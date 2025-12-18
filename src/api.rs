@@ -40,7 +40,7 @@ impl ApiClient {
             "X-API-Key",
             HeaderValue::from_str(&api_key).unwrap_or(HeaderValue::from_static("")),
         );
-        headers.insert(USER_AGENT, HeaderValue::from_static("DarkCore/10.4-Rust"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
@@ -53,25 +53,64 @@ impl ApiClient {
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>, Box<dyn Error>> {
-        let url = format!("https://manifest.morrenus.xyz/api/v1/search?q={}", query);
-        let resp = self.client.get(&url).send().await?;
+        // 1. Try Morrenus API (if key exists)
+        if !self.api_key.is_empty() {
+             let url = "https://manifest.morrenus.xyz/api/v1/search";
+             // Use query params for proper encoding
+             if let Ok(resp) = self.client.get(url)
+                .query(&[("q", query)])
+                .send().await 
+             {
+                 if let Ok(text) = resp.text().await {
+                     // Try parsing as list
+                     if let Ok(list) = serde_json::from_str::<Vec<SearchResult>>(&text) {
+                         return Ok(list);
+                     }
+                     // Try as object
+                     #[derive(Deserialize)]
+                     struct Wrapper { results: Vec<SearchResult> }
+                     if let Ok(wrapper) = serde_json::from_str::<Wrapper>(&text) {
+                         return Ok(wrapper.results);
+                     }
+                 }
+             }
+        }
 
-        // Handle both list and object w/ results
-        let text = resp.text().await?;
-        // Try parsing as list first
-        if let Ok(list) = serde_json::from_str::<Vec<SearchResult>>(&text) {
-            return Ok(list);
+        // 2. Fallback: Steam Store Search (Public)
+        // URL: https://store.steampowered.com/api/storesearch/?term={}&l=english&cc=US
+        // We use query params to ensure encoding (e.g. spaces)
+        let fallback_url = "https://store.steampowered.com/api/storesearch/";
+        let params = [
+            ("term", query),
+            ("l", "english"),
+            ("cc", "US")
+        ];
+        
+        // Don't fail immediately on fallback error, return empty vec? 
+        // No, if fallback fails, we should bubble up the error so user knows.
+        let resp = self.client.get(fallback_url)
+            .query(&params)
+            .send().await?;
+            
+        let root: Value = resp.json().await?;
+        
+        let mut results = Vec::new();
+        if let Some(items) = root.get("items").and_then(|v| v.as_array()) {
+            for item in items {
+                // Steam API returns: { "id": 123, "name": "Game", ... }
+                let id_val = item.get("id").cloned();
+                let name_str = item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+                
+                results.push(SearchResult {
+                    game_id: id_val.clone(), 
+                    game_name: name_str.clone(), 
+                    app_id: id_val,
+                    name: name_str,
+                });
+            }
         }
-        // Try as object
-        #[derive(Deserialize)]
-        struct Wrapper {
-            results: Vec<SearchResult>,
-        }
-        if let Ok(wrapper) = serde_json::from_str::<Wrapper>(&text) {
-            return Ok(wrapper.results);
-        }
-
-        Ok(vec![])
+        
+        Ok(results)
     }
 
     pub async fn download_manifest(&self, appid: &str) -> Result<Bytes, Box<dyn Error>> {

@@ -67,11 +67,8 @@ impl DarkCoreApp {
         // Load cache
         let cache_map = load_game_cache();
 
-        let api_client = if !config.api_key.is_empty() {
-            Some(ApiClient::new(config.api_key.clone()))
-        } else {
-            None
-        };
+        // Always initialize client; it handles empty keys via Fallback to Steam Store API.
+        let api_client = Some(ApiClient::new(config.api_key.clone()));
 
         let system_log = Arc::new(Mutex::new(Vec::new()));
         // Initial log
@@ -349,10 +346,8 @@ impl DarkCoreApp {
     }
 
     fn resolve_unknown_games(&mut self) {
-        if self.api_client.is_none() {
-            self.status_msg = "API Key missing.".to_string();
-            return;
-        }
+        // Hybrid System: Even without key, we can resolve names via Steam Store API.
+
 
         let active_games = self.active_games.clone();
         let game_cache = self.game_cache.clone();
@@ -451,11 +446,10 @@ impl DarkCoreApp {
     }
 
     fn install_game(&mut self, appid: String, name: String) {
-        if self.api_client.is_none() {
-            return;
-        }
+        // UNIFIED PROTOCOL: Works both Online (Manifests) and Offline (FamSharing/Public) through Fallbacks.
+        let api_key = self.config.api_key.clone(); // Can be empty
+        let client = ApiClient::new(api_key.clone()); 
 
-        let client = ApiClient::new(self.config.api_key.clone());
         let steam_path = self.config.steam_path.clone();
         let gl_path = self.config.gl_path.clone();
 
@@ -478,7 +472,7 @@ impl DarkCoreApp {
                     }
                 }
             };
-
+            
             // STEP 1: Kill Steam
             log("STEP 1: Killing Steam Process...".to_string());
             use std::process::Command;
@@ -487,112 +481,118 @@ impl DarkCoreApp {
                 .output();
             std::thread::sleep(std::time::Duration::from_secs(2));
 
-            // STEP 2: APP ID DOWNLOAD
-            log(format!("STEP 2: Downloading Manifest for ID {}...", appid));
+            // STEP 2: TRY MANIFEST (Priority)
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            match runtime.block_on(client.download_manifest(&appid)) {
-                Ok(bytes) => {
-                    log("Download successful. Extracting...".to_string());
-                    // Process Zip
-                    let reader = Cursor::new(bytes);
-                    if let Ok(mut zip) = ZipArchive::new(reader) {
-                        let depot_dir = Path::new(&steam_path).join("depotcache");
-                        if !depot_dir.exists() {
-                            let _ = std::fs::create_dir_all(&depot_dir);
-                        }
+            let mut manifest_success = false;
+            let mut lua_content = String::new();
 
-                        let mut lua_content = String::new();
-
-                        for i in 0..zip.len() {
-                            if let Ok(mut file) = zip.by_index(i) {
-                                let raw_path = file.name().to_string();
-
-                                if raw_path.ends_with(".manifest") {
-                                    // FLATTEN PATH: Ignore folders in zip, extract directly to depotcache root
-                                    // This fixes issues if zip has "depot_cache/123.manifest"
-                                    if let Some(name) = Path::new(&raw_path).file_name() {
-                                        let outpath = depot_dir.join(name);
-                                        // Ensure we don't crash if file exists or extraction fails
-                                        if let Ok(mut outfile) = std::fs::File::create(outpath) {
-                                            let _ = std::io::copy(&mut file, &mut outfile);
-                                        }
+            // Only attempt manifest download if we have a key (saves a request) OR we assume empty key fails?
+            // Morrenus API definitely needs key.
+            if !api_key.is_empty() {
+                log(format!("STEP 2: Downloading Manifest for ID {}...", appid));
+                match runtime.block_on(client.download_manifest(&appid)) {
+                    Ok(bytes) => {
+                        log("Download successful. Extracting...".to_string());
+                        let reader = Cursor::new(bytes);
+                        if let Ok(mut zip) = ZipArchive::new(reader) {
+                            let depot_dir = Path::new(&steam_path).join("depotcache");
+                            if !depot_dir.exists() {
+                                 let _ = std::fs::create_dir_all(&depot_dir);
+                            }
+                            for i in 0..zip.len() {
+                                if let Ok(mut file) = zip.by_index(i) {
+                                    let raw_path = file.name().to_string();
+                                    if raw_path.ends_with(".manifest") {
+                                         if let Some(fname) = Path::new(&raw_path).file_name() {
+                                             let out_path = depot_dir.join(fname);
+                                             if let Ok(mut outfile) = std::fs::File::create(out_path) {
+                                                  let _ = std::io::copy(&mut file, &mut outfile);
+                                             }
+                                         }
+                                    } else if raw_path.ends_with(".lua") {
+                                         use std::io::Read;
+                                         let _ = file.read_to_string(&mut lua_content);
                                     }
-                                } else if raw_path.ends_with(".lua") {
-                                    use std::io::Read;
-                                    let _ = file.read_to_string(&mut lua_content);
                                 }
                             }
+                            manifest_success = true;
                         }
-
-                        // Parse & Inject
-                        if lua_content.is_empty() {
-                            lua_content = format!("addappid({})", appid);
-                        }
-
-                        let (all_ids, keys) = parse_lua_for_keys(&lua_content);
-
-                        // RESTORE: Add ALL IDs compliant with DLC policy.
-                        // We do NOT filter Depots anymore because it might prevent unlocking.
-                        // Better to have "useless" TXTs than a broken game.
-                        let mut final_ids = Vec::new();
-                        for id in all_ids.iter() {
-                            if include_dlcs || *id == appid {
-                                final_ids.push(id.clone());
-                            }
-                        }
-                        log(format!(
-                            "Found {} IDs. Injecting {} to AppList.",
-                            all_ids.len(),
-                            final_ids.len()
-                        ));
-
-                        // Inject VDF
-                        if let Err(e) = inject_vdf(&steam_path, &keys) {
-                            log(format!("VDF Error: {}", e));
-                        } else {
-                            log("VDF Injection successful.".to_string());
-                        }
-
-                        // Add to AppList
-                        if let Err(e) = add_games_to_list(&gl_path, final_ids) {
-                            log(format!("AppList Error: {}", e));
-                        } else {
-                            log("AppList updated.".to_string());
-                        }
-
-                        // UPDATE CACHE
-                        {
-                            if let Ok(mut cache) = game_cache.lock() {
-                                cache.insert(appid.clone(), name.clone());
-                                let _ = save_game_cache(&cache);
-                            }
-                        }
-
-                        // STEP 3: LUNCH INJECTOR
-                        log("STEP 3: Launching DLLInjector...".to_string());
-                        let injector_path = Path::new(&gl_path).join("DLLInjector.exe");
-                        if injector_path.exists() {
-                            if let Ok(mut _child) =
-                                Command::new(&injector_path).current_dir(&gl_path).spawn()
-                            {
-                                // Wait 15s like Python
-                                log("Injector launched. Waiting 15s...".to_string());
-                                std::thread::sleep(std::time::Duration::from_secs(15));
-                            }
-                        } else {
-                            log("DLLInjector.exe not found!".to_string());
-                        }
-
-                        // STEP 4: TRIGGER INSTALL
-                        log("STEP 4: Triggering Steam Install...".to_string());
-                        let _ = open::that(format!("steam://install/{}", appid));
-                        log("Protocol Complete. Happy Gaming!".to_string());
+                    },
+                    Err(_) => {
+                        log("Manifest download failed (Invalid Key or Server Error). Skipping to Fallback...".to_string());
                     }
                 }
-                Err(e) => {
-                    log(format!("Download failed: {}", e));
+            } else {
+                 log("OFFLINE MODE: Skipping Manifest Download (No API Key).".to_string());
+            }
+
+            // STEP 3: PREPARE IDs (Hybrid)
+            let mut final_ids = Vec::new();
+
+            // 3A. If Manifest/Lua success -> Use Lua IDs (Best)
+            if manifest_success && !lua_content.is_empty() {
+                let (all_ids, keys) = parse_lua_for_keys(&lua_content);
+                // VDF Injection
+                if let Err(e) = inject_vdf(&steam_path, &keys) {
+                    log(format!("VDF Error: {}", e));
+                }
+                // Filter IDs
+                for id in all_ids.iter() {
+                    if include_dlcs || *id == appid {
+                        final_ids.push(id.clone());
+                    }
+                }
+                 log(format!("Lua Intelligence: Found {} associated IDs.", final_ids.len()));
+            } 
+            // 3B. If Failed/Offline -> Use Public Store API (Smart Fallback)
+            else {
+                 log("Using Public Steam Store API for DLC detection...".to_string());
+                 final_ids.push(appid.clone()); // Always add main game
+                 
+                 if include_dlcs {
+                     match runtime.block_on(client.get_dlc_list(&appid)) {
+                         Ok(dlcs) => {
+                             if !dlcs.is_empty() {
+                                 log(format!("Found {} DLCs from Steam Store.", dlcs.len()));
+                                 final_ids.extend(dlcs);
+                             } else {
+                                 log("No DLCs found publicly.".to_string());
+                             }
+                         },
+                         Err(_) => log("Could not fetch DLC list (Connection Error).".to_string())
+                     }
+                 }
+            }
+
+            // STEP 4: UPDATE APPLIST
+            log(format!("STEP 3: Injecting {} IDs to AppList...", final_ids.len()));
+            if let Err(e) = add_games_to_list(&gl_path, final_ids) {
+                 log(format!("AppList Error: {}", e));
+            } else {
+                 log("AppList updated successfully.".to_string());
+            }
+
+             // Update Cache
+             {
+                if let Ok(mut cache) = game_cache.lock() {
+                    cache.insert(appid.clone(), name.clone());
+                    let _ = save_game_cache(&cache);
                 }
             }
+
+            // STEP 5: DLL INJECTOR & RESTART
+            log("STEP 4: Converting Environment...".to_string());
+            let injector_path = Path::new(&gl_path).join("DLLInjector.exe");
+            if injector_path.exists() {
+                 if let Ok(mut _child) = Command::new(&injector_path).current_dir(&gl_path).spawn() {
+                     log("Injector launched. Waiting 15s...".to_string());
+                     std::thread::sleep(std::time::Duration::from_secs(15));
+                 }
+            }
+
+            log("STEP 5: Launching Installation...".to_string());
+            let _ = open::that(format!("steam://install/{}", appid));
+            log("Protocol Complete. Happy Gaming!".to_string());
         });
     }
 }
@@ -631,6 +631,17 @@ impl eframe::App for DarkCoreApp {
                             .family(egui::FontFamily::Monospace)
                             .color(egui::Color32::from_rgb(0, 200, 255)),
                     );
+
+                    if self.config.api_key.is_empty() {
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new("⚠ FALLBACK MODE: STEAM FAMILY SHARE ONLY (NO API KEY)")
+                                .size(10.0)
+                                .color(egui::Color32::ORANGE)
+                                .strong(),
+                        )
+                        .on_hover_text("Morrenus API Key is missing. Manifests cannot be downloaded.\nOnly Family Shared games and Public DLCs are available.\nAdd a key in Settings for full unlocking power.");
+                    }
                     ui.add_space(5.0);
                 });
                 ui.separator();
