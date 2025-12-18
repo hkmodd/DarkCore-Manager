@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock
+**/.idea
+**/.vscode
+*.iml
+*.pdb
+*.exe
+!darkcore-greenluma.exe
+config.json
+/AppList
+/depotcache
+/Profiles
