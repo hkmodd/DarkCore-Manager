@@ -39,7 +39,7 @@ A fully custom GUI built with `egui` featuring:
 
 ## 🚀 INSTALLATION
 
-1.  **Download Release**: Grab the latest `darkcore-greenluma.exe` from [Releases](#).
+1.  **Download Release**: Grab the latest `darkcore-greenluma.exe` from [Releases](https://github.com/hkmodd/DarkCore-Manager/releases/tag/release).
 2.  **Set Paths**: On first launch, go to **SETTINGS** and point to:
     *   Your `Steam` folder.
     *   Your `GreenLuma` folder.
