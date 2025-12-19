@@ -1,7 +1,6 @@
 use crate::config::get_config_path;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
 
 pub fn load_game_cache() -> HashMap<String, String> {
     let mut path = get_config_path();

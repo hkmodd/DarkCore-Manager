@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="logo.png" alt="DarkCore Logo" width="128" height="128">
+  <img src="manager/logo.png" alt="DarkCore Logo" width="128" height="128">
   <br>
   <br>
   <pre>
@@ -40,7 +40,7 @@
 >
 > 1.  **Independent Research**: **DarkCore Manager** is an independent project created solely for educational purposes, demonstrating advanced Rust UI patterns and process orchestration.
 > 2.  **No Affiliation**: This software is **NOT** affiliated with, endorsed by, or connected to Valve Corporation, Steam, GreenLuma, Steamless, or Morrenus.
-> 3.  **No Proprietary Data**: This tool **does NOT** contain, distribute, or host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
+> ### 3. **No Proprietary Data**: This tool **does NOT** contain, distribute, or host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
 > 4.  **User Responsibility**: The user assumes full responsibility for compliance with all applicable Terms of Service and local laws. The author assumes **NO LIABILITY** for bans, data loss, or system instability.
 
 <br>
@@ -55,13 +55,40 @@ Acting as a sophisticated **Middleware Orchestrator**, it automates the complex 
 
 Unlike basic launchers, DarkCore operates as a state-aware system supervisor:
 
-*   **AppID Context Switching**: Generates context-aware `AppId.txt` files to guide injection targets.
-*   **AppList Sequencing**: Dynamically builds and sorts the `AppList` directory structure (`0.txt`, `1.txt`...), ensuring deterministic loading of entitlements by GreenLuma.
-*   **License Injection (config.vdf)**: Parses Lua entitlement scripts from Morrenus to surgically inject `DecryptionKey`s into Steam's `config/config.vdf`, enabling authorized unlocking of encrypted depots.
-*   **Manifest Deployment**: Extracts official signed Steam Manifests (`.manifest`) directly into the `depotcache` directory, allowing Steam to recognize and download game files as if owned.
-*   **Process Orchestration**: Manages the lifecycle of `Steam.exe`, `DLLInjector.exe`, and game processes via native Win32 calls.
+*   **Context Switching**: Generates context-aware configurations to guide injection targets.
+*   **Deterministic Loading**: Dynamically builds and sorts the `AppList` directory structure (`0.txt`, `1.txt`...), ensuring deterministic loading of entitlements.
+*   **Depot Authorization**: Parses Lua scripts to surgically inject key-values into Steam's `config/config.vdf`, enabling authorized interaction with encrypted depots.
+*   **Manifest Deployment**: Extracts official signed Steam Manifests (`.manifest`) directly into the `depotcache` directory, allowing compliant file verification.
+*   **Process Orchestration**: Manages the lifecycle of child processes via native Win32 calls.
 
 **It doesn't just run commands. It manages the environment.**
+
+## 🗝️ System Attributes: Core Modules
+To achieve seamless interoperability, three systems must work in unison. DarkCore orchestrates them all:
+
+### 1. 🔓 Steamless (Static Analysis & Unpacking)
+*   **Role**: **Executable Unpacker**.
+*   **Function**: Automated handling of the "SteamStub" wrapper. It preserves the integrity of the original binary while preparing it for an offline or sandboxed execution environment.
+*   **DarkCore Integration**: Fully automated via the "Steamless" tab. Handles backup (`.bak`), unpacking, and replacement with 100% safety.
+
+### 2. 🔑 GreenLuma (Injection Interface)
+*   **Role**: **Client Debug Parameter Override**.
+*   **Function**: Leveraging the Steam Client's "Family Sharing" protocols, it allows for the loading of specific AppIDs into the local context for testing and library management purposes.
+*   **DarkCore Integration**: Feeds the `AppList` to the injector to initialize the UI state.
+
+### 3. 📡 Morrenus Integration (Depot Synchronization)
+*   **Role**: **Manifest & Key Aggregation**.
+*   **Function**: Facilitates the retrieval of **Signed Manifests** and **Depot Keys** necessary for the client to validate and download content from the CDN.
+*   **DarkCore Integration**: Automates the retrieval of Lua scripts and Manifests, ensuring correct `config.vdf` and `depotcache` alignment.
+
+### 4. 🧠 TITAN Module (Runtime Persistence Layer) - *NEW!*
+*   **Role**: **Steamworks API Emulation**.
+*   **Function**: A custom `dll` proxy that intercepts and handles `ISteamRemoteStorage` and `ISteamUserStats` calls locally. This ensures application stability when the client cannot reach the backend.
+*   **Capabilities**:
+    *   **💾 Local Storage Virtualization**: Redirects save game I/O to a sandboxed local directory, decoupling it from the Cloud.
+    *   **☁️ State Harmonization**: Patches `localconfig.vdf` and manages `remotecache.vdf` to ensure the Client UI reflects a "Healthy/Updated" state, eliminating synchronization errors.
+    *   **🏆 Offline Achievement Tracking**: Persists unlocked achievements to a local `stats.txt` database, preserving user progress across sessions without upstream server dependency.
+
 
 ---
 
@@ -101,35 +128,49 @@ We believe in transparency. Build it yourself.
 
 1.  **Clone Repository**
     ```powershell
-    git clone https://github.com/hkmodd/DarkCore-Manager
-    cd <foldername>
+    git clone https://github.com/hkmodd/DarkCore-Manager.git
+    cd DarkCore-Manager
     ```
 
 2.  **Asset Injection (Optional)**
-    *   Place your `icon.ico` in the root directory. The build system (`build.rs`) will fuse it into the executable resource table.
+    *   Place your `icon.ico` in the `manager/` directory. The build system will fuse it into the executable.
 
-3.  **Compile Release**
+3.  **Compile System**
     ```powershell
     cargo build --release
     ```
-    *Target Artifact: `target/release/darkcore-greenluma.exe`*
+    *This command compiles the entire workspace:*
+    *   **Manager**: `target/release/darkcore-manager.exe` (The UI Application)
+    *   **Titan Hook**: `target/release/titan_hook.dll` (The Stealth Layer)
+
+    > [!TIP]
+    > Ensure both files are in the same directory for deployment to work correctly.
 
 ---
 
-## ⚙️ Configuration Protocol
+## ⚙️ Operational Protocol
 
-### 1. Initialization
-Upon first boot, the system validates paths. Navigate to **SETTINGS** to map your environment:
-1.  **Steam Path**: Root directory (e.g., `C:\Program Files (x86)\Steam`).
-2.  **GreenLuma Path**: Directory containing `DLLInjector.exe`.
-3.  **Steamless Path**: Path to `Steamless.CLI.exe` (Vital for DRM removal).
-4.  **API Key**: Optional. Leave empty for Fallback Mode.
+### 1. Environment Mapping (Initialization)
+Upon first boot, the core system requires mapping to your local ecosystem. Navigate to the **SETTINGS** tab to initialize the environment:
 
-### 2. Deployment
-1.  **Search**: Input Game Name -> Query Public/Private Database.
-2.  **Parameters**: Toggle DLC inclusion.
-3.  **EXECUTE**: DarkCore handles the rest.
-    *   *Kill Steam -> Write Configs -> Inject VDF -> Restart Steam -> Trigger Install.*
+*   **Steam Root**: The directory housing `Steam.exe` (e.g., `C:\Program Files (x86)\Steam`).
+*   **GreenLuma Artifact**: The folder containing the *GreenLuma 2024* binary (`DLLInjector.exe`).
+*   **Steamless Binary**: Path to `Steamless.CLI.exe`. This is **critical** for the "Unpacker" module to function correctly on protected executables.
+*   **Morrenus API Key**: (Optional) Input your private key to unlock the "Intelligence Module" (Manifests & Decryption Keys).
+    *   *Note: Without this key, the system defaults to **Fallback Mode** (Public Steam Store API), limiting capabilities to Library Management only.*
+
+### 2. The Execution Cycle
+DarkCore streamlines the deployment process into a deterministic linear workflow:
+
+1.  **Query**: Navigate to **SEARCH**, input a specific AppID or Game Name. The system actively queries the selected database.
+2.  **Selection**: Choose your target application. The interface will populate available DLC content dynamically.
+3.  **Titan Activation (Crucial)**: For specific titles requiring local emulation (e.g., *Spyro Reignited*), click the **ACTIVATE TITAN** button.
+    *   *Action*: Deploys the `titan_hook.dll` proxy and performs "State Harmonization" on the Steam Cloud config.
+4.  **Engage**: Click **PLAY / INJECT**.
+    *   *Sequence Initiated*: `Terminate Steam` -> `Generate AppList` -> `Inject Configs` -> `Restart Steam` -> `Inject GreenLuma`.
+
+> [!IMPORTANT]
+> **Process Hygiene**: Always ensure Steam is **fully terminated** before initiating a new injection cycle to prevent file locking or memory offset conflicts.
 
 ---
 

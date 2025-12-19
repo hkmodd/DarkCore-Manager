@@ -13,6 +13,7 @@ pub struct SearchResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CoveredGame {
     pub id: String,
     pub name: String,

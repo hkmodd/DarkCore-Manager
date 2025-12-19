@@ -2,7 +2,6 @@ use glob::glob;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct GameProfile {

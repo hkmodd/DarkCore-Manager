@@ -1,6 +1,6 @@
 use crate::api::{ApiClient, SearchResult};
 use crate::app_list::{
-    add_games_to_list, nuke_reorder, overwrite_app_list, refresh_active_games_list, GameProfile,
+    add_games_to_list, nuke_reorder, refresh_active_games_list, GameProfile,
 };
 use crate::cache::{load_game_cache, save_game_cache};
 use crate::config::{load_config, save_config, AppConfig};
@@ -582,6 +582,36 @@ impl DarkCoreApp {
 
             // STEP 5: DLL INJECTOR & RESTART
             log("STEP 4: Converting Environment...".to_string());
+            
+            // TITAN MODE CHECK
+            // Check if titan_hook.dll exists in the same dir as our executable or gl_path
+            let titan_dll = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("titan_hook.dll")))
+                .unwrap_or_else(|| Path::new("titan_hook.dll").to_path_buf());
+
+            if titan_dll.exists() {
+                 log("TITAN MODE: Native Hooking Engine Detected.".to_string());
+                 // To use Titan Injection, we need the GAME EXECUTABLE path, not just steam://install
+                 // Since we don't know the game exe path easily without querying Steam installation, 
+                 // we cannot fully replace the "Install" button behavior which relies on Steam to download.
+                 //
+                 // HOWEVER, for "Play" (if game is installed), we could.
+                 // But this function is named `install_game`, and it launches `steam://install` which acts as Play if installed.
+                 //
+                 // LIMITATION: We can't inject into `steam://` URL launch. We must launch the exe directly.
+                 // For now, we will stick to the existing GreenLuma Injector (DLLInjector.exe) for the generic flow,
+                 // UNLESS the user explicitly wants Titan features.
+                 //
+                 // IF we want to inject TitanHook into the GAME, we must launch the game exe.
+                 //
+                 // PROPOSAL: Inject TitanHook into GreenLuma's DLLInjector? No, that's external.
+                 //
+                 // Let's stick to the GreenLuma flow for now as "Base", but if we want Titan features, we really need a "Launch Game" button that knows the Exe path.
+                 //
+                 // Falling back to standard GreenLuma behavior for stability as per "install_game" name.
+            }
+            
             let injector_path = Path::new(&gl_path).join("DLLInjector.exe");
             if injector_path.exists() {
                  if let Ok(mut _child) = Command::new(&injector_path).current_dir(&gl_path).spawn() {
@@ -1099,6 +1129,67 @@ impl DarkCoreApp {
                                     {
                                         delete_req = Some((game.app_id.clone(), game.name.clone()));
                                     }
+
+                                    // TITAN MODE CHECK
+                                    let steam_path = self.config.steam_path.clone();
+                                    
+                                    // Use helper methods from game_path.rs
+                                    if crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id).is_some() {
+                                        if crate::game_path::GamePathFinder::is_titan_active(&steam_path, &game.app_id) {
+                                            ui.label(
+                                                egui::RichText::new("✅ TITAN ACTIVE")
+                                                    .color(egui::Color32::GREEN)
+                                                    .size(10.0)
+                                            ).on_hover_text("Titan Hook (version.dll) is deployed.");
+                                        } else {
+                                            let btn = ui.button(
+                                                egui::RichText::new("⚔ ACTIVATE TITAN")
+                                                    .color(egui::Color32::YELLOW)
+                                                    .size(10.0)
+                                            ).on_hover_text("Deploy Titan Hook (version.dll) for Cloud Save & Achievements.");
+                                            
+                                            if btn.clicked() {
+                                                // KILL STEAM FIRST (Safety for VDF & File Locks)
+                                                let _ = std::process::Command::new("taskkill")
+                                                    .args(&["/F", "/IM", "steam.exe"])
+                                                    .output();
+                                                
+                                                // Wait a moment for process death
+                                                std::thread::sleep(std::time::Duration::from_millis(1000));
+
+                                                match crate::game_path::GamePathFinder::deploy_titan_hook(&steam_path, &game.app_id) {
+                                                    Ok(path) => {
+                                                        self.log(format!("Titan deployed to: {:?}", path));
+                                                        // Suppress Cloud Error (Safe now that Steam is dead)
+                                                        match crate::game_path::GamePathFinder::suppress_cloud_sync(&steam_path, &game.app_id) {
+                                                            Ok(_) => {
+                                                                self.log("Cloud Sync Suppressed (localconfig patched).".to_string());
+                                                                self.log("Steam Terminated. PLEASE RESTART STEAM to apply changes.".to_string());
+                                                            },
+                                                            Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
+                                                        }
+                                                    },
+                                                    Err(e) => self.log(format!("Titan Error: {}", e)),
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                         // Not installed or check if DLC
+                                         if self.is_probable_dlc(&game.name) {
+                                            ui.label(
+                                                egui::RichText::new("📦 DLC / CONTENT")
+                                                    .color(egui::Color32::from_rgb(150, 150, 255))
+                                                    .size(10.0)
+                                            ).on_hover_text("Detected as Downloadable Content (No standalone executable detected).");
+                                         } else {
+                                             ui.label(
+                                                 egui::RichText::new("NOT INSTALLED")
+                                                     .color(egui::Color32::DARK_GRAY)
+                                                     .size(10.0)
+                                             );
+                                         }
+                                    }
+
                                     ui.label(
                                         egui::RichText::new(&game.filename)
                                             .size(10.0)
@@ -1125,7 +1216,7 @@ impl DarkCoreApp {
         );
         ui.add_space(10.0);
 
-        let mut path_row =
+        let path_row =
             |ui: &mut egui::Ui,
              label: &str,
              valid: bool,
@@ -1237,7 +1328,6 @@ impl DarkCoreApp {
                 if ui.button("SAVE").clicked() {
                     if !self.profile_name_input.is_empty() {
                         // Gather IDs
-                        use crate::app_list::GameProfile;
                         let games = self.active_games.lock().unwrap();
                         let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
                         drop(games);
@@ -1368,5 +1458,20 @@ impl DarkCoreApp {
             }
         }
         self.log(format!("Deleted {} items.", ids.len()));
+    }
+
+    fn is_probable_dlc(&self, name: &str) -> bool {
+        let lower = name.to_lowercase();
+        let keywords = [
+            "dlc", "pack", "soundtrack", " ost", "artbook", "upgrade", 
+            "season pass", "expansion", "ticket", "skin", "costume", 
+            "bonus", "content", "kit", "bundle", "edition"
+        ];
+        for kw in keywords {
+            if lower.contains(kw) {
+                return true;
+            }
+        }
+        false
     }
 }

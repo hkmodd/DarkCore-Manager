@@ -6,6 +6,8 @@ mod cache;
 mod config;
 mod profiles;
 mod steamless;
+mod game_path;
+mod injector;
 mod ui;
 mod vdf_injector;
 
