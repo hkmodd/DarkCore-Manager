@@ -111,10 +111,9 @@ impl DarkCoreApp {
 
         let system_log = Arc::new(Mutex::new(Vec::new()));
         // Initial log
-        system_log
-            .lock()
-            .unwrap()
-            .push("System Ready. Darkcore Rust Initialized.".to_string());
+        if let Ok(mut logs) = system_log.lock() {
+            logs.push("System Ready. Darkcore Rust Initialized.".to_string());
+        }
 
         let mut app = Self {
             config,
@@ -304,8 +303,12 @@ impl DarkCoreApp {
             let log_arc = self.system_log.clone();
 
             self.log(&format!("Searching for: {}", query));
-            results_arc.lock().unwrap().clear();
-            cover_cache.lock().unwrap().clear();
+            if let Ok(mut res) = results_arc.lock() {
+                res.clear();
+            }
+            if let Ok(mut cache) = cover_cache.lock() {
+                cache.clear();
+            }
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
@@ -354,11 +357,12 @@ impl DarkCoreApp {
                                 return len_a.cmp(&len_b);
                             }
 
-                            // 4. Alphabetical
                             name_a.cmp(&name_b)
                         });
 
-                        *results_arc.lock().unwrap() = res.clone();
+                        if let Ok(mut results) = results_arc.lock() {
+                            *results = res.clone();
+                        }
 
                         // Download Covers
                         let dl_client = reqwest::Client::builder()
@@ -445,10 +449,9 @@ impl DarkCoreApp {
                         });
                     }
                     Err(e) => {
-                        let _ = log_arc
-                            .lock()
-                            .unwrap()
-                            .push(format!("Search API Error: {}", e));
+                        if let Ok(mut logs) = log_arc.lock() {
+                            logs.push(format!("Search API Error: {}", e));
+                        }
                     }
                 }
             });
@@ -460,7 +463,7 @@ impl DarkCoreApp {
         let active_games = self.active_games.clone();
         let game_cache = self.game_cache.clone();
         let client_key = self.config.api_key.clone();
-        // let client = ApiClient::new(client_key.clone()); // Unused here, created inside thread
+        let steam_path = self.config.steam_path.clone();
         let status_queue = self.status_update_queue.clone();
 
         self.status_msg = "Resolving unknown games...".to_string();
@@ -470,10 +473,11 @@ impl DarkCoreApp {
 
             // Identify unknowns
             {
-                let games = active_games.lock().unwrap();
-                for g in games.iter() {
-                    if g.name == "Unknown" {
-                        ids_to_resolve.push(g.app_id.clone());
+                if let Ok(games) = active_games.lock() {
+                    for g in games.iter() {
+                        if g.name == "Unknown" || g.name.starts_with("Depot of") {
+                            ids_to_resolve.push(g.app_id.clone());
+                        }
                     }
                 }
             }
@@ -487,51 +491,128 @@ impl DarkCoreApp {
                     let client = ApiClient::new(client_key.clone());
                     let game_cache = game_cache.clone();
                     let id_clone = id.clone();
+                    let steam_path_ref = steam_path.clone();
 
                     handles.push(tokio::spawn(async move {
                         let mut found_name = None;
 
-                        // 1. Try Morrenus Search first
-                        if let Ok(results) = client.search(&id_clone).await {
-                            use crate::api::val_to_string;
-                            let matched = results.iter().find(|r| {
-                                let rid = val_to_string(&r.game_id);
-                                let rid2 = val_to_string(&r.app_id);
-                                rid == id_clone || rid2 == id_clone
-                            });
+                        // 0. Hardcoded Common Redists
+                        match id_clone.as_str() {
+                             "228980" => found_name = Some("Steamworks Common Redistributables".to_string()),
+                             "228981" | "228982" | "228983" | "228984" | "228985" | 
+                             "228986" | "228987" | "228988" | "228989" | "228990" => {
+                                 found_name = Some(format!("Steamworks Redist ({})", id_clone));
+                             },
+                             "366850" => found_name = Some("Old World".to_string()),
+                             "408630" => found_name = Some("Europa Universalis IV".to_string()),
+                             _ => {}
+                        }
 
-                            if let Some(res) = matched {
-                                let name = res
-                                    .game_name
-                                    .as_deref()
-                                    .or(res.name.as_deref())
-                                    .unwrap_or("Unknown")
-                                    .to_string();
-                                if name != "Unknown" {
-                                    found_name = Some(name);
+                        // 1. Try Morrenus Search first
+                        if found_name.is_none() {
+                            if let Ok(results) = client.search(&id_clone).await {
+                                use crate::api::val_to_string;
+                                let matched = results.iter().find(|r| {
+                                    let rid = val_to_string(&r.game_id);
+                                    let rid2 = val_to_string(&r.app_id);
+                                    rid == id_clone || rid2 == id_clone
+                                });
+
+                                if let Some(res) = matched {
+                                    let name = res
+                                        .game_name
+                                        .as_deref()
+                                        .or(res.name.as_deref())
+                                        .unwrap_or("Unknown")
+                                        .to_string();
+                                    if name != "Unknown" {
+                                        found_name = Some(name);
+                                    }
                                 }
                             }
                         }
 
-                        // 2. Fallback: Steam Store API
+                        // 2. Fallback: Steam Store API & HTML Scraper
                         if found_name.is_none() {
-                            // Try fetching from official Steam API
                             let url = format!(
                                 "https://store.steampowered.com/api/appdetails?appids={}",
                                 id_clone
                             );
+                            let mut api_success = false;
+
                             if let Ok(resp) = reqwest::get(&url).await {
                                 if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    // Path: [id].data.name
                                     if let Some(data) =
                                         json.get(&id_clone).and_then(|v| v.get("data"))
                                     {
                                         if let Some(name_val) = data.get("name") {
                                             if let Some(n) = name_val.as_str() {
                                                 found_name = Some(n.to_string());
+                                                api_success = true;
                                             }
                                         }
                                     }
+                                }
+                            }
+
+                            // 2b. HTML Title Scraper (Nuclear Option)
+                            if !api_success {
+                                let page_url = format!("https://store.steampowered.com/app/{}", id_clone);
+                                if let Ok(resp) = reqwest::get(&page_url).await {
+                                    if let Ok(text) = resp.text().await {
+                                         if let Some(start) = text.find("<title>") {
+                                             if let Some(end) = text[start..].find(" on Steam</title>") {
+                                                 let raw = &text[start + 7 .. start + end];
+                                                 let cleaned = raw.trim()
+                                                    .replace("&amp;", "&")
+                                                    .replace("&apos;", "'")
+                                                    .replace("&#39;", "'");
+                                                 
+                                                 if !cleaned.is_empty() {
+                                                     found_name = Some(cleaned);
+                                                 }
+                                             }
+                                         }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. Fallback: Local Config VDF (Depot Check)
+                        if found_name.is_none() {
+                            if let Some(parent_id) = crate::game_path::GamePathFinder::find_parent_for_depot(&steam_path_ref, &id_clone) {
+                                // Try to get parent name from cache
+                                let parent_name = {
+                                    if let Ok(c) = game_cache.lock() {
+                                        c.get(&parent_id).cloned()
+                                    } else {
+                                        None
+                                    }
+                                };
+                                
+                                if let Some(p_name) = parent_name {
+                                    found_name = Some(format!("{} [Depot]", p_name));
+                                } else {
+                                    found_name = Some(format!("Depot of AppID {}", parent_id));
+                                }
+                            }
+                        }
+
+                        // 4. Fallback: Deep Manifest Scan (User Mounted Depots)
+                        if found_name.is_none() {
+                            if let Some(parent_id) = crate::game_path::GamePathFinder::find_parent_by_scanning_manifests(&steam_path_ref, &id_clone) {
+                                let parent_name = {
+                                    if let Ok(c) = game_cache.lock() {
+                                        c.get(&parent_id).cloned()
+                                    } else {
+                                        None
+                                    }
+                                };
+                                
+                                if let Some(p_name) = parent_name {
+                                    found_name = Some(format!("{} [Depot]", p_name));
+                                } else {
+                                    found_name = Some(format!("Depot of AppID {}", parent_id));
                                 }
                             }
                         }
@@ -578,7 +659,7 @@ impl DarkCoreApp {
         ));
 
         std::thread::spawn(move || {
-            let log = |msg: String| {
+            let log = move |msg: String| {
                 if let Ok(mut logs) = log_arc.lock() {
                     logs.push(msg);
                     if logs.len() > 100 {
@@ -594,6 +675,19 @@ impl DarkCoreApp {
                 .args(&["/F", "/IM", "steam.exe"])
                 .output();
             std::thread::sleep(std::time::Duration::from_secs(2));
+
+            // STEP 1.5: FORCE UPDATE -> DELETE APPMANIFEST
+            // This forces Steam to "Discover Existing Files" and re-validate against our new Manifest.
+            if let Some(acf_path) = crate::game_path::GamePathFinder::find_manifest_path(&steam_path, &appid) {
+                 log(format!("Forcing Update Check: Deleting existing AppManifest at {:?}...", acf_path));
+                 if let Err(e) = std::fs::remove_file(&acf_path) {
+                     log(format!("Warning: Could not delete appmanifest: {}", e));
+                 } else {
+                     log("AppManifest deleted. Steam will re-discover files.".to_string());
+                 }
+            } else {
+                 log("No existing AppManifest found (Clean Install or Verify pending).".to_string());
+            }
 
             // STEP 2: TRY MANIFEST (Priority)
             let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1207,6 +1301,15 @@ impl DarkCoreApp {
         let log_height = 200.0;
         let results_h = (available - log_height - 20.0).max(100.0);
 
+        // Cache installed IDs for O(1) lookup
+        let installed_ids: std::collections::HashSet<String> = {
+            if let Ok(games) = self.active_games.lock() {
+                games.iter().map(|g| g.app_id.clone()).collect()
+            } else {
+                std::collections::HashSet::new()
+            }
+        };
+
         egui::ScrollArea::vertical().id_salt("results_scroll").max_height(results_h).show(ui, |ui| {
             for res in results.iter() {
                 use crate::api::val_to_string;
@@ -1215,17 +1318,15 @@ impl DarkCoreApp {
                 let id2 = val_to_string(&res.app_id);
                 let id = if !id1.is_empty() { id1 } else { id2 };
                 let display_id = if id.is_empty() { "0".to_string() } else { id.clone() };
+                let is_installed = installed_ids.contains(&display_id);
 
                 // Animated Card Hover
                 let card_id = ui.make_persistent_id(&display_id);
                 let _is_hovered = ui.ctx().animate_bool(card_id, 
                      ui.input(|i| i.pointer.hover_pos().map_or(false, |_pos| {
-                         // We don't have rect yet, simple hack: 
-                         // Just use "interact" on the frame response below
-                         false // We'll set it after
+                         false 
                      }))
-                ); // Getting hover before drawing is tricky in immediate mode without 2-pass.
-                // Simpler: Just rely on standard sense(Sense::hover()) on the frame.
+                ); 
 
                 ui.push_id(display_id.clone(), |ui| {
                     let frame_style = egui::Frame::group(ui.style())
@@ -1237,8 +1338,6 @@ impl DarkCoreApp {
                     let response = frame_style.show(ui, |ui| {
                              ui.horizontal(|ui| {
                                  // CALC DYNAMIC SIZE
-                                 // 1200px -> 80px width
-                                 // 2560px -> 180px width
                                  let avail_width = ui.ctx().screen_rect().width().max(800.0);
                                  let scale = (avail_width / 1200.0).max(1.0).min(3.0);
                                  let cover_w = 70.0 * scale;
@@ -1259,28 +1358,43 @@ impl DarkCoreApp {
                                  ui.label(egui::RichText::new(format!("ID: {}", display_id)).size(10.0).color(egui::Color32::GRAY));
                                  ui.add_space(5.0);
                                  
-                                 // PULSING INSTALL BUTTON
-                                 let text = "🚀 INSTALL";
+                                 // PULSING BUTTON
+                                 let text = if is_installed { "♻ UPDATE" } else { "🚀 INSTALL" };
                                  let time = ui.input(|i| i.time);
                                  let alpha = (time * 3.0).sin().abs() as f32 * 0.5 + 0.5; // 0.5 to 1.0
-                                 let color = egui::Color32::from_rgba_premultiplied(
-                                     0, (255.0 * alpha) as u8, (100.0 * alpha) as u8, 255
-                                 );
+                                 
+                                 let bg_color = if is_installed {
+                                     // Orange/Yellow for Update
+                                     egui::Color32::from_rgba_premultiplied(
+                                         (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
+                                     )
+                                 } else {
+                                     // Green/Cyan for Install
+                                     egui::Color32::from_rgba_premultiplied(
+                                         0, (255.0 * alpha) as u8, (100.0 * alpha) as u8, 255
+                                     )
+                                 };
+                                 
                                  let text_color = egui::Color32::BLACK;
                                  
                                  let limit_reached = self.active_games.lock().unwrap().len() >= 134;
 
-                                 if limit_reached {
+                                 if limit_reached && !is_installed {
                                       ui.add(egui::Button::new(egui::RichText::new("⛔ LIMIT (134)").strong())
                                           .fill(egui::Color32::DARK_GRAY)
                                           .rounding(4.0))
                                           .on_hover_text("Max AppList limit reached. Create a Profile to install more.");
                                  } else {
                                       let btn = egui::Button::new(egui::RichText::new(text).color(text_color).strong())
-                                         .fill(color)
+                                         .fill(bg_color)
                                          .rounding(4.0);
                                       
-                                      if ui.add(btn).clicked() {
+                                      let mut btn_resp = ui.add(btn);
+                                      if is_installed {
+                                          btn_resp = btn_resp.on_hover_text("Game is already installed. Click to force update manifest/config.");
+                                      }
+                                      
+                                      if btn_resp.clicked() {
                                            self.install_game(display_id.clone(), name.to_string());
                                       }
                                  }
@@ -1290,15 +1404,8 @@ impl DarkCoreApp {
                          });
                     });
                     
-                    // Simple Hover Effect (Brighten border)
                     if response.response.hovered() {
                          ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                         // Since we already drew it, we can't change it this frame easy.
-                         // But next frame it will redraw. 
-                         // Actually eframe clears every frame. 
-                         // To do hover style, we should calculate style BEFORE show.
-                         // But Frame::show returns Response AFTER.
-                         // Standard Egui pattern: UI is stateful.
                     }
                 });
                 ui.add_space(5.0);
@@ -1394,10 +1501,15 @@ impl DarkCoreApp {
                 )
                 .clicked()
             {
-                if let Err(e) = nuke_reorder(&self.config.gl_path, &self.config.steam_path, None) {
+                let result = {
+                    let guard = self.game_cache.lock().ok();
+                    nuke_reorder(&self.config.gl_path, &self.config.steam_path, None, guard.as_deref())
+                };
+
+                if let Err(e) = result {
                     self.log(format!("Error: {}", e));
                 } else {
-                    self.log("Library Reordered (Safe verification).".to_string());
+                    self.log("Library Reordered (Alphabetical/Safe).".to_string());
                     self.refresh_library();
                 }
             }

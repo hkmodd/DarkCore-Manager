@@ -86,57 +86,73 @@ pub fn refresh_active_games_list(
 
 pub fn nuke_reorder(
     gl_path: &str,
-    _steam_path: &str, // Kept unused to match signature
+    _steam_path: &str,
     target_id_to_remove: Option<&str>,
+    cache: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<(), std::io::Error> {
     let al_path = Path::new(gl_path).join("AppList");
     if !al_path.exists() {
         return Ok(());
     }
 
-    // Safety: We do NOT auto-clean depots anymore (user reported it breaks updates).
-    // We only reorder existing files 0..N and remove specific targets if requested.
+    let mut entries = Vec::new();
 
-    let mut existing_ids = Vec::new();
-
-    // Read all existing IDs
+    // 1. Read all existing IDs
     let pattern = al_path.join("*.txt");
-    let pattern_str = pattern.to_string_lossy();
-
-    if let Ok(paths) = glob(&pattern_str) {
+    if let Ok(paths) = glob(&pattern.to_string_lossy()) {
         for path in paths.flatten() {
             if let Ok(content) = fs::read_to_string(&path) {
                 let aid = content.trim().to_string();
 
-                // Only remove if specifically targeted
+                // Remove target
                 if let Some(target) = target_id_to_remove {
                     if aid == target {
                         let _ = fs::remove_file(&path);
                         continue;
                     }
                 }
-
-                existing_ids.push(aid);
+                entries.push(aid);
             }
-            // Delete old file to prepare for re-write
+            // Delete file
             let _ = fs::remove_file(&path);
         }
     }
 
-    // Sort IDs
-    existing_ids.sort_by(|a, b| {
-        let na = a.parse::<u64>().unwrap_or(u64::MAX);
-        let nb = b.parse::<u64>().unwrap_or(u64::MAX);
-        if na != u64::MAX && nb != u64::MAX {
-            na.cmp(&nb)
-        } else {
-            a.cmp(b)
-        }
-    });
-    existing_ids.dedup();
+    // 2. Sort Logic
+    // If cache is provided, sort by Name. Else, sort by ID numeric.
+    if let Some(game_map) = cache {
+        entries.sort_by(|a, b| {
+            let name_a = game_map.get(a).map(|s| s.as_str()).unwrap_or("zzz_unknown");
+            let name_b = game_map.get(b).map(|s| s.as_str()).unwrap_or("zzz_unknown");
 
-    // Write back
-    for (i, aid) in existing_ids.iter().enumerate() {
+            // Primary: Name
+            let name_cmp = name_a.to_lowercase().cmp(&name_b.to_lowercase());
+            if name_cmp != std::cmp::Ordering::Equal {
+                return name_cmp;
+            }
+
+            // Secondary: ID Length (Main game usually shorter ID than DLC, sometimes)
+            let len_cmp = a.len().cmp(&b.len());
+            if len_cmp != std::cmp::Ordering::Equal {
+                return len_cmp;
+            }
+
+            // Tertiary: ID Value
+            a.cmp(b)
+        });
+    } else {
+        // Fallback Numeric
+        entries.sort_by(|a, b| {
+            let na = a.parse::<u64>().unwrap_or(u64::MAX);
+            let nb = b.parse::<u64>().unwrap_or(u64::MAX);
+            na.cmp(&nb)
+        });
+    }
+
+    entries.dedup();
+
+    // 3. Write back
+    for (i, aid) in entries.iter().enumerate() {
         let text_path = al_path.join(format!("{}.txt", i));
         fs::write(text_path, aid)?;
     }

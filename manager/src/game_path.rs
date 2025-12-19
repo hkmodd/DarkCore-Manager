@@ -4,13 +4,13 @@ use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
-enum VdfValue {
+pub enum VdfValue {
     Str(String),
     Obj(Vec<(String, VdfValue)>), // Preserves order
 }
 
 impl VdfValue {
-    fn get_mut(&mut self, key: &str) -> Option<&mut VdfValue> {
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut VdfValue> {
         if let VdfValue::Obj(entries) = self {
             for (k, v) in entries {
                 if k.eq_ignore_ascii_case(key) {
@@ -21,7 +21,7 @@ impl VdfValue {
         None
     }
 
-    fn insert_or_update(&mut self, key: String, value: VdfValue) {
+    pub fn insert_or_update(&mut self, key: String, value: VdfValue) {
         if let VdfValue::Obj(entries) = self {
             for (k, v) in entries.iter_mut() {
                 if k.eq_ignore_ascii_case(&key) {
@@ -35,7 +35,7 @@ impl VdfValue {
     }
 
     // Helper to ensure path exists and get mutable ref to it
-    fn ensure_path(&mut self, path: &[&str]) -> Option<&mut VdfValue> {
+    pub fn ensure_path(&mut self, path: &[&str]) -> Option<&mut VdfValue> {
         if path.is_empty() {
             return Some(self);
         }
@@ -50,7 +50,7 @@ impl VdfValue {
         Some(current)
     }
 
-    fn has_key(&self, key: &str) -> bool {
+    pub fn has_key(&self, key: &str) -> bool {
         if let VdfValue::Obj(entries) = self {
             entries.iter().any(|(k, _)| k.eq_ignore_ascii_case(key))
         } else {
@@ -62,6 +62,19 @@ impl VdfValue {
 pub struct GamePathFinder;
 
 impl GamePathFinder {
+    pub fn find_manifest_path(steam_path: &str, app_id: &str) -> Option<PathBuf> {
+        let library_folders = Self::get_library_folders(steam_path);
+        for lib in library_folders {
+            let manifest_path = lib
+                .join("steamapps")
+                .join(format!("appmanifest_{}.acf", app_id));
+            if manifest_path.exists() {
+                return Some(manifest_path);
+            }
+        }
+        None
+    }
+
     pub fn find_game_path(steam_path: &str, app_id: &str) -> Option<PathBuf> {
         let library_folders = Self::get_library_folders(steam_path);
         for lib in library_folders {
@@ -201,8 +214,97 @@ impl GamePathFinder {
         Ok(())
     }
 
-    // --- Minimal VDF Parser ---
-    fn parse_vdf(input: &str) -> Option<VdfValue> {
+    pub fn find_parent_for_depot(steam_path: &str, depot_id: &str) -> Option<String> {
+        let config_path = PathBuf::from(steam_path).join("config").join("config.vdf");
+        if let Ok(content) = fs::read_to_string(config_path) {
+            if let Some(mut root) = Self::parse_vdf(&content) {
+                // Traverse to Apps
+                let mut current = &mut root;
+                let path = ["InstallConfigStore", "Software", "Valve", "Steam", "Apps"];
+
+                for &key in &path {
+                    if let Some(next) = current.get_mut(key) {
+                        current = next;
+                    } else {
+                        return None;
+                    }
+                }
+
+                // Now iterate all Apps
+                if let VdfValue::Obj(apps) = current {
+                    for (app_id, data) in apps {
+                        if let VdfValue::Obj(fields) = data {
+                            for (k, v) in fields {
+                                if k.eq_ignore_ascii_case("depots") {
+                                    if v.has_key(depot_id) {
+                                        return Some(app_id.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn find_parent_by_scanning_manifests(steam_path: &str, depot_id: &str) -> Option<String> {
+        let lib_folders = Self::get_library_folders(steam_path);
+
+        for lib in lib_folders {
+            let apps_dir = lib.join("steamapps");
+            if let Ok(paths) = fs::read_dir(apps_dir) {
+                for entry in paths.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "acf") {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            if !content.contains(depot_id) {
+                                continue;
+                            }
+
+                            if let Some(root) = Self::parse_vdf(&content) {
+                                if let VdfValue::Obj(entries) = root {
+                                    for (_, v) in entries {
+                                        if let VdfValue::Obj(fields) = v {
+                                            let mut current_appid = None;
+                                            let mut found_depot = false;
+
+                                            for (key, val) in fields {
+                                                if key.eq_ignore_ascii_case("appid") {
+                                                    if let VdfValue::Str(s) = &val {
+                                                        current_appid = Some(s.clone());
+                                                    }
+                                                }
+                                                if key.eq_ignore_ascii_case("MountedDepots") {
+                                                    if let VdfValue::Obj(depots) = &val {
+                                                        if depots
+                                                            .iter()
+                                                            .any(|(d_id, _)| d_id == depot_id)
+                                                        {
+                                                            found_depot = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            if found_depot {
+                                                return current_appid;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // --- Minimal VDF Parser Public ---
+    pub fn parse_vdf(input: &str) -> Option<VdfValue> {
         let mut tokens = VecDeque::new();
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
@@ -266,7 +368,7 @@ impl GamePathFinder {
         Some(VdfValue::Obj(entries))
     }
 
-    fn serialize_vdf(val: &VdfValue) -> String {
+    pub fn serialize_vdf(val: &VdfValue) -> String {
         let mut buf = String::new();
         Self::serialize_recursive(val, &mut buf, 0);
         buf
