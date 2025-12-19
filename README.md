@@ -82,7 +82,7 @@ DarkCore adapts to your environment in real-time.
 When a valid key is detected, DarkCore enforces **Strict Validation**, preventing the installation of broken or unsupported AppIDs. If it's not in the database, it doesn't touch your disk.
 
 ### ⚡ Technical Highlights
-*   **Rust Native**: Compiled to machine code. Zero interpreter overhead. 10MB standalone binary.
+*   **Rust Native**: Compiled to machine code. Zero interpreter overhead. 15.1MB standalone binary.
 *   **Cyberpunk Interface**: Built with `egui` (Immediate Mode GUI). High-FPS rendering, custom styling, responsive layout.
 *   **Limit Bypass**: Proprietary **Profile System** allows unlimited libraries by hot-swapping `AppList` configurations.
 *   **Steamless Automation**: Integrated GUI for `Steamless CLI` with **Auto-Backup** (`.bak`), **Auto-Rename**, and **Smart Detection**.
