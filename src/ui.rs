@@ -1126,10 +1126,15 @@ impl DarkCoreApp {
         ui.add_space(10.0);
 
         let mut path_row =
-            |ui: &mut egui::Ui, label: &str, valid: bool, txt: &mut String, is_dir: bool| {
+            |ui: &mut egui::Ui,
+             label: &str,
+             valid: bool,
+             txt: &mut String,
+             is_dir: bool,
+             hint: Option<&str>| {
                 ui.label(label);
                 ui.horizontal(|ui| {
-                    let tint = if valid {
+                    let _tint = if valid {
                         egui::Color32::GREEN
                     } else {
                         egui::Color32::RED
@@ -1153,6 +1158,9 @@ impl DarkCoreApp {
                             }
                         }
                     }
+                    if let Some(h) = hint {
+                        ui.label("❓").on_hover_text(h);
+                    }
                 });
                 ui.add_space(5.0);
             };
@@ -1163,6 +1171,7 @@ impl DarkCoreApp {
             Path::new(&self.config.steam_path).exists(),
             &mut self.config.steam_path,
             true,
+            None,
         );
         path_row(
             ui,
@@ -1170,6 +1179,7 @@ impl DarkCoreApp {
             Path::new(&self.config.gl_path).exists(),
             &mut self.config.gl_path,
             true,
+            Some("Folder containing DLLInjector.exe and AppList folder.\nSearch for 'GreenLuma 2024' on specialized forums."),
         );
         path_row(
             ui,
@@ -1177,11 +1187,15 @@ impl DarkCoreApp {
             Path::new(&self.config.steamless_path).exists(),
             &mut self.config.steamless_path,
             false,
+            Some("Steamless.CLI.exe required for DRM analysis.\nSearch for 'Steamless' on GitHub (atom0s)."),
         );
 
         ui.separator();
         ui.label("API Key (Morrenus):");
-        ui.text_edit_singleline(&mut self.config.api_key);
+        ui.horizontal(|ui| {
+             ui.text_edit_singleline(&mut self.config.api_key);
+             ui.label("❓").on_hover_text("Optional API Key for Manifest Downloads.\nSearch for 'Morrenus API' to find the Discord server.");
+        });
 
         ui.add_space(15.0);
         if ui
