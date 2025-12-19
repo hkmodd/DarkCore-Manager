@@ -15,15 +15,36 @@ use ui::DarkCoreApp;
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
+    // Load Icon
+    let icon_data = if let Ok(img) = image::open("icon.ico") {
+        let img = img.to_rgba8();
+        Some(eframe::egui::IconData {
+            rgba: img.as_raw().to_vec(),
+            width: img.width(),
+            height: img.height(),
+        })
+    } else {
+        None
+    };
+
+    let viewport = eframe::egui::ViewportBuilder::default()
+            .with_inner_size([1200.0, 800.0]) // Wider for Sidebar
+            .with_resizable(true)
+            .with_title("DarkCore Manager v1.2");
+
+    let viewport = if let Some(icon) = icon_data {
+        viewport.with_icon(icon)
+    } else {
+        viewport
+    };
+
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1150.0, 950.0])
-            .with_resizable(true),
+        viewport,
         ..Default::default()
     };
 
     eframe::run_native(
-        "DARKCORE MANAGER v10.4 Rust",
+        "DarkCore Manager v1.2",
         options,
         Box::new(|cc| Ok(Box::new(DarkCoreApp::new(cc)))),
     )

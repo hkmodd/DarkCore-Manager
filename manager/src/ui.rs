@@ -11,7 +11,7 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use zip::ZipArchive;
 
@@ -58,6 +58,11 @@ pub struct DarkCoreApp {
     delete_associated_dlcs: Vec<String>,
     is_scanning_dlcs: bool,
     dlc_scan_result: Arc<Mutex<Option<Vec<String>>>>,
+    
+    // Identity & Animation
+    logo_texture: Option<egui::TextureHandle>,
+    logo_data: Option<egui::ColorImage>,
+    tab_changed_at: Instant,
 }
 
 impl DarkCoreApp {
@@ -102,6 +107,22 @@ impl DarkCoreApp {
             delete_associated_dlcs: Vec::new(),
             is_scanning_dlcs: false,
             dlc_scan_result: Arc::new(Mutex::new(None)),
+            logo_texture: None,
+            logo_data: {
+                // EMBEDDED LOGO (Compile-time check)
+                // Relative to manager/src/ui.rs -> manager/logo.png
+                let bytes = include_bytes!("../logo.png"); 
+                if let Ok(img) = image::load_from_memory(bytes) {
+                    let img = img.to_rgba8();
+                    Some(egui::ColorImage::from_rgba_unmultiplied(
+                        [img.width() as usize, img.height() as usize],
+                        img.as_flat_samples().as_slice(),
+                    ))
+                } else {
+                    None
+                }
+            },
+            tab_changed_at: Instant::now(),
         };
 
         app.configure_visuals(&_cc.egui_ctx);
@@ -115,39 +136,66 @@ impl DarkCoreApp {
     }
 
     fn configure_visuals(&self, ctx: &egui::Context) {
+        let mut style = (*ctx.style()).clone();
+        
+        // FONT SIZES
+        style.text_styles = [
+            (egui::TextStyle::Heading, egui::FontId::new(24.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Body, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Monospace, egui::FontId::new(14.0, egui::FontFamily::Monospace)),
+            (egui::TextStyle::Button, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
+        ].into();
+        
+        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        style.spacing.button_padding = egui::vec2(15.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+        style.spacing.button_padding = egui::vec2(20.0, 10.0);
+        style.visuals.window_rounding = egui::Rounding::same(12.0);
+        // style.visuals.popup_shadow = egui::epaint::Shadow::big_dark(); // removed to avoid error
+        
+        ctx.set_style(style);
+
         let mut visuals = egui::Visuals::dark();
 
-        // Cyberpunk Palette
-        let bg_color = egui::Color32::from_rgb(5, 5, 10); // Deep Black/Blue
-        let surface_color = egui::Color32::from_rgb(20, 20, 25);
-        let accent_green = egui::Color32::from_rgb(0, 255, 150); // Neon Green
-        let accent_cyan = egui::Color32::from_rgb(0, 200, 255);
-        let text_color = egui::Color32::from_rgb(220, 220, 220);
+        // CYBERPUNK PALETTE
+        let bg_app = egui::Color32::from_rgb(11, 12, 16); // Obsidian
+        let bg_surface = egui::Color32::from_rgb(24, 26, 33); // Gunmetal
+        let accent_cyan = egui::Color32::from_rgb(0, 243, 255); // Neon Cyan
+        let accent_pink = egui::Color32::from_rgb(255, 0, 110); // Cyber Pink
+        //let accent_green = egui::Color32::from_rgb(0, 255, 136); // Toxic Green
+        let text_bright = egui::Color32::from_rgb(245, 245, 250); 
+        let text_dim = egui::Color32::from_rgb(160, 160, 180);
 
-        visuals.window_fill = bg_color;
-        visuals.panel_fill = bg_color;
+        visuals.window_fill = bg_app;
+        visuals.panel_fill = bg_app;
+        
+        // Non Interactive
+        visuals.widgets.noninteractive.bg_fill = bg_app;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_bright); // Changed from text_main to text_bright
 
-        // Widgets
-        visuals.widgets.noninteractive.bg_fill = bg_color;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_color);
+        // Buttons (Idle) - "Glassy" look
+        visuals.widgets.inactive.bg_fill = bg_surface;
+        visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_dim);
+        visuals.widgets.inactive.weak_bg_fill = bg_surface;
 
-        visuals.widgets.inactive.bg_fill = surface_color;
-        visuals.widgets.inactive.weak_bg_fill = surface_color;
-        visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(140));
+        // Buttons (Hover) - "Glow"
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(35, 38, 50);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_cyan);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.hovered.expansion = 2.0; 
 
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(40, 40, 50);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_green);
-        visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
-
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(60, 60, 70);
+        // Buttons (Active)
+        visuals.widgets.active.bg_fill = accent_cyan.linear_multiply(0.15);
         visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, accent_cyan);
-        visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(8.0);
+        visuals.widgets.active.expansion = 1.0;
 
         // Selection
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 100, 200);
-        visuals.selection.stroke = egui::Stroke::new(1.0, accent_cyan);
-
+        visuals.selection.bg_fill = accent_pink.linear_multiply(0.3);
+        visuals.selection.stroke = egui::Stroke::new(1.0, accent_pink);
+        
         ctx.set_visuals(visuals);
     }
 
@@ -155,31 +203,23 @@ impl DarkCoreApp {
         let msg = msg.into();
         if let Ok(mut logs) = self.system_log.lock() {
             logs.push(msg);
-            // Keep last 50 lines
-            if logs.len() > 50 {
-                logs.remove(0);
-            }
+            if logs.len() > 50 { logs.remove(0); }
         }
     }
 
     fn refresh_library(&mut self) {
-        if self.config.gl_path.is_empty() {
-            return;
-        }
+        if self.config.gl_path.is_empty() { return; }
         let gl_path = self.config.gl_path.clone();
-
         let cache_lock = self.game_cache.lock().unwrap();
         let cache_snapshot = cache_lock.clone();
         drop(cache_lock);
-
         let target = self.active_games.clone();
         let steam_path = self.config.steam_path.clone();
-
-        // Blocking for simplicity or could be async
         let games = refresh_active_games_list(&gl_path, &steam_path, &cache_snapshot);
         let mut target_guard = target.lock().unwrap();
         *target_guard = games;
     }
+
 
     fn perform_search(&self) {
         if let Some(client) = &self.api_client {
@@ -581,168 +621,162 @@ impl DarkCoreApp {
             }
 
             // STEP 5: DLL INJECTOR & RESTART
-            log("STEP 4: Converting Environment...".to_string());
-            
-            // TITAN MODE CHECK
-            // Check if titan_hook.dll exists in the same dir as our executable or gl_path
-            let titan_dll = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("titan_hook.dll")))
-                .unwrap_or_else(|| Path::new("titan_hook.dll").to_path_buf());
-
-            if titan_dll.exists() {
-                 log("TITAN MODE: Native Hooking Engine Detected.".to_string());
-                 // To use Titan Injection, we need the GAME EXECUTABLE path, not just steam://install
-                 // Since we don't know the game exe path easily without querying Steam installation, 
-                 // we cannot fully replace the "Install" button behavior which relies on Steam to download.
-                 //
-                 // HOWEVER, for "Play" (if game is installed), we could.
-                 // But this function is named `install_game`, and it launches `steam://install` which acts as Play if installed.
-                 //
-                 // LIMITATION: We can't inject into `steam://` URL launch. We must launch the exe directly.
-                 // For now, we will stick to the existing GreenLuma Injector (DLLInjector.exe) for the generic flow,
-                 // UNLESS the user explicitly wants Titan features.
-                 //
-                 // IF we want to inject TitanHook into the GAME, we must launch the game exe.
-                 //
-                 // PROPOSAL: Inject TitanHook into GreenLuma's DLLInjector? No, that's external.
-                 //
-                 // Let's stick to the GreenLuma flow for now as "Base", but if we want Titan features, we really need a "Launch Game" button that knows the Exe path.
-                 //
-                 // Falling back to standard GreenLuma behavior for stability as per "install_game" name.
-            }
+            log("STEP 4: Relaunching Steam (Injected)...".to_string());
             
             let injector_path = Path::new(&gl_path).join("DLLInjector.exe");
             if injector_path.exists() {
-                 if let Ok(mut _child) = Command::new(&injector_path).current_dir(&gl_path).spawn() {
-                     log("Injector launched. Waiting 15s...".to_string());
-                     std::thread::sleep(std::time::Duration::from_secs(15));
-                 }
+               use std::process::Stdio;
+               // We must set CurrentDir to GreenLuma folder or it might fail
+               if let Err(e) = Command::new(&injector_path)
+                   .current_dir(&gl_path)
+                   .stdout(Stdio::null())
+                   .stderr(Stdio::null())
+                   .spawn() {
+                       log(format!("Failed to launch Injector: {}", e));
+                   } else {
+                       log("Steam launched via GreenLuma. Install prompt should appear shortly.".to_string());
+                       std::thread::sleep(std::time::Duration::from_secs(5)); 
+                       let _ = Command::new("explorer")
+                           .arg(format!("steam://install/{}", appid))
+                           .spawn();
+                   }
+            } else {
+                log("ERROR: DLLInjector.exe not found in GreenLuma path!".to_string());
             }
-
-            log("STEP 5: Launching Installation...".to_string());
-            let _ = open::that(format!("steam://install/{}", appid));
-            log("Protocol Complete. Happy Gaming!".to_string());
         });
     }
+
+
 }
 
 impl eframe::App for DarkCoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Custom styling for Main Container
-        let main_frame = egui::containers::Frame::default()
-            .inner_margin(20.0)
-            .fill(egui::Color32::from_rgb(5, 5, 10));
+        // Custom Colors for this specific layout override
+        let bg_sidebar = egui::Color32::from_rgb(18, 20, 28);
+        let accent_cyan = egui::Color32::from_rgb(0, 243, 255);
+        let accent_pink = egui::Color32::from_rgb(255, 0, 110);
+        let _text_dim = egui::Color32::from_rgb(140, 140, 160);
 
-        // 0. CONFIG WARNING
-        if self.config.steam_path.is_empty() || self.config.gl_path.is_empty() {
-            egui::TopBottomPanel::top("warning").frame(egui::containers::Frame::default().fill(egui::Color32::RED)).show(ctx, |ui| {
-                 ui.centered_and_justified(|ui| {
-                      ui.label(egui::RichText::new("⚠️ SYSTEM WARNING: CONFIGURATION INCOMPLETE. PLEASE SET PATHS IN SETTINGS TAB.").color(egui::Color32::WHITE).strong());
-                 });
-             });
+        // Create Logo Texture lazy
+        if self.logo_texture.is_none() {
+            if let Some(data) = &self.logo_data {
+                self.logo_texture = Some(ctx.load_texture(
+                    "logo",
+                    data.clone(),
+                    egui::TextureOptions::LINEAR
+                ));
+            }
         }
 
-        egui::TopBottomPanel::top("header")
-            .frame(main_frame)
+        // --- SIDEBAR ---
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .default_width(240.0)
+            .frame(egui::containers::Frame::default().fill(bg_sidebar).inner_margin(16.0))
             .show(ctx, |ui| {
+                ui.add_space(10.0);
+                // LOGO & IDENTITY
                 ui.vertical_centered(|ui| {
-                    ui.add_space(5.0);
-                    ui.label(
-                        egui::RichText::new("// D4RKC0R3_MANAGER_v10.4")
-                            .color(egui::Color32::from_rgb(0, 255, 100))
-                            .size(28.0)
-                            .family(egui::FontFamily::Monospace)
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("[ SYSTEM_STATUS :: PURIFIED ]")
-                            .size(12.0)
-                            .family(egui::FontFamily::Monospace)
-                            .color(egui::Color32::from_rgb(0, 200, 255)),
-                    );
-
-                    if self.config.api_key.is_empty() {
-                        ui.add_space(5.0);
-                        ui.label(
-                            egui::RichText::new("⚠ FALLBACK MODE: STEAM FAMILY SHARE ONLY (NO API KEY)")
-                                .size(10.0)
-                                .color(egui::Color32::ORANGE)
-                                .strong(),
-                        )
-                        .on_hover_text("Morrenus API Key is missing. Manifests cannot be downloaded.\nOnly Family Shared games and Public DLCs are available.\nAdd a key in Settings for full unlocking power.");
+                    if let Some(texture) = &self.logo_texture {
+                         let size = texture.size_vec2();
+                         let target_width = 180.0;
+                         let scale = target_width / size.x;
+                         let target_height = size.y * scale;
+                         
+                         ui.image((texture.id(), egui::vec2(target_width, target_height)));
                     }
-                    ui.add_space(5.0);
-                });
-                ui.separator();
-                ui.add_space(5.0);
-            });
-
-        egui::TopBottomPanel::bottom("status")
-            .min_height(100.0)
-            .frame(main_frame)
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
+                    
+                    ui.add_space(8.0);
+                    
+                    // ARTISTIC HEADER
                     ui.label(
-                        egui::RichText::new("SYSTEM LOG")
-                            .font(egui::FontId::proportional(14.0))
-                            .color(egui::Color32::from_rgb(0, 200, 255)),
+                        egui::RichText::new("D A R K C O R E")
+                            .family(egui::FontFamily::Monospace)
+                            .size(22.0)
+                            .strong()
+                            .color(accent_cyan)
                     );
+                });
+                
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        egui::RichText::new("MANAGER v1.2")
+                            .size(10.0)
+                            .color(accent_pink)
+                            .extra_letter_spacing(2.0),
+                    );
+                });
+                
+                ui.add_space(30.0);
 
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .max_height(120.0)
-                        .show(ui, |ui| {
-                            let logs = self.system_log.lock().unwrap();
-                            for line in logs.iter() {
-                                ui.label(
-                                    egui::RichText::new(line)
-                                        .font(egui::FontId::monospace(12.0))
-                                        .color(egui::Color32::from_rgb(180, 180, 180)),
-                                );
+                // NAV BUTTONS HELPER
+                let mut nav_btn = |label: &str, icon: &str, tab_idx: usize| {
+                   let is_active = self.active_tab == tab_idx;
+                   let bg = if is_active { accent_cyan.linear_multiply(0.15) } else { egui::Color32::TRANSPARENT };
+                   let fg = if is_active { accent_cyan } else { egui::Color32::from_gray(180) };
+                   let stroke = if is_active { egui::Stroke::new(1.0, accent_cyan) } else { egui::Stroke::NONE };
+                   
+                   let btn = egui::Button::new(
+                       egui::RichText::new(format!("{}  {}", icon, label))
+                           .size(16.0)
+                           .color(fg)
+                   )
+                   .fill(bg)
+                   .stroke(stroke)
+                   .frame(true)
+                   .min_size(egui::vec2(200.0, 45.0));
+                   
+                   if ui.add(btn).clicked() {
+                       if self.active_tab != tab_idx {
+                            self.active_tab = tab_idx;
+                            self.tab_changed_at = Instant::now(); // Trigger Fade
+                            if tab_idx == 2 {
+                                self.refresh_library();
                             }
-                        });
+                       }
+                   }
+                   ui.add_space(8.0);
+                };
+
+                nav_btn("INSTALL", "🚀", 0);
+                nav_btn("LIBRARY", "📂", 2);
+                nav_btn("PROFILES", "💾", 3);
+                nav_btn("DRM INTEL", "🔍", 1);
+                nav_btn("SETTINGS", "⚙️", 4);
+
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                    ui.add_space(20.0);
+                    // STATUS
+                    ui.label(
+                        egui::RichText::new(&self.status_msg)
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(120)),
+                    );
+                    ui.separator();
                 });
             });
 
+        // --- CENTRAL CONTENT ---
         egui::CentralPanel::default()
-            .frame(main_frame.inner_margin(10.0))
+            .frame(egui::containers::Frame::default().fill(egui::Color32::from_rgb(11, 12, 16)).inner_margin(24.0))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.style_mut().spacing.item_spacing.x = 20.0;
-                    let tab_btn = |ui: &mut egui::Ui, label: &str, active: bool| {
-                        let color = if active {
-                            egui::Color32::from_rgb(0, 255, 100)
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        let text = egui::RichText::new(label).color(color).size(16.0).strong();
-                        if ui.add(egui::Button::new(text).frame(false)).clicked() {
-                            return true;
-                        }
-                        false
-                    };
+                // ANIMATION
+                let dt = self.tab_changed_at.elapsed().as_secs_f32();
+                let alpha = (dt / 0.25).clamp(0.0, 1.0); // 250ms fade
+                ui.set_opacity(alpha);
+                if alpha < 1.0 {
+                    ui.ctx().request_repaint();
+                }
+                // WARNING
+                if self.config.steam_path.is_empty() || self.config.gl_path.is_empty() {
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("⚠️ CONFIGURATION REQUIRED").color(egui::Color32::RED).strong());
+                        ui.label("Please go to Settings and configure paths.");
+                    });
+                    ui.add_space(20.0);
+                }
 
-                    if tab_btn(ui, "🚀 INSTALL", self.active_tab == 0) {
-                        self.active_tab = 0;
-                    }
-                    if tab_btn(ui, "🔍 DRM ANALYZER", self.active_tab == 1) {
-                        self.active_tab = 1;
-                    }
-                    if tab_btn(ui, "📂 LIBRARY", self.active_tab == 2) {
-                        self.active_tab = 2;
-                        self.refresh_library();
-                    }
-                    if tab_btn(ui, "📂 PROFILES", self.active_tab == 3) {
-                        self.active_tab = 3;
-                    }
-                    if tab_btn(ui, "⚙️ SETTINGS", self.active_tab == 4) {
-                        self.active_tab = 4;
-                    }
-                });
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(10.0);
+                // CONTENT
                 match self.active_tab {
                     0 => self.ui_installation(ui),
                     1 => self.ui_drm(ui),
@@ -751,6 +785,21 @@ impl eframe::App for DarkCoreApp {
                     4 => self.ui_settings(ui),
                     _ => self.ui_installation(ui),
                 }
+                
+                ui.add_space(20.0);
+                ui.separator();
+                // LOGS (Small footer in main area)
+                 egui::CollapsingHeader::new(egui::RichText::new("SYSTEM LOGS").size(12.0).color(egui::Color32::from_gray(100)))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
+                             if let Ok(logs) = self.system_log.lock() {
+                                 for line in logs.iter().rev() {
+                                     ui.monospace(line);
+                                 }
+                             }
+                        });
+                    });
             });
 
         // POLL SCAN RESULT
@@ -896,6 +945,31 @@ impl DarkCoreApp {
             {
                 self.perform_search();
                 self.last_input_time = None;
+            }
+
+            ui.add_space(20.0);
+            
+            // LAUNCH STEAM BUTTON
+            let btn_launch = egui::Button::new(
+                egui::RichText::new("🚀 LAUNCH STEAM (INJECTED)")
+                    .size(14.0)
+                    .color(egui::Color32::YELLOW)
+                    .strong()
+            ).fill(egui::Color32::from_rgb(50, 50, 60));
+
+            if ui.add(btn_launch).on_hover_text("Manually start Steam via GreenLuma Injector").clicked() {
+                 let greenluma_path = PathBuf::from(self.config.gl_path.clone());
+                 let injector_exe = greenluma_path.join("DLLInjector.exe");
+                 if injector_exe.exists() {
+                     self.log("Manual Launch: Starting Steam (GreenLuma)...".to_string());
+                     if let Err(e) = std::process::Command::new(&injector_exe)
+                         .current_dir(&greenluma_path)
+                         .spawn() {
+                             self.log(format!("Launch Error: {}", e));
+                         }
+                 } else {
+                     self.log("Error: DLLInjector.exe not found.".to_string());
+                 }
             }
         });
 
@@ -1164,7 +1238,21 @@ impl DarkCoreApp {
                                                         match crate::game_path::GamePathFinder::suppress_cloud_sync(&steam_path, &game.app_id) {
                                                             Ok(_) => {
                                                                 self.log("Cloud Sync Suppressed (localconfig patched).".to_string());
-                                                                self.log("Steam Terminated. PLEASE RESTART STEAM to apply changes.".to_string());
+                                                                
+                                                                // AUTO-RESTART STEAM via GreenLuma Injector
+                                                                let greenluma_path = PathBuf::from(self.config.gl_path.clone());
+                                                                let injector_exe = greenluma_path.join("DLLInjector.exe");
+                                                                
+                                                                if injector_exe.exists() {
+                                                                     self.log("Restarting Steam (GreenLuma)...".to_string());
+                                                                     if let Err(e) = std::process::Command::new(injector_exe)
+                                                                         .current_dir(greenluma_path) 
+                                                                         .spawn() {
+                                                                             self.log(format!("Failed to auto-restart Steam: {}", e));
+                                                                         }
+                                                                } else {
+                                                                    self.log("Steam Terminated. PLEASE RESTART STEAM MANUALLY (Injector not found).".to_string());
+                                                                }
                                                             },
                                                             Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
                                                         }
