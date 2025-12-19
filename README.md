@@ -162,15 +162,16 @@ Upon first boot, the core system requires mapping to your local ecosystem. Navig
 ### 2. The Execution Cycle
 DarkCore streamlines the deployment process into a deterministic linear workflow:
 
-1.  **Query**: Navigate to **SEARCH**, input a specific AppID or Game Name. The system actively queries the selected database.
-2.  **Selection**: Choose your target application. The interface will populate available DLC content dynamically.
-3.  **Titan Activation (Crucial)**: For specific titles requiring local emulation (e.g., *Spyro Reignited*), click the **ACTIVATE TITAN** button.
-    *   *Action*: Deploys the `titan_hook.dll` proxy and performs "State Harmonization" on the Steam Cloud config.
-4.  **Engage**: Click **PLAY / INJECT**.
-    *   *Sequence Initiated*: `Terminate Steam` -> `Generate AppList` -> `Inject Configs` -> `Restart Steam` -> `Inject GreenLuma`.
+1.  **Query**: Navigate to **SEARCH**, input a specific AppID or Game Name.
+2.  **Engage**: Click **PLAY / INJECT**.
+    *   *Sequence Initiated*: `Terminate Steam` -> `Generate AppList` -> `Restart Steam` -> `Inject GreenLuma`.
+    *   *Result*: The game appears in your Steam Library. **Install/Download it now.**
+3.  **Titan Activation (Post-Install)**: Once the game files are on disk (or if you encounter Cloud/Save errors), return to DarkCore and click **ACTIVATE TITAN** on the game card.
+    *   *Automation*: The system will automatically **Terminate Steam** to safely inject the `titan_hook.dll` proxy and patch the Cloud Configuration.
+    *   *Final Step*: Restart Steam to apply the Cloud "State Harmonization".
 
-> [!IMPORTANT]
-> **Process Hygiene**: Always ensure Steam is **fully terminated** before initiating a new injection cycle to prevent file locking or memory offset conflicts.
+> [!TIP]
+> **Process Hygiene**: DarkCore now automatically handles Steam termination during critical operations (Injection & Titan Deployment) to prevent file locking. You do not need to manually close Steam.
 
 ---
 
