@@ -101,8 +101,8 @@ We believe in transparency. Build it yourself.
 
 1.  **Clone Repository**
     ```powershell
-    git clone https://github.com/YourUsername/darkcore-rust.git
-    cd darkcore-rust
+    git clone https://github.com/hkmodd/DarkCore-Manager
+    cd <foldername>
     ```
 
 2.  **Asset Injection (Optional)**
