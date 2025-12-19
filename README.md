@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="manager/logo.png" alt="DarkCore Logo" width="128" height="128">
+  <img src="manager/logo.png" alt="DarkCore Logo" width="192" height="192">
   <br>
   <br>
   <pre>
