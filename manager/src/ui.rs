@@ -738,16 +738,18 @@ impl eframe::App for DarkCoreApp {
         let accent_pink = egui::Color32::from_rgb(255, 0, 110);
         let _text_dim = egui::Color32::from_rgb(140, 140, 160);
 
-        // Create Logo Texture lazy
-        if self.logo_texture.is_none() {
             if let Some(data) = &self.logo_data {
                 self.logo_texture = Some(ctx.load_texture(
-                    "logo",
+                    "logo_v5_final",
                     data.clone(),
-                    egui::TextureOptions::LINEAR
+                    egui::TextureOptions {
+                        magnification: egui::TextureFilter::Linear,
+                        minification: egui::TextureFilter::Linear,
+                        mipmap_mode: Some(egui::TextureFilter::Linear),
+                        ..egui::TextureOptions::LINEAR
+                    }
                 ));
             }
-        }
 
         // --- SIDEBAR ---
         egui::SidePanel::left("sidebar")
@@ -1008,30 +1010,8 @@ impl eframe::App for DarkCoreApp {
                     _ => self.ui_installation(ui),
                 }
                 
-                ui.add_space(20.0);
-                ui.separator();
-                // LOGS (Small footer in main area)
-                 egui::CollapsingHeader::new(egui::RichText::new("SYSTEM LOGS").size(12.0).color(egui::Color32::from_gray(100)))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
-                             if let Ok(logs) = self.system_log.lock() {
-                                 for line in logs.iter().rev() {
-                                     let color = if line.to_uppercase().contains("ERROR") {
-                                         egui::Color32::from_rgb(255, 80, 80)
-                                     } else if line.contains("SUCCESS") || line.contains("Done") || line.contains("Ready") {
-                                         egui::Color32::from_rgb(80, 255, 80)
-                                     } else if line.contains("WARN") {
-                                         egui::Color32::from_rgb(255, 200, 0)
-                                     } else {
-                                         egui::Color32::from_gray(150)
-                                     };
-                                     
-                                     ui.label(egui::RichText::new(line).color(color).family(egui::FontFamily::Monospace));
-                                 }
-                             }
-                        });
-                    });
+                // Global Footer Removed (Logs are now per-tab or sidebar)
+                ui.add_space(5.0);
             });
 
         // POLL SCAN RESULT
@@ -1143,34 +1123,8 @@ impl DarkCoreApp {
         self.process_cover_queue(ctx_ui.ctx()); // Process queue here
 
         // SYSTEM LOGS (Pinned Bottom)
-        egui::TopBottomPanel::bottom("install_logs_panel")
-            .resizable(true)
-            .min_height(100.0)
-            .default_height(200.0)
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(15, 15, 20)).inner_margin(10.0))
-            .show_inside(ctx_ui, |ui| {
-                 ui.horizontal(|ui| {
-                     ui.label("📜");
-                     ui.label(egui::RichText::new("SYSTEM LOGS").size(12.0).strong().color(egui::Color32::GRAY));
-                 });
-                 ui.separator();
-                 
-                 egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if let Ok(log) = self.system_log.lock() {
-                             for line in log.iter() {
-                                 ui.label(
-                                     egui::RichText::new(line)
-                                         .monospace()
-                                         .size(11.0)
-                                         .color(egui::Color32::from_rgb(180, 180, 190))
-                                 );
-                             }
-                        }
-                    });
-            });
+        // Logs moved to bottom.
+
 
         // MAIN CONTENT
         egui::CentralPanel::default().show_inside(ctx_ui, |ui| {
@@ -1249,7 +1203,11 @@ impl DarkCoreApp {
         let search_results = self.search_results.clone();
         let results = search_results.lock().unwrap();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let available = ui.available_height();
+        let log_height = 200.0;
+        let results_h = (available - log_height - 20.0).max(100.0);
+
+        egui::ScrollArea::vertical().id_salt("results_scroll").max_height(results_h).show(ui, |ui| {
             for res in results.iter() {
                 use crate::api::val_to_string;
                 let name = res.game_name.as_deref().or(res.name.as_deref()).unwrap_or("Unknown");
@@ -1345,6 +1303,24 @@ impl DarkCoreApp {
                 });
                 ui.add_space(5.0);
             }
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| { 
+             ui.label("📜"); 
+             ui.label(egui::RichText::new("SYSTEM LOGS").size(12.0).strong().color(egui::Color32::GRAY)); 
+        });
+
+        egui::ScrollArea::vertical().id_salt("log_scroll").max_height(200.0).stick_to_bottom(true).show(ui, |ui| {
+             if let Ok(log) = self.system_log.lock() {
+                 for line in log.iter() {
+                     let color = if line.to_uppercase().contains("ERROR") { egui::Color32::from_rgb(255, 80, 80) } 
+                                 else if line.contains("SUCCESS") || line.contains("Done") || line.contains("Ready") { egui::Color32::from_rgb(80, 255, 80) } 
+                                 else if line.contains("WARN") { egui::Color32::from_rgb(255, 200, 0) } 
+                                 else { egui::Color32::from_rgb(180, 180, 190) };
+                     ui.label(egui::RichText::new(line).monospace().size(11.0).color(color));
+                 }
+             }
         });
         });
     }
