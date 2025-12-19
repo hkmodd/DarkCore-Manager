@@ -10,7 +10,8 @@
 ██████╔╝██║  ██║██║  ██║██║  ██╗╚██████╗╚██████╔╝██║  ██║███████╗
 ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
   </pre>
-  <h3>System Orchestration & Compatibility Layer</h3>
+  <h3>DarkCore Manager v1.2 "Project Neon"</h3>
+  <h4>System Orchestration & Compatibility Layer</h4>
   <p>
     <b>High-Performance. Memory-Safe. Cyberpunk Aesthetics.</b>
   </p>
@@ -110,7 +111,7 @@ When a valid key is detected, DarkCore enforces **Strict Validation**, preventin
 
 ### ⚡ Technical Highlights
 *   **Rust Native**: Compiled to machine code. Zero interpreter overhead. 15.1MB standalone binary.
-*   **Cyberpunk Interface**: Built with `egui` (Immediate Mode GUI). High-FPS rendering, custom styling, responsive layout.
+*   **Project Neon UI**: Rebuilt with a "Glass & Glow" design language. Features a fixed Sidebar navigation, adaptive layouts, and 250ms fade animations for a premium feel.
 *   **Limit Bypass**: Proprietary **Profile System** allows unlimited libraries by hot-swapping `AppList` configurations.
 *   **Steamless Automation**: Integrated GUI for `Steamless CLI` with **Auto-Backup** (`.bak`), **Auto-Rename**, and **Smart Detection**.
 
@@ -133,7 +134,8 @@ We believe in transparency. Build it yourself.
     ```
 
 2.  **Asset Injection (Optional)**
-    *   Place your `icon.ico` in the `manager/` directory. The build system will fuse it into the executable.
+    *   **Logo**: Automatically embedded (`baked-in`) at compile time.
+    *   **Icon**: Place your `icon.ico` in the `manager/` directory to override the window icon.
 
 3.  **Compile System**
     ```powershell
@@ -167,8 +169,7 @@ DarkCore streamlines the deployment process into a deterministic linear workflow
     *   *Sequence Initiated*: `Terminate Steam` -> `Generate AppList` -> `Restart Steam` -> `Inject GreenLuma`.
     *   *Result*: The game appears in your Steam Library. **Install/Download it now.**
 3.  **Titan Activation (Post-Install)**: Once the game files are on disk (or if you encounter Cloud/Save errors), return to DarkCore and click **ACTIVATE TITAN** on the game card.
-    *   *Automation*: The system will automatically **Terminate Steam** to safely inject the `titan_hook.dll` proxy and patch the Cloud Configuration.
-    *   *Final Step*: Restart Steam to apply the Cloud "State Harmonization".
+    *   *Automation*: The system automatically **Terminates Steam**, deploys the Titan Hook, patches the Cloud Configuration, and **Auto-Restarts Steam** via the Injector. Zero manual intervention required.
 
 > [!TIP]
 > **Process Hygiene**: DarkCore now automatically handles Steam termination during critical operations (Injection & Titan Deployment) to prevent file locking. You do not need to manually close Steam.
