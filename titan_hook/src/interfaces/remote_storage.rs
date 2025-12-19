@@ -114,7 +114,7 @@ unsafe extern "C" fn detour_file_write(
 }
 
 unsafe extern "C" fn detour_file_read(
-    this: *mut c_void,
+    _this: *mut c_void, // Fixed unused variable
     filename: *const i8,
     data: *mut u8,
     size: i32,
@@ -135,8 +135,6 @@ unsafe extern "C" fn detour_file_read(
         }
     }
 
-    // Fallback to original? Usually not if we want to be full emu, but for mixed mode...
-    // No, if checking local failed, return 0 (not found) to avoid Cloud confusion.
     0
 }
 
@@ -196,9 +194,9 @@ unsafe extern "C" fn detour_get_file_name_and_size(
                 }
                 let name = file_path.file_name().unwrap().to_string_lossy().to_string();
                 let c_str = CString::new(name).unwrap();
-                let ptr = c_str.as_ptr();
-                LAST_FILENAME_BUF = c_str.into_bytes_with_nul();
-                return LAST_FILENAME_BUF.as_ptr() as *const i8;
+                let last_buf = std::ptr::addr_of_mut!(LAST_FILENAME_BUF);
+                (*last_buf) = c_str.into_bytes_with_nul();
+                return (*last_buf).as_ptr() as *const i8;
             }
         }
     }

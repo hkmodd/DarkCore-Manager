@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 

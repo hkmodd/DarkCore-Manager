@@ -8,6 +8,7 @@ use crate::profiles::{Profile, ProfileManager};
 use crate::steamless;
 use crate::vdf_injector::{inject_vdf, parse_lua_for_keys};
 use eframe::egui;
+use rodio::Source;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Cursor;
@@ -16,6 +17,16 @@ use std::sync::{Arc, Mutex};
 use zip::ZipArchive;
 
 use std::time::{Duration, Instant};
+
+#[derive(Clone)]
+struct MatrixTrail {
+    x: f32,
+    head_y: f32,
+    speed: f32,
+    len: usize,
+    chars: Vec<char>,
+    layer: u8, // 0=Back (Slow/Small), 1=Mid, 2=Front (Fast/Large)
+}
 
 pub struct DarkCoreApp {
     config: AppConfig,
@@ -51,7 +62,20 @@ pub struct DarkCoreApp {
     profile_name_input: String,
     active_profile_name: String,
 
-    // Smart Delete
+    // Thread Communication
+    status_update_queue: Arc<Mutex<Option<String>>>,
+    
+    // Matrix Easter Egg
+    matrix_trails: Vec<MatrixTrail>,
+
+    // API Key Glitch State
+    api_key_glitch_update: Instant,
+    api_key_glitch_cache: String,
+
+    // Feedback State
+    config_saved_at: Option<Instant>,
+
+    // UI State
     delete_modal_open: bool,
     delete_candidate_id: Option<String>,
     delete_candidate_name: Option<String>,
@@ -63,6 +87,16 @@ pub struct DarkCoreApp {
     logo_texture: Option<egui::TextureHandle>,
     logo_data: Option<egui::ColorImage>,
     tab_changed_at: Instant,
+
+    // Audio
+    _audio_stream: Option<rodio::OutputStream>,
+    _audio_stream_handle: Option<rodio::OutputStreamHandle>,
+    audio_sink: Option<rodio::Sink>,
+    volume: f32,
+
+    // Steamless Context
+    steamless_app_id: String,
+    steamless_auto_titan: bool,
 }
 
 impl DarkCoreApp {
@@ -123,7 +157,43 @@ impl DarkCoreApp {
                 }
             },
             tab_changed_at: Instant::now(),
+            
+            // Audio Init
+            _audio_stream: None,
+            _audio_stream_handle: None,
+            audio_sink: None,
+            volume: 0.02, // Ultra-Quiet Background (Whisper Level)
+
+            steamless_app_id: String::new(),
+            steamless_auto_titan: true,
+
+            status_update_queue: Arc::new(Mutex::new(None)),
+
+            matrix_trails: Vec::new(),
+            
+            api_key_glitch_update: Instant::now(),
+            api_key_glitch_cache: String::new(),
+
+            config_saved_at: None,
         };
+
+        // Initialize Audio Thread
+        if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+            if let Ok(sink) = rodio::Sink::try_new(&handle) {
+                // Load embedded track
+                let bytes = include_bytes!("../Neon Veins.mp3");
+                let cursor = std::io::Cursor::new(bytes);
+                if let Ok(source) = rodio::Decoder::new(cursor) {
+                     sink.append(source.repeat_infinite());
+                     sink.set_volume(0.02);
+                     sink.play();
+                     
+                     app._audio_stream = Some(stream);
+                     app._audio_stream_handle = Some(handle);
+                     app.audio_sink = Some(sink);
+                }
+            }
+        }
 
         app.configure_visuals(&_cc.egui_ctx);
 
@@ -222,7 +292,7 @@ impl DarkCoreApp {
 
 
     fn perform_search(&self) {
-        if let Some(client) = &self.api_client {
+        if let Some(_client) = &self.api_client {
             if self.search_query.is_empty() {
                 return;
             }
@@ -310,7 +380,7 @@ impl DarkCoreApp {
                                      let queue = cover_queue.clone();
                                      let appid_clone = appid.clone();
                                      let dl_client = dl_client.clone();
-                                     let log_arc_inner = log_arc.clone();
+                                     let _log_arc_inner = log_arc.clone();
                                      
                                      handles.push(tokio::spawn(async move {
                                          let url_portrait = format!("https://steamcdn-a.akamaihd.net/steam/apps/{}/library_600x900.jpg", appid_clone);
@@ -387,12 +457,11 @@ impl DarkCoreApp {
 
     fn resolve_unknown_games(&mut self) {
         // Hybrid System: Even without key, we can resolve names via Steam Store API.
-
-
         let active_games = self.active_games.clone();
         let game_cache = self.game_cache.clone();
         let client_key = self.config.api_key.clone();
-        let client = ApiClient::new(client_key.clone());
+        // let client = ApiClient::new(client_key.clone()); // Unused here, created inside thread
+        let status_queue = self.status_update_queue.clone();
 
         self.status_msg = "Resolving unknown games...".to_string();
 
@@ -482,6 +551,11 @@ impl DarkCoreApp {
                     let _ = h.await;
                 }
             });
+            
+            // Signal Completion
+            if let Ok(mut guard) = status_queue.lock() {
+                *guard = Some("Resolution Complete.".to_string());
+            }
         });
     }
 
@@ -651,6 +725,13 @@ impl DarkCoreApp {
 
 impl eframe::App for DarkCoreApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Poll Status Updates from Threads
+        if let Ok(mut guard) = self.status_update_queue.lock() {
+            if let Some(msg) = guard.take() {
+                self.status_msg = msg;
+            }
+        }
+
         // Custom Colors for this specific layout override
         let bg_sidebar = egui::Color32::from_rgb(18, 20, 28);
         let accent_cyan = egui::Color32::from_rgb(0, 243, 255);
@@ -676,21 +757,39 @@ impl eframe::App for DarkCoreApp {
             .show(ctx, |ui| {
                 ui.add_space(10.0);
                 // LOGO & IDENTITY
-                ui.vertical_centered(|ui| {
-                    if let Some(texture) = &self.logo_texture {
-                         let size = texture.size_vec2();
-                         let target_width = 180.0;
-                         let scale = target_width / size.x;
-                         let target_height = size.y * scale;
-                         
-                         ui.image((texture.id(), egui::vec2(target_width, target_height)));
-                    }
-                    
-                    ui.add_space(8.0);
-                    
-                    // ARTISTIC HEADER
-                    ui.label(
-                        egui::RichText::new("D A R K C O R E")
+            ui.vertical_centered(|ui| {
+                if let Some(texture) = &self.logo_texture {
+                     // Animation State
+                     let time = ui.input(|i| i.time);
+                     let hover = (time * 1.5).sin() * 5.0; // +/- 5px Float
+                     let pulse = (time * 2.0).sin() * 0.1 + 0.9; // 0.8-1.0 Opacity
+
+                     // Continuous Repaint for Animation
+                     ui.ctx().request_repaint();
+
+                     // Dynamic Spacing (Floating Effect)
+                     ui.add_space(15.0 + hover as f32);
+
+                     let size = texture.size_vec2();
+                     let target_width = 180.0;
+                     let scale = target_width / size.x;
+                     let target_height = size.y * scale;
+                     
+                     // Draw Animated Image
+                     ui.add(
+                        egui::Image::new((texture.id(), egui::vec2(target_width, target_height)))
+                            .tint(egui::Color32::WHITE.linear_multiply(pulse as f32))
+                     );
+                     
+                     // Counter-act spacing to keep header stable
+                     ui.add_space(8.0 - hover as f32);
+                } else {
+                     ui.add_space(10.0);
+                }
+
+                // ARTISTIC HEADER
+                ui.label(
+                    egui::RichText::new("D A R K C O R E")
                             .family(egui::FontFamily::Monospace)
                             .size(22.0)
                             .strong()
@@ -726,7 +825,10 @@ impl eframe::App for DarkCoreApp {
                    .frame(true)
                    .min_size(egui::vec2(200.0, 45.0));
                    
-                   if ui.add(btn).clicked() {
+                   let response = ui.add(btn);
+                   
+                   // HOVER / CLICK NAVIGATION
+                   if response.clicked() || response.hovered() {
                        if self.active_tab != tab_idx {
                             self.active_tab = tab_idx;
                             self.tab_changed_at = Instant::now(); // Trigger Fade
@@ -735,6 +837,11 @@ impl eframe::App for DarkCoreApp {
                             }
                        }
                    }
+                   
+                   // Ensure smooth animation when interacting
+                   if response.hovered() {
+                       ui.ctx().request_repaint();
+                   }
                    ui.add_space(8.0);
                 };
 
@@ -742,16 +849,130 @@ impl eframe::App for DarkCoreApp {
                 nav_btn("LIBRARY", "📂", 2);
                 nav_btn("PROFILES", "💾", 3);
                 nav_btn("DRM INTEL", "🔍", 1);
-                nav_btn("SETTINGS", "⚙️", 4);
+                nav_btn("SETTINGS", "⚙", 4);
+                nav_btn("ABOUT", "💻", 5);
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                    ui.add_space(20.0);
+                    ui.add_space(10.0);
                     // STATUS
                     ui.label(
                         egui::RichText::new(&self.status_msg)
                             .size(10.0)
-                            .color(egui::Color32::from_gray(120)),
+                            .color(egui::Color32::from_gray(100)),
                     );
+
+                    // AUDIO CONTROLS
+                    if let Some(sink) = &self.audio_sink {
+                        ui.separator();
+                        ui.add_space(5.0);
+                        
+                        // CUSTOM NEON VOLUME BAR
+                        let bar_height = 24.0;
+                        let (rect, response) = ui.allocate_at_least(egui::vec2(ui.available_width(), bar_height), egui::Sense::click_and_drag());
+                        
+                        // INTERACTION
+                        let mut volume_changed = false;
+                        
+                        // 1. Mouse Wheel (Requested Feature)
+                        if response.hovered() {
+                             let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                             if scroll != 0.0 {
+                                  // Scroll up = Volume Up
+                                  self.volume = (self.volume + scroll * 0.005).clamp(0.0, 1.0);
+                                  volume_changed = true;
+                             }
+                        }
+                        
+                        // 2. Click/Drag
+                        if response.dragged() || response.clicked() {
+                             if let Some(ptr) = response.interact_pointer_pos() {
+                                 let rel = (ptr.x - rect.min.x) / rect.width();
+                                 self.volume = rel.clamp(0.0, 1.0);
+                                 volume_changed = true;
+                             }
+                        }
+                        
+                        if volume_changed {
+                            sink.set_volume(self.volume);
+                            ui.ctx().request_repaint();
+                        }
+
+                        // VISUALS ("Extremely Cool")
+                        let painter = ui.painter();
+                        let time = ui.input(|i| i.time);
+                        
+                        // Background Groove
+                        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(200));
+                        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(40)));
+                        
+                        // Dynamic Fill
+                        let fill_w = rect.width() * self.volume;
+                        let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_w, rect.height()));
+                        
+                        // Neon Color Pulse
+                        let pulse = (time * 3.0).sin() * 0.2 + 0.8;
+                        let neon_base = egui::Color32::from_rgb(0, 255, 200); // Cyan-Green
+                        let neon_color = neon_base.linear_multiply(pulse as f32);
+                        
+                        if self.volume > 0.0 {
+                            painter.rect_filled(fill_rect, 4.0, neon_color.linear_multiply(0.3)); // Glow halo
+                            painter.rect_filled(fill_rect.shrink(2.0), 3.0, neon_color); // Core
+                        }
+                        
+                        // FAKE AUDIO WAVES (Spectrum Visualizer Effect)
+                        let bars = 18;
+                        let bar_w = rect.width() / bars as f32;
+                        for i in 0..bars {
+                             let x = rect.min.x + i as f32 * bar_w;
+                             // Simulation: Sine wave based on time + index + volume loudness
+                             let phase = time * 8.0 + (i as f64 * 0.8);
+                             // Amplitude modulated by volume (so it flattens when quiet)
+                             let raw_amp = (phase.sin() * 0.5 + 0.5) as f32; 
+                             let amp = raw_amp * (self.volume * 1.5).min(1.0); 
+                             
+                             let h = rect.height() * 0.7 * amp;
+                             if h < 2.0 { continue; }
+                             
+                             let y_base = rect.max.y - 4.0;
+                             let y_top = y_base - h;
+
+                             // Only draw bars essentially "inside" the fill for contrast? 
+                             // Or draw everywhere?
+                             // Let's draw white bars inside the fill, gray outside?
+                             let bar_rect = egui::Rect::from_min_max(egui::pos2(x + 1.0, y_top), egui::pos2(x + bar_w - 1.0, y_base));
+                             
+                             if x < rect.min.x + fill_w {
+                                 // Active Spectrum
+                                 painter.rect_filled(bar_rect, 1.0, egui::Color32::WHITE.linear_multiply(0.6));
+                             } else {
+                                 // Passive (Dark)
+                                 painter.rect_filled(bar_rect, 1.0, egui::Color32::from_white_alpha(10));
+                             }
+                        }
+                        
+                        // Text Overlay (Volume %)
+                        let vol_pct = (self.volume * 100.0) as u32;
+                        painter.text(
+                            rect.center(), 
+                            egui::Align2::CENTER_CENTER, 
+                            format!("VOL {}%", vol_pct), 
+                            egui::FontId::proportional(10.0), 
+                            egui::Color32::WHITE
+                        );
+
+                        // PLAY/PAUSE Toggle
+                        ui.add_space(4.0);
+                        let btn_txt = if sink.is_paused() { "▶ RESUME AUDIO" } else { "⏸ PAUSE AUDIO" };
+                        let btn = egui::Button::new(egui::RichText::new(btn_txt).size(10.0).strong())
+                            .min_size(egui::vec2(rect.width(), 16.0))
+                            .fill(egui::Color32::from_black_alpha(100))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                            
+                        if ui.add(btn).clicked() {
+                             if sink.is_paused() { sink.play(); } else { sink.pause(); }
+                        }
+                        ui.add_space(5.0);
+                    }
                     ui.separator();
                 });
             });
@@ -783,6 +1004,7 @@ impl eframe::App for DarkCoreApp {
                     2 => self.ui_library(ui),
                     3 => self.ui_profiles(ui),
                     4 => self.ui_settings(ui),
+                    5 => self.ui_info(ui),
                     _ => self.ui_installation(ui),
                 }
                 
@@ -795,7 +1017,17 @@ impl eframe::App for DarkCoreApp {
                         egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
                              if let Ok(logs) = self.system_log.lock() {
                                  for line in logs.iter().rev() {
-                                     ui.monospace(line);
+                                     let color = if line.to_uppercase().contains("ERROR") {
+                                         egui::Color32::from_rgb(255, 80, 80)
+                                     } else if line.contains("SUCCESS") || line.contains("Done") || line.contains("Ready") {
+                                         egui::Color32::from_rgb(80, 255, 80)
+                                     } else if line.contains("WARN") {
+                                         egui::Color32::from_rgb(255, 200, 0)
+                                     } else {
+                                         egui::Color32::from_gray(150)
+                                     };
+                                     
+                                     ui.label(egui::RichText::new(line).color(color).family(egui::FontFamily::Monospace));
                                  }
                              }
                         });
@@ -907,8 +1139,41 @@ impl DarkCoreApp {
         ctx.request_repaint();
     }
 
-    fn ui_installation(&mut self, ui: &mut egui::Ui) {
-        self.process_cover_queue(ui.ctx()); // Process queue here
+    fn ui_installation(&mut self, ctx_ui: &mut egui::Ui) {
+        self.process_cover_queue(ctx_ui.ctx()); // Process queue here
+
+        // SYSTEM LOGS (Pinned Bottom)
+        egui::TopBottomPanel::bottom("install_logs_panel")
+            .resizable(true)
+            .min_height(100.0)
+            .default_height(200.0)
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(15, 15, 20)).inner_margin(10.0))
+            .show_inside(ctx_ui, |ui| {
+                 ui.horizontal(|ui| {
+                     ui.label("📜");
+                     ui.label(egui::RichText::new("SYSTEM LOGS").size(12.0).strong().color(egui::Color32::GRAY));
+                 });
+                 ui.separator();
+                 
+                 egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if let Ok(log) = self.system_log.lock() {
+                             for line in log.iter() {
+                                 ui.label(
+                                     egui::RichText::new(line)
+                                         .monospace()
+                                         .size(11.0)
+                                         .color(egui::Color32::from_rgb(180, 180, 190))
+                                 );
+                             }
+                        }
+                    });
+            });
+
+        // MAIN CONTENT
+        egui::CentralPanel::default().show_inside(ctx_ui, |ui| {
         ui.label(
             egui::RichText::new("SEARCH & AUTOMATION")
                 .color(egui::Color32::from_rgb(0, 200, 255))
@@ -995,8 +1260,8 @@ impl DarkCoreApp {
 
                 // Animated Card Hover
                 let card_id = ui.make_persistent_id(&display_id);
-                let is_hovered = ui.ctx().animate_bool(card_id, 
-                     ui.input(|i| i.pointer.hover_pos().map_or(false, |pos| {
+                let _is_hovered = ui.ctx().animate_bool(card_id, 
+                     ui.input(|i| i.pointer.hover_pos().map_or(false, |_pos| {
                          // We don't have rect yet, simple hack: 
                          // Just use "interact" on the frame response below
                          false // We'll set it after
@@ -1081,10 +1346,14 @@ impl DarkCoreApp {
                 ui.add_space(5.0);
             }
         });
+        });
     }
 
     fn ui_drm(&mut self, ui: &mut egui::Ui) {
-        ui.label("Steamless CLI Unpacker");
+        ui.heading("STEAMLESS DRM REMOVAL");
+        ui.add_space(10.0);
+
+        ui.label("Target Executable:");
         ui.horizontal(|ui| {
             ui.text_edit_singleline(&mut self.target_exe);
             if ui.button("Browse...").clicked() {
@@ -1096,10 +1365,39 @@ impl DarkCoreApp {
                 }
             }
         });
-        if ui.button("Patch DRM").clicked() {
+        
+        ui.add_space(5.0);
+        
+        ui.label("Associated AppID (Optional, for Titan):");
+        ui.horizontal(|ui| {
+             ui.text_edit_singleline(&mut self.steamless_app_id); 
+             ui.label("❓").on_hover_text("Enter the Steam AppID of this game to automatically deploy Titan Hook after unpacking.");
+        });
+
+        ui.add_space(5.0);
+        ui.checkbox(&mut self.steamless_auto_titan, "Auto-Activate Titan (Hook + Cloud Patch)");
+
+        ui.add_space(15.0);
+
+        if ui.button(egui::RichText::new("UNPACK & PATCH").strong().size(16.0)).clicked() {
+            if self.target_exe.is_empty() {
+                self.log("Error: No executable selected.".to_string());
+                return;
+            }
+
             match steamless::run_steamless(&self.target_exe, &self.config.steamless_path) {
-                Ok(msg) => self.log(msg),
-                Err(e) => self.log(format!("Error: {}", e)),
+                Ok(msg) => {
+                    self.log(msg);
+                    // AUTO TITAN TRIGGER
+                    if self.steamless_auto_titan && !self.steamless_app_id.is_empty() {
+                        // We must clone because deploy mutates self and we are in a mutable borrow??
+                        // Actually calling method on self inside match is fine if no conflict?
+                        // `steamless::run_steamless` does not borrow self.
+                        let appid = self.steamless_app_id.clone();
+                        self.deploy_titan_auto(&appid);
+                    }
+                },
+                Err(e) => self.log(format!("Steamless Error: {}", e)),
             }
         }
     }
@@ -1370,31 +1668,161 @@ impl DarkCoreApp {
         );
 
         ui.separator();
-        ui.label("API Key (Morrenus):");
-        ui.horizontal(|ui| {
-             ui.text_edit_singleline(&mut self.config.api_key);
-             ui.label("❓").on_hover_text("Optional API Key for Manifest Downloads.\nSearch for 'Morrenus API' to find the Discord server.");
+        
+        // Glitch Logic for API Key
+        // Force repaint if we have a key (to drive animation loop)
+        if !self.config.api_key.is_empty() {
+             ui.ctx().request_repaint();
+        }
+
+        // Update Glitch String (High Speed)
+        let now = Instant::now();
+        if !self.config.api_key.is_empty() && (
+             now.duration_since(self.api_key_glitch_update).as_millis() > 50 || 
+             self.api_key_glitch_cache.len() != self.config.api_key.len()
+        ) {
+             self.api_key_glitch_update = now;
+             
+             // High-Tech Glyph Set (Very Distinct)
+             let glyphs = "ABCDEF0123456789!@#$%^&*()_+-=[]{}|;:,.<>?§";
+             let time = ui.input(|i| i.time);
+             let seed = (time * 10000.0) as usize;
+             
+             self.api_key_glitch_cache = self.config.api_key.chars().enumerate().map(|(i, _)| {
+                 let idx = (seed.wrapping_add(i * 13).wrapping_add(now.elapsed().as_nanos() as usize)) % glyphs.len();
+                 glyphs.chars().nth(idx).unwrap_or('?')
+             }).collect();
+        }
+
+        ui.label(egui::RichText::new("API Key (Secure Sandbox):").color(egui::Color32::from_rgb(0, 255, 100)));
+        
+        let frame = egui::Frame::group(ui.style())
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 150, 50)))
+            .fill(egui::Color32::from_rgb(5, 15, 5))
+            .inner_margin(6.0)
+            .rounding(4.0);
+
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                 ui.label("🔒");
+                 
+                 let glitch_text = self.api_key_glitch_cache.clone();
+                 
+                 let response = ui.add(
+                      egui::TextEdit::singleline(&mut self.config.api_key)
+                          .font(egui::FontId::monospace(14.0))
+                          .desired_width(320.0)
+                          .layouter(&mut |ui, string, _| {
+                               let display_text = if string.is_empty() { 
+                                   "" 
+                               } else if string.len() == glitch_text.len() {
+                                   &glitch_text
+                               } else {
+                                   string // Fallback
+                               };
+
+                               let mut job = egui::text::LayoutJob::default();
+                               job.append(
+                                   display_text,
+                                   0.0,
+                                   egui::TextFormat {
+                                       font_id: egui::FontId::monospace(14.0),
+                                       color: egui::Color32::from_rgb(50, 255, 50),
+                                       background: egui::Color32::from_black_alpha(150),
+                                       ..Default::default()
+                                   }
+                               );
+                               ui.fonts(|f| f.layout_job(job))
+                          })
+                 );
+                 
+                 if response.changed() {
+                      self.api_key_glitch_update = Instant::now() - Duration::from_millis(100);
+                 }
+                 
+                 ui.label(egui::RichText::new("❓").size(12.0))
+                   .on_hover_text("Optional API Key for Manifest Downloads.\nSearch for 'Morrenus API' on Google/Discord.");
+            });
         });
 
         ui.add_space(15.0);
-        if ui
-            .button(
-                egui::RichText::new("💾 SAVE CONFIGURATION")
-                    .color(egui::Color32::BLACK)
-                    .strong(),
-            )
-            .highlight()
-            .clicked()
-        {
-            if let Err(e) = save_config(&self.config) {
+        ui.add_space(20.0);
+        
+        // CUSTOM ANIMATED SAVE BUTTON
+        let now = Instant::now();
+        let is_recently_saved = self.config_saved_at.map(|t| now.duration_since(t).as_secs_f32() < 2.0).unwrap_or(false);
+        
+        if is_recently_saved {
+            ui.ctx().request_repaint(); // Animation Loop
+        }
+
+        let btn_text = if is_recently_saved { "✅ CONFIGURATION SAVED" } else { "💾 SAVE CONFIGURATION" };
+        let btn_size = egui::vec2(280.0, 45.0);
+        
+        let (rect, response) = ui.allocate_at_least(btn_size, egui::Sense::click());
+        
+        if response.clicked() {
+             if let Err(e) = save_config(&self.config) {
                 self.status_msg = format!("Save error: {}", e);
             } else {
+                self.config_saved_at = Some(Instant::now());
                 self.status_msg = "Config saved.".to_string();
                 self.api_client = Some(ApiClient::new(self.config.api_key.clone()));
                 self.refresh_library();
                 self.resolve_unknown_games();
             }
         }
+
+        // Animation Factors
+        let hover_factor = ui.ctx().animate_bool(response.id.with("hover"), response.hovered());
+        let save_factor = if let Some(t) = self.config_saved_at {
+             let elapsed = now.duration_since(t).as_secs_f32();
+             if elapsed < 1.5 {
+                 1.0 - (elapsed / 1.5).powf(0.5) // Sqrt fade
+             } else { 0.0 }
+        } else { 0.0 };
+
+        let painter = ui.painter();
+        let center = rect.center();
+        
+        // Colors
+        let cyan = egui::Color32::from_rgb(0, 243, 255);
+        let green = egui::Color32::from_rgb(50, 255, 100);
+        
+        let target_color = if save_factor > 0.0 { green } else { cyan };
+        
+        // Dynamic Rect
+        let visual_rect = rect.shrink(2.0).expand(2.0 * hover_factor);
+        let corner_radius = 6.0;
+
+        // Background Fill (Glassy)
+        if hover_factor > 0.0 {
+            painter.rect_filled(visual_rect, corner_radius, target_color.linear_multiply(0.1));
+        }
+        
+        // Border Stroke
+        let stroke_width = 1.0 + (1.0 * hover_factor) + (2.0 * save_factor);
+        painter.rect_stroke(visual_rect, corner_radius, egui::Stroke::new(stroke_width, target_color));
+        
+        // SHOCKWAVE EFFECT (The "Figa" part)
+        if save_factor > 0.0 {
+            let expansion = (1.0 - save_factor) * 40.0; // Expand outwards
+            let alpha = save_factor * 0.6;
+            painter.rect_stroke(
+                visual_rect.expand(expansion),
+                corner_radius + expansion,
+                egui::Stroke::new(2.0, green.linear_multiply(alpha))
+            );
+        }
+
+        // Text
+        painter.text(
+            center, 
+            egui::Align2::CENTER_CENTER, 
+            btn_text, 
+            egui::FontId::proportional(16.0), 
+            target_color
+        );
     }
 
     fn ui_profiles(&mut self, ui: &mut egui::Ui) {
@@ -1561,5 +1989,212 @@ impl DarkCoreApp {
             }
         }
         false
+    }
+
+    fn deploy_titan_auto(&mut self, app_id: &str) {
+        let steam_path = self.config.steam_path.clone();
+        
+        self.log(format!("Auto-Deploying Titan for AppID: {}...", app_id));
+
+        // 1. Kill Steam
+        let _ = std::process::Command::new("taskkill")
+            .args(&["/F", "/IM", "steam.exe"])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+
+        // 2. Deploy Hook (DLL + AppID txt)
+        match crate::game_path::GamePathFinder::deploy_titan_hook(&steam_path, app_id) {
+            Ok(path) => {
+                self.log(format!("Titan Hook deployed to: {:?}", path));
+
+                // 3. Suppress Cloud
+                match crate::game_path::GamePathFinder::suppress_cloud_sync(&steam_path, app_id) {
+                    Ok(_) => self.log("Cloud Sync Suppressed.".to_string()),
+                    Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
+                }
+
+                // 4. Auto-Restart
+                let greenluma_path = PathBuf::from(self.config.gl_path.clone());
+                let injector_exe = greenluma_path.join("DLLInjector.exe");
+                if injector_exe.exists() {
+                     self.log("Restarting Steam...".to_string());
+                     if let Err(e) = std::process::Command::new(injector_exe)
+                         .current_dir(greenluma_path)
+                         .spawn() {
+                             self.log(format!("Failed to restart Steam: {}", e));
+                         }
+                } else {
+                     self.log("GreenLuma Injector not found. Restart Manually.".to_string());
+                }
+            },
+            Err(e) => self.log(format!("Titan Deployment Failed: {}", e)),
+        }
+    }
+
+    fn ui_info(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let time = ui.input(|i| i.time);
+        
+        if self.active_tab == 5 {
+             ui.ctx().request_repaint();
+        }
+
+        // Deep Black Background
+        ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(2, 2, 5));
+
+        let rand_pseudo = |seed: usize| -> usize {
+            (seed.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fffffff
+        };
+        
+        // Extended Glyph Set (Katakana-ish + numbers)
+        // Note: Standard Fonts might not have all chars, using safe set + some extras
+        let glyphs = "qwertyuiopasdfghjklzxcvbnmQWERTYUIOPASDFGHJKLZXCVBNM0123456789<>:;[]{}!@#$%^&*=+-_|?"; 
+        let random_matrix_char = |seed: usize| -> char {
+             glyphs.chars().nth(seed % glyphs.chars().count()).unwrap_or('X')
+        };
+
+        // INITIAL POPULATION (Heavy Density)
+        if self.matrix_trails.is_empty() {
+             for i in 0..450 {
+                 let layer = (i % 3) as u8;
+                 // Front layer (2) is sparse but impactful
+                 // Back layer (0) is dense
+                 
+                 let speed_base = match layer { 0 => 1.0, 1 => 2.5, _ => 4.5 };
+                 let speed = speed_base + (i % 7) as f32 * 0.3;
+                 // Random X
+                 let x = (i as f32 * 13.0 * (layer as f32 + 1.2) + (time * 100.0) as f32) % rect.width() + rect.min.x;
+                 let h_y = rect.min.y + (i as f32 * 7.0) % rect.height();
+                 let len = 10 + (i % 30);
+                 
+                 let mut chars = Vec::new();
+                 for k in 0..len { chars.push(random_matrix_char(i + k)); }
+                 
+                 self.matrix_trails.push(MatrixTrail { x, head_y: h_y, speed, len, chars, layer });
+             }
+        }
+        
+        // SPAWN NEW TRAILS
+        // Maintain ~450 trails
+        if self.matrix_trails.len() < 450 {
+             let seed = (time * 10000.0) as usize;
+             // Spawn mostly back/mid layers, occasionally front
+             if rand_pseudo(seed) % 100 < 60 { 
+                 let layer_roll = rand_pseudo(seed + 1) % 100;
+                 let layer = if layer_roll < 50 { 0 } else if layer_roll < 85 { 1 } else { 2 };
+                 
+                 let x = rect.min.x + (rand_pseudo(seed + 2) % (rect.width() as usize)) as f32;
+                 let speed_base = match layer { 0 => 1.0, 1 => 2.5, _ => 4.5 };
+                 let speed = speed_base + (rand_pseudo(seed + 3) as f32 % 5.0) * 0.4;
+                 let len = 10 + (rand_pseudo(seed + 4) % 40) as usize;
+                 
+                 let mut chars = Vec::new();
+                 for k in 0..len { chars.push(random_matrix_char(seed + k)); }
+                 
+                 self.matrix_trails.push(MatrixTrail {
+                     x, head_y: rect.min.y - 150.0, speed, len, chars, layer
+                 });
+             }
+        }
+
+        // UPDATE & RENDER
+        let painter = ui.painter();
+        
+        // Layer Configs
+        let font_small = egui::FontId::monospace(10.0);
+        let font_mid = egui::FontId::monospace(14.0);
+        let font_large = egui::FontId::monospace(18.0); // Big Front
+
+        let white = egui::Color32::WHITE;
+        let neon_green = egui::Color32::from_rgb(50, 255, 50);
+
+        // Sort trails by layer so Front draws on top of Back
+        // But for performance with retain_mut we can't sort easily every frame.
+        // It's digital rain, depth overlap is usually chaotic anyway.
+        // We'll iterate. Painter works in order.
+        // To do generic depth sort, we'd need to separate list. 
+        // Let's just draw mixed. It adds to the chaos.
+
+        self.matrix_trails.retain_mut(|trail| {
+            trail.head_y += trail.speed;
+            
+            // Random mutation
+            if rand_pseudo((trail.head_y * 10.0) as usize) % 15 == 0 {
+                let idx = rand_pseudo((time * 1000.0) as usize) % trail.len;
+                trail.chars[idx] = random_matrix_char((time * 999.0) as usize);
+            }
+
+            let (font, char_h, opacity_mult) = match trail.layer {
+                0 => (&font_small, 10.0, 0.3),
+                1 => (&font_mid, 14.0, 0.7),
+                _ => (&font_large, 18.0, 1.0),
+            };
+
+            // Draw Chars
+             for (i, &c) in trail.chars.iter().enumerate() {
+                let y_pos = trail.head_y - (i as f32 * char_h);
+                if y_pos > rect.max.y { continue; }
+                if y_pos < rect.min.y - char_h { break; }
+
+                let color;
+                if i == 0 {
+                    color = white.linear_multiply(opacity_mult);
+                    // Fake Bloom for head
+                    if trail.layer == 2 {
+                         // Double draw for glow
+                         painter.text(egui::pos2(trail.x, y_pos), egui::Align2::CENTER_TOP, c, font.clone(), white.linear_multiply(0.4));
+                    }
+                } else if i < 3 {
+                    color = neon_green.linear_multiply(opacity_mult);
+                } else {
+                     let fade = 1.0 - (i as f32 / trail.len as f32);
+                     // Quadratic fade out
+                     color = neon_green.linear_multiply((fade * fade) * opacity_mult);
+                }
+                
+                painter.text(
+                    egui::pos2(trail.x, y_pos),
+                    egui::Align2::CENTER_TOP,
+                    c,
+                    font.clone(),
+                    color
+                );
+             }
+
+            let tail_y = trail.head_y - (trail.len as f32 * char_h);
+            tail_y < rect.max.y
+        });
+
+        // MANIFESTO OVERLAY (Optimized)
+        let center = rect.center();
+        let wrap_width = 550.0;
+        
+        let galley = painter.layout_job(
+            egui::text::LayoutJob::simple(
+                "WE ARE THE ORCHESTRATORS.\n\nSteam is the cage. DarkCore is the key.\nWe build bridges where they built walls.\nWe play what we want, when we want.\n\nPower to the Players.\n\nSigned, SEBASTIAN.".to_string(),
+                egui::FontId::monospace(15.0),
+                egui::Color32::from_rgb(220, 255, 220),
+                wrap_width
+            )
+        );
+
+        let text_rect = egui::Rect::from_center_size(center, galley.size() + egui::vec2(80.0, 80.0));
+        
+        // Advanced Box Rendering
+        painter.rect_filled(text_rect, 2.0, egui::Color32::from_black_alpha(245)); // Darker bg
+        painter.rect_stroke(text_rect, 2.0, egui::Stroke::new(2.0, neon_green)); // Crisp border
+        
+        // Outer Glow
+        for i in 1..5 {
+            let width = 2.0 + i as f32 * 2.0;
+            let alpha = 60 / i; // Brighter glow
+            painter.rect_stroke(
+                text_rect.expand(i as f32), 
+                2.0, 
+                egui::Stroke::new(width, neon_green.linear_multiply(alpha as f32 / 255.0))
+            );
+        }
+
+        painter.galley(text_rect.min + egui::vec2(40.0, 40.0), galley, egui::Color32::WHITE);
     }
 }
