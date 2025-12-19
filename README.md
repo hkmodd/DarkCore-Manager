@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="manager/logo.png" alt="DarkCore Logo" width="192" height="192">
+  <img src="manager/logo.png" alt="DarkCore Logo" width="128" height="128">
   <br>
   <br>
   <pre>
@@ -10,8 +10,7 @@
 ██████╔╝██║  ██║██║  ██║██║  ██╗╚██████╗╚██████╔╝██║  ██║███████╗
 ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
   </pre>
-  <h3>DarkCore Manager v1.2 "Project Neon"</h3>
-  <h4>System Orchestration & Compatibility Layer</h4>
+  <h3>System Orchestration & Compatibility Layer</h3>
   <p>
     <b>High-Performance. Memory-Safe. Cyberpunk Aesthetics.</b>
   </p>
@@ -41,7 +40,7 @@
 >
 > 1.  **Independent Research**: **DarkCore Manager** is an independent project created solely for educational purposes, demonstrating advanced Rust UI patterns and process orchestration.
 > 2.  **No Affiliation**: This software is **NOT** affiliated with, endorsed by, or connected to Valve Corporation, Steam, GreenLuma, Steamless, or Morrenus.
-> ### 3. **No Proprietary Data**: This tool **does NOT** contain, distribute, or host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
+> 3.  **No Proprietary Data**: This tool **does NOT** contain, distribute, or host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
 > 4.  **User Responsibility**: The user assumes full responsibility for compliance with all applicable Terms of Service and local laws. The author assumes **NO LIABILITY** for bans, data loss, or system instability.
 
 <br>
@@ -90,7 +89,6 @@ To achieve seamless interoperability, three systems must work in unison. DarkCor
     *   **☁️ State Harmonization**: Patches `localconfig.vdf` and manages `remotecache.vdf` to ensure the Client UI reflects a "Healthy/Updated" state, eliminating synchronization errors.
     *   **🏆 Offline Achievement Tracking**: Persists unlocked achievements to a local `stats.txt` database, preserving user progress across sessions without upstream server dependency.
 
-
 ---
 
 ## ✨ Feature Matrix
@@ -135,7 +133,7 @@ We believe in transparency. Build it yourself.
 
 2.  **Asset Injection (Optional)**
     *   **Logo**: Automatically embedded (`baked-in`) at compile time.
-    *   **Icon**: Place your `icon.ico` in the `manager/` directory to override the window icon.
+    *   **Icon**: Place your `icon.ico` in the `manager/` directory.
 
 3.  **Compile System**
     ```powershell
