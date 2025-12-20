@@ -6,6 +6,7 @@
 *.pdb
 *.exe
 !darkcore-greenluma.exe
+build_error.log
 config.json
 /AppList
 /depotcache
