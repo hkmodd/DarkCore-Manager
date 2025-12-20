@@ -154,4 +154,26 @@ impl ApiClient {
 
         Ok(dlc_ids)
     }
+
+    pub async fn get_status(&self, appid: &str) -> Result<GameStatus, Box<dyn Error>> {
+        if self.api_key.is_empty() {
+             return Err("No API Key".into());
+        }
+        let url = format!("https://manifest.morrenus.xyz/api/v1/status/{}?api_key={}", appid, self.api_key);
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+             return Err(format!("API Error {}", resp.status()).into());
+        }
+        let status: GameStatus = resp.json().await?;
+        Ok(status)
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct GameStatus {
+    pub app_id: String,
+    pub status: String,
+    pub needs_update: Option<bool>,
+    pub file_modified: Option<String>,
+    pub timestamp: Option<String>,
 }

@@ -81,8 +81,8 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
     let mut ids = Vec::new();
     let mut keys = HashMap::new();
 
-    // Regex: addappid\s*\(\s*(\d+)(?:[^)]*?"([a-fA-F0-9]{64})")?
-    let re = Regex::new(r#"addappid\s*\(\s*(\d+)(?:[^)]*?"([a-fA-F0-9]{64})")?"#).unwrap();
+    // Regex: addappid\s*\(\s*(\d+)(?:[^)]*?["']([a-fA-F0-9]{64})["'])?
+    let re = Regex::new(r#"addappid\s*\(\s*(\d+)(?:[^)]*?["']([a-fA-F0-9]{64})["'])?"#).unwrap();
 
     for cap in re.captures_iter(lua_content) {
         if let Some(id_match) = cap.get(1) {

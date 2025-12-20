@@ -39,6 +39,7 @@ pub struct DarkCoreApp {
     search_results: Arc<Mutex<Vec<SearchResult>>>,
     active_games: Arc<Mutex<Vec<GameProfile>>>,
     game_cache: Arc<Mutex<HashMap<String, String>>>,
+    update_cache: Arc<Mutex<HashMap<String, bool>>>,
 
     // Steamless
     target_exe: String,
@@ -83,6 +84,13 @@ pub struct DarkCoreApp {
     is_scanning_dlcs: bool,
     dlc_scan_result: Arc<Mutex<Option<Vec<String>>>>,
     
+    // Install Modal
+    install_modal_open: bool,
+    install_candidate: Option<(String, String)>, // (AppID, Name)
+    detected_libraries: Vec<std::path::PathBuf>,
+    selected_library_index: usize,
+    install_dir_input: String, // NEW: Manual override for Folder Name
+
     // Identity & Animation
     logo_texture: Option<egui::TextureHandle>,
     logo_data: Option<egui::ColorImage>,
@@ -124,6 +132,7 @@ impl DarkCoreApp {
             search_results: Arc::new(Mutex::new(Vec::new())),
             active_games: Arc::new(Mutex::new(Vec::new())),
             game_cache: Arc::new(Mutex::new(cache_map)),
+            update_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             target_exe: String::new(),
             include_dlcs: true,
             status_msg: "System Ready".to_string(),
@@ -140,6 +149,14 @@ impl DarkCoreApp {
             delete_associated_dlcs: Vec::new(),
             is_scanning_dlcs: false,
             dlc_scan_result: Arc::new(Mutex::new(None)),
+            
+            // Install Modal
+            install_modal_open: false,
+            install_candidate: None,
+            detected_libraries: Vec::new(),
+            selected_library_index: 0,
+            install_dir_input: String::new(), // Init
+            
             logo_texture: None,
             logo_data: {
                 // EMBEDDED LOGO (Compile-time check)
@@ -297,6 +314,11 @@ impl DarkCoreApp {
             }
             let query = self.search_query.clone();
             let results_arc = self.search_results.clone();
+            let active_games = self.active_games.clone();
+            let update_cache = self.update_cache.clone();
+            let steam_path = self.config.steam_path.clone();
+            
+            // Restore missing variables
             let client_key = self.config.api_key.clone();
             let cover_queue = self.cover_queue.clone();
             let cover_cache = self.cover_cache.clone();
@@ -312,7 +334,7 @@ impl DarkCoreApp {
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let client = ApiClient::new(client_key);
+                let client = ApiClient::new(client_key.clone());
 
                 // Result of blocking search
                 let search_res = rt.block_on(client.search(&query));
@@ -371,9 +393,18 @@ impl DarkCoreApp {
                             .build()
                             .unwrap_or_default();
 
-                        // Block to spawn and wait for all downloads
+                        // Block to spawn and wait for all downloads AND status checks
                         rt.block_on(async {
                             let mut handles = Vec::new();
+                            
+                            // Get Installed IDs for check
+                            let installed: std::collections::HashSet<String> = {
+                                if let Ok(g) = active_games.lock() {
+                                    g.iter().map(|x| x.app_id.clone()).collect()
+                                } else {
+                                    std::collections::HashSet::new()
+                                }
+                            };
 
                             for item in res {
                                  let id1 = crate::api::val_to_string(&item.game_id);
@@ -386,6 +417,7 @@ impl DarkCoreApp {
                                      let dl_client = dl_client.clone();
                                      let _log_arc_inner = log_arc.clone();
                                      
+                                     // COVER TASK
                                      handles.push(tokio::spawn(async move {
                                          let url_portrait = format!("https://steamcdn-a.akamaihd.net/steam/apps/{}/library_600x900.jpg", appid_clone);
                                          let url_landscape = format!("https://steamcdn-a.akamaihd.net/steam/apps/{}/header.jpg", appid_clone);
@@ -405,8 +437,7 @@ impl DarkCoreApp {
                                                  }
                                              }
                                          }
-                                         
-                                         // 2. Try Landscape (Header) if Portrait failed
+                                         // 2. Try Landscape
                                          if !success {
                                              if let Ok(resp) = dl_client.get(&url_landscape).send().await {
                                                  if resp.status().is_success() {
@@ -422,23 +453,68 @@ impl DarkCoreApp {
                                                  }
                                              }
                                          }
-                                         
-                                         // 3. Fallback to Placeholder if both failed
+                                         // 3. Fallback
                                          if !success {
-                                             // Generate a 1x1 dark gray pixel to clear "Loading..."
-                                             // or a small 60x90 placeholder
-                                             let w = 60;
-                                             let h = 90;
+                                             let w = 60; let h = 90;
                                              let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-                                             for _ in 0..(w*h) {
-                                                 // r, g, b, a (Dark Gray/Blue)
-                                                 pixels.push(30); pixels.push(30); pixels.push(40); pixels.push(255);
-                                             }
-                                             if let Ok(mut q) = queue.lock() {
-                                                  q.push((appid_clone.clone(), w, h, pixels));
-                                             }
+                                             for _ in 0..(w*h) { pixels.push(30); pixels.push(30); pixels.push(40); pixels.push(255); }
+                                             if let Ok(mut q) = queue.lock() { q.push((appid_clone.clone(), w, h, pixels)); }
                                          }
                                      }));
+                                     
+                                     // UPDATE CHECK TASK
+                                     // Only check if installed
+                                     if installed.contains(&appid) {
+                                          let client = client.clone(); // ApiClient is cheap clone
+                                          let cache = update_cache.clone();
+                                          let sp = steam_path.clone();
+                                          let aid = appid.clone();
+                                          
+                                          handles.push(tokio::spawn(async move {
+                                               // 1. Get Local
+                                               let acf = std::path::Path::new(&sp).join("steamapps").join(format!("appmanifest_{}.acf", aid));
+                                               let mut local_ts = 0u64;
+                                               if acf.exists() {
+                                                   if let Ok(c) = std::fs::read_to_string(&acf) {
+                                                       if let Some(pos) = c.find("\"LastUpdated\"") {
+                                                            let rem = &c[pos..];
+                                                            if let Some(sq) = rem.find("\"") {
+                                                                if let Some(el) = rem[sq+1..].find("\"") {
+                                                                     let val_p = &rem[sq+1+el+1..];
+                                                                     if let Some(qs) = val_p.find("\"") {
+                                                                         if let Some(qe) = val_p[qs+1..].find("\"") {
+                                                                             let s = &val_p[qs+1..qs+1+qe];
+                                                                             local_ts = s.parse().unwrap_or(0);
+                                                                         }
+                                                                     }
+                                                                }
+                                                            }
+                                                       }
+                                                   }
+                                               }
+                                               
+                                               // 2. Get Remote
+                                               match client.get_status(&aid).await {
+                                                   Ok(st) => {
+                                                        let mut needs = st.needs_update.unwrap_or(false);
+                                                        if !needs && local_ts > 0 {
+                                                            if let Some(ts_str) = st.timestamp {
+                                                                use chrono::DateTime;
+                                                                if let Ok(dt) = DateTime::parse_from_rfc3339(&ts_str) {
+                                                                    if dt.timestamp() as u64 > local_ts {
+                                                                        needs = true;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Ok(mut c) = cache.lock() {
+                                                            c.insert(aid, needs);
+                                                        }
+                                                   },
+                                                   Err(_) => {}
+                                               }
+                                          }));
+                                     }
                                  }
                             }
                             
@@ -621,72 +697,210 @@ impl DarkCoreApp {
                         if let Some(name) = found_name {
                             if let Ok(mut cache) = game_cache.lock() {
                                 cache.insert(id_clone.clone(), name.clone());
-                                let _ = save_game_cache(&cache); // Save to disk immediately
+                                let _ = save_game_cache(&cache);
                             }
                         }
                     }));
                 }
 
-                // Wait for all requests to finish
                 for h in handles {
                     let _ = h.await;
                 }
             });
             
-            // Signal Completion
             if let Ok(mut guard) = status_queue.lock() {
                 *guard = Some("Resolution Complete.".to_string());
             }
         });
     }
 
-    fn install_game(&mut self, appid: String, name: String) {
-        // UNIFIED PROTOCOL: Works both Online (Manifests) and Offline (FamSharing/Public) through Fallbacks.
-        let api_key = self.config.api_key.clone(); // Can be empty
-        let client = ApiClient::new(api_key.clone()); 
-
+    fn check_updates_for_ids(&self, ids: Vec<String>) {
+        if ids.is_empty() { return; }
+        let client_opt = self.api_client.clone();
+        let cache_arc = self.update_cache.clone();
         let steam_path = self.config.steam_path.clone();
-        let gl_path = self.config.gl_path.clone();
 
-        let game_cache = self.game_cache.clone();
-        let include_dlcs = self.include_dlcs;
+        std::thread::spawn(move || {
+            let client = if let Some(c) = client_opt { c } else { return; };
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            
+            let mut handles = Vec::new();
+            
+            for appid in ids {
+                let client = client.clone();
+                let cache = cache_arc.clone();
+                let sp = steam_path.clone();
+                
+                handles.push(tokio::spawn(async move {
+                    // 1. Get Local LastUpdated
+                    let acf_path = std::path::Path::new(&sp).join("steamapps")
+                        .join(format!("appmanifest_{}.acf", appid));
+                    
+                    let mut local_ts = 0u64;
+                    if acf_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&acf_path) {
+                            // Simple Regex/Find for "LastUpdated"
+                            // Format: "LastUpdated" "1234567890"
+                            if let Some(pos) = content.find("\"LastUpdated\"") {
+                                let remainder = &content[pos..];
+                                // Skip label and search for value
+                                if let Some(start_quote) = remainder.find("\"") {
+                                    // Skip first quote of label, find second
+                                    if let Some(end_label) = remainder[start_quote+1..].find("\"") {
+                                         let val_part = &remainder[start_quote+1+end_label+1..];
+                                         // Find value quotes
+                                         if let Some(v_start) = val_part.find("\"") {
+                                             if let Some(v_end) = val_part[v_start+1..].find("\"") {
+                                                 let num_str = &val_part[v_start+1 .. v_start+1+v_end];
+                                                 local_ts = num_str.parse().unwrap_or(0);
+                                             }
+                                         }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Get Remote Status
+                    match client.get_status(&appid).await {
+                        Ok(status) => {
+                             let mut needs_update = false;
+                             
+                             // A. Explicit Flag
+                             if let Some(true) = status.needs_update {
+                                 needs_update = true;
+                             }
+                             
+                             // B. Timestamp comparison
+                             if !needs_update && local_ts > 0 {
+                                 if let Some(ts_str) = status.timestamp {
+                                     // Try parsing ISO or Unix?
+                                     // Solus uses DateTime. Assuming ISO 8601.
+                                     use chrono::DateTime;
+                                     if let Ok(dt) = DateTime::parse_from_rfc3339(&ts_str) {
+                                         let remote_ts = dt.timestamp() as u64;
+                                         if remote_ts > local_ts {
+                                             needs_update = true;
+                                         }
+                                     }
+                                 }
+                             }
+                             
+                             if let Ok(mut c) = cache.lock() {
+                                 c.insert(appid, needs_update);
+                             }
+                        },
+                        Err(_) => {
+                            // If API fails, assume False (Play) or keep previous
+                        }
+                    }
+                }));
+            }
+            
+            rt.block_on(async {
+                for h in handles { let _ = h.await; }
+            });
+        });
+    }
+
+    pub fn install_game(&self, appid: String, name: String, target_library: Option<std::path::PathBuf>, install_dir_name: Option<String>) {
+        // UNIFIED PROTOCOL: Works both Online (Manifests) and Offline (FamSharing/Public) through Fallbacks.
         let log_arc = self.system_log.clone();
-
-        self.status_msg = format!("START: Protocol for {}", name);
-        self.log(&format!(
-            "Starting installation protocol for: {} ({})",
-            name, appid
-        ));
+        // let api_client_clone = self.api_client.clone(); // Not needed if we re-init
+        let steam_path = self.config.steam_path.clone(); // Still need main path for other things
+        let gl_path = self.config.gl_path.clone();
+        let include_dlcs = self.include_dlcs;
+        let game_cache = self.game_cache.clone(); // Keep this for cache updates
+        let api_key = self.config.api_key.clone(); // Keep this for API client creation inside thread
+        
+        // Use Arc/Mutex for status updates
+        let status_queue = self.status_update_queue.clone();
+        
+        let update_status = move |msg: String| {
+            if let Ok(mut lock) = status_queue.lock() {
+                *lock = Some(msg);
+            }
+        };
 
         std::thread::spawn(move || {
             let log = move |msg: String| {
                 if let Ok(mut logs) = log_arc.lock() {
+                    // Print first (borrow), then push (move)
+                    println!("[LOG] {}", msg);
                     logs.push(msg);
-                    if logs.len() > 100 {
-                        logs.remove(0);
-                    }
                 }
             };
             
+            // Re-initialize client inside thread for manifest download
+            let client = ApiClient::new(api_key.clone());
+
+            log(format!("START: Protocol for {}", name));
+            update_status(format!("Installing {}", name));
+
+            // STEP 0.5: SETUP GREENLUMA CONFIG (Stealth Mode)
+            // Ensure .bin files exist
+            if let Err(e) = setup_greenluma_config(&gl_path) {
+                 log(format!("Warning: Could not setup GreenLuma config: {}", e));
+            } else {
+                 log("GreenLuma configured (NoQuestion/NoSplash).".to_string());
+            }
+
             // STEP 1: Kill Steam
             log("STEP 1: Killing Steam Process...".to_string());
-            use std::process::Command;
-            let _ = Command::new("taskkill")
-                .args(&["/F", "/IM", "steam.exe"])
-                .output();
-            std::thread::sleep(std::time::Duration::from_secs(2));
+            let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
+            std::thread::sleep(std::time::Duration::from_millis(2000));
 
-            // STEP 1.5: FORCE UPDATE -> DELETE APPMANIFEST
-            // This forces Steam to "Discover Existing Files" and re-validate against our new Manifest.
-            if let Some(acf_path) = crate::game_path::GamePathFinder::find_manifest_path(&steam_path, &appid) {
-                 log(format!("Forcing Update Check: Deleting existing AppManifest at {:?}...", acf_path));
-                 if let Err(e) = std::fs::remove_file(&acf_path) {
-                     log(format!("Warning: Could not delete appmanifest: {}", e));
-                 } else {
-                     log("AppManifest deleted. Steam will re-discover files.".to_string());
-                 }
+            // STEP 1.5: GHOST INSTALLATION -> GENERATE ACF
+            let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            let timestamp = time.to_string(); 
+
+            let acf_filename = format!("appmanifest_{}.acf", appid);
+            
+            // PATH LOGIC
+            let (final_acf_path, target_root) = if let Some(target) = target_library {
+                // USER SELECTED or ENFORCED PATH
+                log(format!("Using selected library: {:?}", target));
+                (target.join("steamapps").join(&acf_filename), target)
+            } else if let Some(existing_path) = crate::game_path::GamePathFinder::find_manifest_path(&steam_path, &appid) {
+                // AUTO-DETECTED
+                log(format!("Found existing manifest at: {:?}", existing_path));
+                let root = existing_path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&steam_path)).to_path_buf();
+                (existing_path, root)
             } else {
-                 log("No existing AppManifest found (Clean Install or Verify pending).".to_string());
+                // DEFAULT
+                let root = std::path::Path::new(&steam_path).to_path_buf();
+                (root.join("steamapps").join(&acf_filename), root)
+            };
+
+            // CRITICAL FIX: CLEANUP CONFLICTS
+            // If we are writing to Drive D, we MUST ensure no manifest exists for this ID on Drive C.
+            // Steam gets confused if two manifests exist.
+            let all_libs = crate::game_path::GamePathFinder::get_library_folders(&steam_path);
+            for lib in all_libs {
+                // Check if this lib is effectively the same as our target (canonicalize or simple eq)
+                if lib != target_root {
+                    let conflict_path = lib.join("steamapps").join(&acf_filename);
+                    if conflict_path.exists() {
+                        log(format!("Found conflicting manifest at {:?}. Deleting...", conflict_path));
+                        if let Err(e) = std::fs::remove_file(&conflict_path) {
+                             log(format!("Error deleting conflict: {}", e));
+                        } else {
+                             log("Conflict cleaned.".to_string());
+                        }
+                    }
+                }
+            }
+
+            log(format!("Generating Ghost ACF at: {:?}", final_acf_path));
+            
+            // Use potentially overridden install dir name, or default to display name
+            let install_dir = install_dir_name.unwrap_or(name.clone());
+
+            // Pass steam_path so we can calculate steam.exe location for the ACF
+            if let Err(e) = generate_acf(&steam_path, &final_acf_path, &appid, &install_dir, &timestamp) {
+                log(format!("Error writing ACF: {}", e));
+            } else {
+                 log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
             }
 
             // STEP 2: TRY MANIFEST (Priority)
@@ -740,17 +954,25 @@ impl DarkCoreApp {
             // 3A. If Manifest/Lua success -> Use Lua IDs (Best)
             if manifest_success && !lua_content.is_empty() {
                 let (all_ids, keys) = parse_lua_for_keys(&lua_content);
-                // VDF Injection
-                if let Err(e) = inject_vdf(&steam_path, &keys) {
-                    log(format!("VDF Error: {}", e));
-                }
-                // Filter IDs
+            
+            // VDF Injection (Steam Native)
+            if let Err(e) = inject_vdf(&steam_path, &keys) {
+                log(format!("Steam VDF Error: {}", e));
+            }
+            
+            // VDF Injection (GreenLuma Override)
+            // GreenLuma 2025 often uses its own config.vdf in its folder.
+            if let Err(e) = inject_vdf(&gl_path, &keys) {
+                 // Not critical if it doesn't exist, but worth trying
+                 log(format!("GreenLuma VDF Warning (Non-Fatal): {}", e));
+            }
+
+            // Filter IDs - FIX: Always include ALL IDs from Lua (Depots + DLCs)
+                // Filtering caused issues where required Depots were skipped if include_dlcs was false.
                 for id in all_ids.iter() {
-                    if include_dlcs || *id == appid {
-                        final_ids.push(id.clone());
-                    }
+                    final_ids.push(id.clone());
                 }
-                 log(format!("Lua Intelligence: Found {} associated IDs.", final_ids.len()));
+                 log(format!("Lua Intelligence: Found {} IDs (Game + Depots + DLCs).", final_ids.len()));
             } 
             // 3B. If Failed/Offline -> Use Public Store API (Smart Fallback)
             else {
@@ -800,50 +1022,48 @@ impl DarkCoreApp {
             
             if steam_exe.exists() {
                  if dll_path.exists() {
-                     log("Syncing Files to Steam Directory...".to_string());
+                     // 3. Launch with EXTERNAL DLL (Legacy Behavior)
+                     log("Launching Steam Suspended (External DLL - Phase 1)...".to_string());
                      
-                     // 1. Copy DLL
-                     let target_dll = std::path::Path::new(&steam_path).join(dll_name);
-                     if let Err(e) = std::fs::copy(&dll_path, &target_dll) {
-                         log(format!("⚠️ DLL Sync Warning: {}", e));
-                     }
-
-                     // 2. Sync AppList
-                     let src_applist = std::path::Path::new(&gl_path).join("AppList");
-                     let dst_applist = std::path::Path::new(&steam_path).join("AppList");
-                     if src_applist.exists() {
-                         let _ = std::fs::create_dir_all(&dst_applist);
-                         if let Ok(entries) = std::fs::read_dir(src_applist) {
-                             for entry in entries.flatten() {
-                                 if let Ok(ft) = entry.file_type() {
-                                     if ft.is_file() {
-                                         let dest_file = dst_applist.join(entry.file_name());
-                                         let _ = std::fs::copy(entry.path(), dest_file);
-                                     }
-                                 }
-                             }
+                     // Use Original DLL Path
+                     let target_dll = std::path::Path::new(&gl_path).join(dll_name);
+                     
+                     if target_dll.exists() {
+                         // PHASE 1: Launch Steam Injected (No AppLaunch yet)
+                         match crate::injector::launch_injected(
+                             steam_exe.to_str().unwrap_or(""),
+                             target_dll.to_str().unwrap_or(""),
+                             Some("-inhibitbootstrap")
+                         ) {
+                             Ok(_) => {
+                                 log("✅ INJECTION SUCCESSFUL. Steam starting...".to_string());
+                                 
+                                 // PHASE 2: Wait for GreenLuma Initialization
+                                 log("Waiting 5s for GreenLuma to unlock AppID...".to_string());
+                                 std::thread::sleep(std::time::Duration::from_secs(5));
+    
+                                 // PHASE 3: Trigger Install Trigger
+                                 log("Triggering Installation Command (Phase 2)...".to_string());
+                                 let _ = std::process::Command::new(steam_exe)
+                                     .arg("-applaunch")
+                                     .arg(&appid)
+                                     .spawn();
+                                     
+                                 log("✅ INSTALL COMMAND SENT.".to_string());
+                             },
+                             Err(e) => log(format!("❌ LAUNCH FAILED: {}", e)),
                          }
-                     }
-
-                     // 3. Launch with LOCAL DLL
-                     log("Launching Steam Suspended (Local DLL)...".to_string());
-                     match crate::injector::launch_injected(
-                         steam_exe.to_str().unwrap_or(""),
-                         target_dll.to_str().unwrap_or(""),
-                         Some("-inhibitbootstrap")
-                     ) {
-                         Ok(_) => log("✅ LAUNCH SUCCESSFUL. Payload Injected.".to_string()),
-                         Err(e) => log(format!("❌ LAUNCH FAILED: {}", e)),
+                     } else {
+                         log(format!("❌ CRITICAL: {} not found in GreenLuma folder!", dll_name));
                      }
                  } else {
-                     log(format!("❌ CRITICAL: {} not found!", dll_name));
+                     log(format!("❌ CRITICAL: {} source not found!", dll_name));
                  }
             } else {
                 log("❌ Error: steam.exe not found.".to_string());
             }
 
-            // Launch Game Install URI as backup
-            let _ = open::that(format!("steam://install/{}", appid));
+            // Remove legacy open::that call - logic handled by args now
         });
     }
 
@@ -1218,6 +1438,8 @@ impl eframe::App for DarkCoreApp {
                     });
                 });
         }
+        
+        self.show_install_modal(ctx);
     }
 }
 
@@ -1327,29 +1549,15 @@ impl DarkCoreApp {
                              // FORCE KILL STEAM FIRST
                              let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
                              std::thread::sleep(std::time::Duration::from_millis(1000));
-
-                             // SYNC FILES
-                             let target_dll = std::path::Path::new(&steam_path).join(dll_name);
-                             let _ = std::fs::copy(&dll_path, &target_dll);
                              
-                             let src_applist = std::path::Path::new(&gl_path).join("AppList");
-                             let dst_applist = std::path::Path::new(&steam_path).join("AppList");
-                             if src_applist.exists() {
-                                 let _ = std::fs::create_dir_all(&dst_applist);
-                                 if let Ok(entries) = std::fs::read_dir(src_applist) {
-                                     for entry in entries.flatten() {
-                                         if let Ok(ft) = entry.file_type() {
-                                             if ft.is_file() {
-                                                 let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name()));
-                                             }
-                                         }
-                                     }
-                                 }
-                             }
+                             // SETUP CONFIG (Create .bin files in GL folder)
+                             // Helper function is now public
+                             let _ = crate::ui::setup_greenluma_config(&gl_path);
 
+                             // DIRECT INJECTION (No copying to Steam folder)
                              match crate::injector::launch_injected(
                                  steam_exe.to_str().unwrap_or(""),
-                                 target_dll.to_str().unwrap_or(""),
+                                 dll_path.to_str().unwrap_or(""), // Use DLL in GL folder
                                  Some("-inhibitbootstrap")
                              ) {
                                  Ok(_) => log("✅ Steam Launched with GreenLuma.".to_string()),
@@ -1438,15 +1646,40 @@ impl DarkCoreApp {
                                  ui.add_space(5.0);
                                  
                                  // PULSING BUTTON
-                                 let text = if is_installed { "♻ UPDATE" } else { "🚀 INSTALL" };
+                                 let mut needs_update = false;
+                                 let mut is_up_to_date = false;
+                                 
+                                 if is_installed {
+                                     if let Ok(cache) = self.update_cache.lock() {
+                                         if let Some(upd) = cache.get(&display_id) {
+                                             if *upd { needs_update = true; }
+                                             else { is_up_to_date = true; }
+                                         }
+                                     }
+                                 }
+
+                                 let text = if is_installed { 
+                                     if needs_update { "♻ UPDATE" }
+                                     else if is_up_to_date { "▶ PLAY" }
+                                     else { "⌛ CHECKING..." }
+                                 } else { "🚀 INSTALL" };
+
                                  let time = ui.input(|i| i.time);
                                  let alpha = (time * 3.0).sin().abs() as f32 * 0.5 + 0.5; // 0.5 to 1.0
                                  
                                  let bg_color = if is_installed {
-                                     // Orange/Yellow for Update
-                                     egui::Color32::from_rgba_premultiplied(
-                                         (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
-                                     )
+                                     if needs_update {
+                                         // Orange/Yellow for Update
+                                         egui::Color32::from_rgba_premultiplied(
+                                             (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
+                                         )
+                                     } else if is_up_to_date {
+                                         // Green for Play (Solid)
+                                         egui::Color32::from_rgb(0, 200, 100)
+                                     } else {
+                                         // Gray for Checking
+                                         egui::Color32::from_rgb(80, 80, 80)
+                                     }
                                  } else {
                                      // Green/Cyan for Install
                                      egui::Color32::from_rgba_premultiplied(
@@ -1470,11 +1703,41 @@ impl DarkCoreApp {
                                       
                                       let mut btn_resp = ui.add(btn);
                                       if is_installed {
-                                          btn_resp = btn_resp.on_hover_text("Game is already installed. Click to force update manifest/config.");
+                                           btn_resp = btn_resp.on_hover_text("Game is already installed. Right-click to Repair.");
                                       }
                                       
+                                      // Right-Click Context Menu for Repair
+                                      btn_resp.context_menu(|ui| {
+                                          if ui.button("🛠 Force Repair (Regenerate ACF)").clicked() {
+                                              ui.close_menu();
+                                              // FORCE MODAL: User explicitly wants to repair, so let them choose/confirm the drive.
+                                              // This is crucial if the game was falsely detected on C: (Ghost ACF) but is actually on D:.
+                                              self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                              self.selected_library_index = 0;
+                                              self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                              self.install_dir_input = name.to_string(); // Pre-fill
+                                              self.install_modal_open = true;
+                                          }
+                                      });
+                                      
                                       if btn_resp.clicked() {
-                                           self.install_game(display_id.clone(), name.to_string());
+                                            if !is_installed || needs_update {
+                                                // Check if manifest exists (Automatic Resume)
+                                               if let Some(path) = crate::game_path::GamePathFinder::find_manifest_path(&self.config.steam_path, &display_id) {
+                                                   // Found it -> Resume/Update in place
+                                                   self.install_game(display_id.clone(), name.to_string(), Some(path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&self.config.steam_path)).to_path_buf()), None);
+                                               } else {
+                                                   // Not found -> New Install -> Ask User
+                                                  self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                  self.selected_library_index = 0;
+                                                  self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                  self.install_dir_input = name.to_string(); // Pre-fill with name
+                                                  self.install_modal_open = true;
+                                               }
+                                            } else {
+                                               // Launch Game URL
+                                               let _ = open::that(format!("steam://rungameid/{}", display_id));
+                                            }
                                       }
                                  }
                                  // Request repaint for animation
@@ -2118,6 +2381,108 @@ impl DarkCoreApp {
                 });
             });
         }
+        
+    }
+    
+    // Renders the Drive/Library Selection Modal
+    fn show_install_modal(&mut self, ctx: &egui::Context) {
+        if self.install_modal_open {
+             // Clone data upfront to release borrow on self
+             let candidate = self.install_candidate.clone();
+             let libraries = self.detected_libraries.clone();
+             
+             if let Some((app_id, name)) = candidate {
+                 let mut open = true;
+                 egui::Window::new(egui::RichText::new("💾 Select Installation Library").strong())
+                     .open(&mut open)
+                     .collapsible(false)
+                     .resizable(false)
+                     .fixed_size(egui::vec2(400.0, 200.0))
+                     .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                     .show(ctx, |ui| {
+                         ui.vertical_centered(|ui| {
+                             ui.add_space(10.0);
+                             ui.label(egui::RichText::new(format!("Installing/Repairing: {}", name)).size(14.0));
+                             ui.label(egui::RichText::new("Please select the Steam Library where the game files are located:").color(egui::Color32::GRAY));
+                             ui.add_space(15.0);
+                             
+                             if libraries.is_empty() {
+                                 ui.label(egui::RichText::new("⚠ No libraries detected!").color(egui::Color32::RED));
+                             }
+                             
+                             egui::ComboBox::from_label("Target Drive")
+                                 .selected_text(format!("{:?}", libraries.get(self.selected_library_index).unwrap_or(&std::path::PathBuf::from("None"))))
+                                 .show_ui(ui, |ui| {
+                                     for (i, lib) in libraries.iter().enumerate() {
+                                         ui.selectable_value(&mut self.selected_library_index, i, format!("{:?}", lib));
+                                     }
+                                 });
+                             
+                             ui.add_space(20.0);
+                             
+                             // INSTALL DIR OVERRIDE
+                             ui.label(egui::RichText::new("Installation Directory Name (Important!)").strong());
+                             ui.label(egui::RichText::new("Use the exact folder name matching your 'common' folder (e.g. 'Expedition 33')").size(10.0).color(egui::Color32::GRAY));
+                             ui.horizontal(|ui| {
+                                 ui.text_edit_singleline(&mut self.install_dir_input);
+                                 
+                                 // SCAN BUTTON
+                                 if ui.button("🔍 Scan").on_hover_text("Try to find existing folder in common").clicked() {
+                                     if let Some(lib) = libraries.get(self.selected_library_index) {
+                                          let common = lib.join("steamapps").join("common");
+                                          if let Ok(entries) = std::fs::read_dir(common) {
+                                              let mut best_match = String::new();
+                                              let mut highest_score = 0;
+                                              
+                                              // Simple fuzzy match
+                                              for entry in entries.flatten() {
+                                                  if let Ok(meta) = entry.metadata() {
+                                                      if meta.is_dir() {
+                                                          let folder_name = entry.file_name().to_string_lossy().to_string();
+                                                          // Score logic: Count matching words?
+                                                          let score = folder_name.to_lowercase().split_whitespace().filter(|w| name.to_lowercase().contains(w)).count();
+                                                          if score > highest_score {
+                                                              highest_score = score;
+                                                              best_match = folder_name;
+                                                          }
+                                                      }
+                                                  }
+                                              }
+                                              
+                                              if !best_match.is_empty() {
+                                                  self.install_dir_input = best_match;
+                                              }
+                                          }
+                                     }
+                                 }
+                             });
+                             
+                             ui.add_space(20.0);
+                             
+                             ui.horizontal(|ui| {
+                                 if ui.button("❌ Cancel").clicked() {
+                                     self.install_modal_open = false;
+                                     self.install_candidate = None;
+                                 }
+                                 
+                                 if ui.button(egui::RichText::new("✅ CONFIRM & INSTALL").strong().color(egui::Color32::GREEN)).clicked() {
+                                     // Proceed with selected library and user-specified install dir
+                                     if let Some(target) = libraries.get(self.selected_library_index) {
+                                         self.install_game(app_id.clone(), name.clone(), Some(target.clone()), Some(self.install_dir_input.clone()));
+                                         self.install_modal_open = false;
+                                         self.install_candidate = None;
+                                     }
+                                 }
+                             });
+                         });
+                     });
+                     
+                 if !open {
+                     self.install_modal_open = false;
+                     self.install_candidate = None;
+                 }
+             }
+        }
     }
 
     fn initiate_delete(&mut self, app_id: String, name: String) {
@@ -2429,4 +2794,77 @@ impl DarkCoreApp {
 
         painter.galley(text_rect.min + egui::vec2(40.0, 40.0), galley, egui::Color32::WHITE);
     }
+}
+
+// Helper function to write the ACF file content
+// Helper function to write the ACF file content
+pub fn generate_acf(steam_path: &str, acf_path: &std::path::Path, appid: &str, name: &str, timestamp: &str) -> std::io::Result<()> {
+    // Ensure parent dir exists
+    if let Some(parent) = acf_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    let steam_exe = std::path::Path::new(steam_path).join("steam.exe");
+    let steam_exe_str = steam_exe.to_str().unwrap_or("steam.exe").replace("\\", "\\\\");
+
+    // StateFlags 6 = 4 (Installed) | 2 (UpdateRequired). 
+    // This tricks Steam into thinking the game is installed but needs an update.
+    let content = format!(r#""AppState"
+{{
+	"appid"		"{}"
+	"Universe"		"1"
+	"LauncherPath"		"{}"
+	"name"		"{}"
+	"StateFlags"		"6"
+	"installdir"		"{}"
+	"LastUpdated"		"{}"
+	"SizeOnDisk"		"0"
+	"StagingSize"		"0"
+	"buildid"		"0"
+	"LastOwner"		"0"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"0"
+	"BytesDownloaded"		"0"
+	"BytesToStage"		"0"
+	"BytesStaged"		"0"
+	"TargetBuildID"		"0"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"UserConfig"
+	{{
+		"language"		"english"
+	}}
+	"MountedConfig"
+	{{
+		"language"		"english"
+	}}
+}}
+"#, appid, steam_exe_str, name, name, timestamp);
+
+    std::fs::write(acf_path, content)?;
+    Ok(())
+}
+
+
+
+
+pub fn setup_greenluma_config(gl_path: &str) -> std::io::Result<()> {
+    let path = std::path::Path::new(gl_path);
+    if !path.exists() { return Ok(()); }
+
+    // GreenLuma uses these empty files as flags for Stealth Mode and NoQuestion
+    let files = ["StealthMode.bin", "NoQuestion.bin"];
+    
+    for f in files.iter() {
+        let p = path.join(f);
+        if !p.exists() {
+           // Create empty file
+           std::fs::write(&p, "")?;
+        }
+    }
+    
+    Ok(())
 }

@@ -95,20 +95,48 @@ impl GamePathFinder {
         None
     }
 
-    fn get_library_folders(steam_path: &str) -> Vec<PathBuf> {
+    pub fn get_library_folders(steam_path: &str) -> Vec<PathBuf> {
         let mut folders = Vec::new();
         let main_steam = PathBuf::from(steam_path);
         folders.push(main_steam.clone());
 
         let vdf_path = main_steam.join("steamapps").join("libraryfolders.vdf");
         if let Ok(content) = fs::read_to_string(vdf_path) {
-            let re = Regex::new(r#""path"\s+"(.+?)""#).unwrap();
-            for cap in re.captures_iter(&content) {
-                if let Some(m) = cap.get(1) {
-                    let path_str = m.as_str().replace("\\\\", "\\");
-                    let p = PathBuf::from(path_str);
-                    if p != main_steam {
-                        folders.push(p);
+            if let Some(parsed) = Self::parse_vdf(&content) {
+                // Navigate to "libraryfolders"
+                // Navigate to "libraryfolders"
+                let root = if let VdfValue::Obj(entries) = parsed {
+                    // Check if "libraryfolders" exists at root level
+                    if let Some((_, v)) = entries
+                        .clone()
+                        .into_iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case("libraryfolders"))
+                    {
+                        Some(v)
+                    } else {
+                        // Fallback: Assume the whole file is the content of libraryfolders (legacy/weird format)
+                        // But we consumed entries. Reconstruct or just use the clone?
+                        // Better: logic.
+                        Some(VdfValue::Obj(entries))
+                    }
+                } else {
+                    Some(parsed)
+                };
+
+                if let Some(VdfValue::Obj(libs)) = root {
+                    for (_, data) in libs {
+                        if let VdfValue::Obj(props) = data {
+                            for (key, val) in props {
+                                if key.eq_ignore_ascii_case("path") {
+                                    if let VdfValue::Str(s) = val {
+                                        let p = PathBuf::from(s.replace("\\\\", "\\"));
+                                        if p != main_steam {
+                                            folders.push(p);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

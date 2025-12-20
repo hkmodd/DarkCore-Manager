@@ -23,6 +23,7 @@ egui_extras = { version = "0.29", features = ["all_loaders"] }
 image = { version = "0.24", features = ["jpeg", "png"] }
 rodio = "0.17"
 sysinfo = "0.30"
+chrono = "0.4"
 windows = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
