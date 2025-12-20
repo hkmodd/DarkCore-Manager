@@ -1738,19 +1738,66 @@ impl DarkCoreApp {
                                                   self.install_modal_open = true;
                                                }
                                             } else {
-                                               // Launch Game Directly via Steam EXE (More Robust than URL Protocol)
+                                               // SMART LAUNCH SYSTEM
                                                let steam_path = self.config.steam_path.clone();
+                                               let gl_path = self.config.gl_path.clone();
                                                let app_id_run = display_id.clone();
+                                               
                                                std::thread::spawn(move || {
                                                    let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
-                                                   if steam_exe.exists() {
-                                                        let _ = std::process::Command::new(steam_exe)
-                                                            .arg("-applaunch")
-                                                            .arg(&app_id_run)
-                                                            .spawn();
+                                                   
+                                                   // 1. Check if Steam is running
+                                                   let status_out = std::process::Command::new("tasklist")
+                                                       .args(&["/FI", "IMAGENAME eq steam.exe", "/M", "GreenLuma_2025_x64.dll"])
+                                                       .output();
+                                                       
+                                                   let mut is_running = false;
+                                                   let mut is_injected = false;
+                                                   
+                                                   // Check generic running first
+                                                   let run_check = std::process::Command::new("tasklist")
+                                                        .args(&["/FI", "IMAGENAME eq steam.exe"])
+                                                        .output();
+                                                   if let Ok(o) = run_check {
+                                                       let s = String::from_utf8_lossy(&o.stdout);
+                                                       if s.contains("steam.exe") { is_running = true; }
+                                                   }
+                                                   
+                                                   // Check injection
+                                                   if let Ok(o) = status_out {
+                                                       let s = String::from_utf8_lossy(&o.stdout);
+                                                       if s.contains("steam.exe") { is_injected = true; }
+                                                   }
+                                                   
+                                                   if is_running {
+                                                       if is_injected {
+                                                           // CASE A: Steam Running + GreenLuma -> Direct Launch
+                                                           let _ = std::process::Command::new(steam_exe)
+                                                               .arg("-applaunch")
+                                                               .arg(&app_id_run)
+                                                               .spawn();
+                                                       } else {
+                                                           // CASE B: Steam Running w/o GreenLuma -> RESTART REQUIRED (Automatic)
+                                                           // Kill Steam
+                                                           let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
+                                                           std::thread::sleep(std::time::Duration::from_millis(2000));
+                                                           
+                                                           // Launch Injected
+                                                           let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
+                                                           let _ = crate::injector::launch_injected(
+                                                               steam_exe.to_str().unwrap_or(""),
+                                                               dll_path.to_str().unwrap_or(""),
+                                                               Some(&format!("-applaunch {}", app_id_run))
+                                                           );
+                                                       }
                                                    } else {
-                                                       // Fallback
-                                                       let _ = open::that(format!("steam://rungameid/{}", app_id_run));
+                                                       // CASE C: Steam Closed -> Launch Injected
+                                                       let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
+                                                       let _ = crate::injector::launch_injected(
+                                                           steam_exe.to_str().unwrap_or(""),
+                                                           dll_path.to_str().unwrap_or(""),
+                                                           Some(&format!("-applaunch {}", app_id_run))
+                                                       );
                                                    }
                                                });
                                             }
