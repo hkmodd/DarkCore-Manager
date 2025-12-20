@@ -157,7 +157,7 @@ We believe in transparency. Build it yourself.
 Upon first boot, the core system requires mapping to your local ecosystem. Navigate to the **SETTINGS** tab to initialize the environment:
 
 *   **Steam Root**: The directory housing `Steam.exe` (e.g., `C:\Program Files (x86)\Steam`).
-*   **GreenLuma Artifact**: The folder containing the *GreenLuma 2024* binary (`DLLInjector.exe`).
+*   **GreenLuma Artifact**: The folder containing the *GreenLuma 2025* binary (`GreenLuma_2025_x64.dll`). Note: `DLLInjector.exe` is no longer required as DarkCore handles native injection.
 *   **Steamless Binary**: Path to `Steamless.CLI.exe`. This is **critical** for the "Unpacker" module to function correctly on protected executables.
 *   **Morrenus API Key**: (Optional) Input your private key to unlock the "Intelligence Module" (Manifests & Decryption Keys).
     *   *Note: Without this key, the system defaults to **Fallback Mode** (Public Steam Store API), limiting capabilities to Library Management only.*
