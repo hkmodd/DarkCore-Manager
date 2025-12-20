@@ -1,3 +1,4 @@
+// Titan Hook Library - Updated for GreenLuma 2025
 pub mod hooks;
 pub mod interfaces;
 
