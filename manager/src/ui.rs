@@ -12,7 +12,7 @@ use rodio::Source;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use zip::ZipArchive;
 
@@ -788,29 +788,62 @@ impl DarkCoreApp {
                 }
             }
 
-            // STEP 5: DLL INJECTOR & RESTART
-            log("STEP 4: Relaunching Steam (Injected)...".to_string());
+            // STEP 5: STEALTH INJECTION & LAUNCH
+            log("STEP 4: Initiating Stealth Launch Sequence (x64)...".to_string());
             
-            let injector_path = Path::new(&gl_path).join("DLLInjector.exe");
-            if injector_path.exists() {
-               use std::process::Stdio;
-               // We must set CurrentDir to GreenLuma folder or it might fail
-               if let Err(e) = Command::new(&injector_path)
-                   .current_dir(&gl_path)
-                   .stdout(Stdio::null())
-                   .stderr(Stdio::null())
-                   .spawn() {
-                       log(format!("Failed to launch Injector: {}", e));
-                   } else {
-                       log("Steam launched via GreenLuma. Install prompt should appear shortly.".to_string());
-                       std::thread::sleep(std::time::Duration::from_secs(5)); 
-                       let _ = Command::new("explorer")
-                           .arg(format!("steam://install/{}", appid))
-                           .spawn();
-                   }
+            // STEP 5: STEALTH INJECTION & LAUNCH (SUSPENDED)
+            log("STEP 4: Initiating Stealth Launch Sequence (Suspended x64)...".to_string());
+            
+            let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+            let dll_name = "GreenLuma_2025_x64.dll";
+            let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+            
+            if steam_exe.exists() {
+                 if dll_path.exists() {
+                     log("Syncing Files to Steam Directory...".to_string());
+                     
+                     // 1. Copy DLL
+                     let target_dll = std::path::Path::new(&steam_path).join(dll_name);
+                     if let Err(e) = std::fs::copy(&dll_path, &target_dll) {
+                         log(format!("⚠️ DLL Sync Warning: {}", e));
+                     }
+
+                     // 2. Sync AppList
+                     let src_applist = std::path::Path::new(&gl_path).join("AppList");
+                     let dst_applist = std::path::Path::new(&steam_path).join("AppList");
+                     if src_applist.exists() {
+                         let _ = std::fs::create_dir_all(&dst_applist);
+                         if let Ok(entries) = std::fs::read_dir(src_applist) {
+                             for entry in entries.flatten() {
+                                 if let Ok(ft) = entry.file_type() {
+                                     if ft.is_file() {
+                                         let dest_file = dst_applist.join(entry.file_name());
+                                         let _ = std::fs::copy(entry.path(), dest_file);
+                                     }
+                                 }
+                             }
+                         }
+                     }
+
+                     // 3. Launch with LOCAL DLL
+                     log("Launching Steam Suspended (Local DLL)...".to_string());
+                     match crate::injector::launch_injected(
+                         steam_exe.to_str().unwrap_or(""),
+                         target_dll.to_str().unwrap_or(""),
+                         Some("-inhibitbootstrap")
+                     ) {
+                         Ok(_) => log("✅ LAUNCH SUCCESSFUL. Payload Injected.".to_string()),
+                         Err(e) => log(format!("❌ LAUNCH FAILED: {}", e)),
+                     }
+                 } else {
+                     log(format!("❌ CRITICAL: {} not found!", dll_name));
+                 }
             } else {
-                log("ERROR: DLLInjector.exe not found in GreenLuma path!".to_string());
+                log("❌ Error: steam.exe not found.".to_string());
             }
+
+            // Launch Game Install URI as backup
+            let _ = open::that(format!("steam://install/{}", appid));
         });
     }
 
@@ -832,17 +865,19 @@ impl eframe::App for DarkCoreApp {
         let accent_pink = egui::Color32::from_rgb(255, 0, 110);
         let _text_dim = egui::Color32::from_rgb(140, 140, 160);
 
-            if let Some(data) = &self.logo_data {
-                self.logo_texture = Some(ctx.load_texture(
-                    "logo_v5_final",
-                    data.clone(),
-                    egui::TextureOptions {
-                        magnification: egui::TextureFilter::Linear,
-                        minification: egui::TextureFilter::Linear,
-                        mipmap_mode: Some(egui::TextureFilter::Linear),
-                        ..egui::TextureOptions::LINEAR
-                    }
-                ));
+            if self.logo_texture.is_none() {
+                if let Some(data) = &self.logo_data {
+                    self.logo_texture = Some(ctx.load_texture(
+                        "logo_v5_final",
+                        data.clone(),
+                        egui::TextureOptions {
+                            magnification: egui::TextureFilter::Linear,
+                            minification: egui::TextureFilter::Linear,
+                            mipmap_mode: Some(egui::TextureFilter::Linear),
+                            ..egui::TextureOptions::LINEAR
+                        }
+                    ));
+                }
             }
 
         // --- SIDEBAR ---
@@ -1271,18 +1306,62 @@ impl DarkCoreApp {
             ).fill(egui::Color32::from_rgb(50, 50, 60));
 
             if ui.add(btn_launch).on_hover_text("Manually start Steam via GreenLuma Injector").clicked() {
-                 let greenluma_path = PathBuf::from(self.config.gl_path.clone());
-                 let injector_exe = greenluma_path.join("DLLInjector.exe");
-                 if injector_exe.exists() {
-                     self.log("Manual Launch: Starting Steam (GreenLuma)...".to_string());
-                     if let Err(e) = std::process::Command::new(&injector_exe)
-                         .current_dir(&greenluma_path)
-                         .spawn() {
-                             self.log(format!("Launch Error: {}", e));
+                 let steam_path = self.config.steam_path.clone();
+                 let gl_path = self.config.gl_path.clone();
+                 let log_arc = self.system_log.clone();
+
+                 std::thread::spawn(move || {
+                     let log = move |msg: String| {
+                         if let Ok(mut logs) = log_arc.lock() {
+                             logs.push(msg);
                          }
-                 } else {
-                     self.log("Error: DLLInjector.exe not found.".to_string());
-                 }
+                     };
+                     log("Manual Launch: Initiating Stealth Sequence (x64)...".to_string());
+                     
+     let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                     let dll_name = "GreenLuma_2025_x64.dll";
+                     let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+
+                     if steam_exe.exists() {
+                        if dll_path.exists() {
+                             // FORCE KILL STEAM FIRST
+                             let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
+                             std::thread::sleep(std::time::Duration::from_millis(1000));
+
+                             // SYNC FILES
+                             let target_dll = std::path::Path::new(&steam_path).join(dll_name);
+                             let _ = std::fs::copy(&dll_path, &target_dll);
+                             
+                             let src_applist = std::path::Path::new(&gl_path).join("AppList");
+                             let dst_applist = std::path::Path::new(&steam_path).join("AppList");
+                             if src_applist.exists() {
+                                 let _ = std::fs::create_dir_all(&dst_applist);
+                                 if let Ok(entries) = std::fs::read_dir(src_applist) {
+                                     for entry in entries.flatten() {
+                                         if let Ok(ft) = entry.file_type() {
+                                             if ft.is_file() {
+                                                 let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name()));
+                                             }
+                                         }
+                                     }
+                                 }
+                             }
+
+                             match crate::injector::launch_injected(
+                                 steam_exe.to_str().unwrap_or(""),
+                                 target_dll.to_str().unwrap_or(""),
+                                 Some("-inhibitbootstrap")
+                             ) {
+                                 Ok(_) => log("✅ Steam Launched with GreenLuma.".to_string()),
+                                 Err(e) => log(format!("❌ Launch Failed: {}", e)),
+                             }
+                        } else {
+                            log(format!("❌ Missing: {}", dll_name));
+                        }
+                     } else {
+                        log("❌ steam.exe not found.".to_string());
+                     }
+                 });
             }
         });
 
@@ -1626,19 +1705,52 @@ impl DarkCoreApp {
                                                                 self.log("Cloud Sync Suppressed (localconfig patched).".to_string());
                                                                 
                                                                 // AUTO-RESTART STEAM via GreenLuma Injector
-                                                                let greenluma_path = PathBuf::from(self.config.gl_path.clone());
-                                                                let injector_exe = greenluma_path.join("DLLInjector.exe");
-                                                                
-                                                                if injector_exe.exists() {
-                                                                     self.log("Restarting Steam (GreenLuma)...".to_string());
-                                                                     if let Err(e) = std::process::Command::new(injector_exe)
-                                                                         .current_dir(greenluma_path) 
-                                                                         .spawn() {
-                                                                             self.log(format!("Failed to auto-restart Steam: {}", e));
-                                                                         }
-                                                                } else {
-                                                                    self.log("Steam Terminated. PLEASE RESTART STEAM MANUALLY (Injector not found).".to_string());
-                                                                }
+                                                                let steam_path = steam_path.clone(); // Capture from outer
+                                                                let gl_path = self.config.gl_path.clone();
+                                                                let log_arc = self.system_log.clone();
+
+                                                                std::thread::spawn(move || {
+                                                                    let log = move |msg: String| {
+                                                                        if let Ok(mut logs) = log_arc.lock() {
+                                                                            logs.push(msg);
+                                                                        }
+                                                                    };
+                                                                    log("Titan/Restart: Initiating Stealth Sequence (x64)...".to_string());
+                                                                    
+                                                                let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                                                                    let dll_name = "GreenLuma_2025_x64.dll";
+                                                                    let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+                
+                                                                    if steam_exe.exists() && dll_path.exists() {
+                                                                        // SYNC
+                                                                        let target_dll = std::path::Path::new(&steam_path).join(dll_name);
+                                                                        let _ = std::fs::copy(&dll_path, &target_dll);
+                                                                        
+                                                                        let src_applist = std::path::Path::new(&gl_path).join("AppList");
+                                                                        let dst_applist = std::path::Path::new(&steam_path).join("AppList");
+                                                                        if src_applist.exists() {
+                                                                            let _ = std::fs::create_dir_all(&dst_applist);
+                                                                            if let Ok(entries) = std::fs::read_dir(src_applist) {
+                                                                               for entry in entries.flatten() {
+                                                                                   if let Ok(ft) = entry.file_type() {
+                                                                                       if ft.is_file() { let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name())); }
+                                                                                   }
+                                                                               }
+                                                                            }
+                                                                        }
+
+                                                                        match crate::injector::launch_injected(
+                                                                            steam_exe.to_str().unwrap_or(""),
+                                                                            target_dll.to_str().unwrap_or(""),
+                                                                            Some("-inhibitbootstrap")
+                                                                        ) {
+                                                                            Ok(_) => log("✅ Restarted with GreenLuma.".to_string()),
+                                                                            Err(e) => log(format!("❌ Restart Failed: {}", e)),
+                                                                        }
+                                                                    } else {
+                                                                        log("❌ Missing files for restart.".to_string());
+                                                                    }
+                                                                });
                                                             },
                                                             Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
                                                         }
@@ -2102,18 +2214,50 @@ impl DarkCoreApp {
                 }
 
                 // 4. Auto-Restart
-                let greenluma_path = PathBuf::from(self.config.gl_path.clone());
-                let injector_exe = greenluma_path.join("DLLInjector.exe");
-                if injector_exe.exists() {
-                     self.log("Restarting Steam...".to_string());
-                     if let Err(e) = std::process::Command::new(injector_exe)
-                         .current_dir(greenluma_path)
-                         .spawn() {
-                             self.log(format!("Failed to restart Steam: {}", e));
+                let steam_path = steam_path.clone();
+                let gl_path = self.config.gl_path.clone();
+                let log_arc = self.system_log.clone();
+
+                std::thread::spawn(move || {
+                     let log = move |msg: String| {
+                         if let Ok(mut logs) = log_arc.lock() {
+                             logs.push(msg);
                          }
-                } else {
-                     self.log("GreenLuma Injector not found. Restart Manually.".to_string());
-                }
+                     };
+                     log("Auto-Titan: Initiating Stealth Sequence (x64)...".to_string());
+                     
+                     let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                     let dll_name = "GreenLuma_2025_x64.dll";
+                     let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+
+                     if steam_exe.exists() && dll_path.exists() {
+                        // SYNC
+                        let target_dll = std::path::Path::new(&steam_path).join(dll_name);
+                        let _ = std::fs::copy(&dll_path, &target_dll);
+
+                        let src_applist = std::path::Path::new(&gl_path).join("AppList");
+                        let dst_applist = std::path::Path::new(&steam_path).join("AppList");
+                        if src_applist.exists() {
+                            let _ = std::fs::create_dir_all(&dst_applist);
+                            if let Ok(entries) = std::fs::read_dir(src_applist) {
+                               for entry in entries.flatten() {
+                                   if let Ok(ft) = entry.file_type() {
+                                       if ft.is_file() { let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name())); }
+                                   }
+                               }
+                            }
+                        }
+
+                        match crate::injector::launch_injected(
+                            steam_exe.to_str().unwrap_or(""),
+                            target_dll.to_str().unwrap_or(""),
+                            Some("-inhibitbootstrap")
+                        ) {
+                            Ok(_) => log("✅ Auto-Titan Injected.".to_string()),
+                            Err(e) => log(format!("❌ Auto-Titan Failed: {}", e)),
+                        }
+                     }
+                });
             },
             Err(e) => self.log(format!("Titan Deployment Failed: {}", e)),
         }
