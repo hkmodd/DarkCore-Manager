@@ -302,8 +302,15 @@ impl DarkCoreApp {
         let target = self.active_games.clone();
         let steam_path = self.config.steam_path.clone();
         let games = refresh_active_games_list(&gl_path, &steam_path, &cache_snapshot);
+        
+        // Collect IDs for update checking
+        let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
+        
         let mut target_guard = target.lock().unwrap();
         *target_guard = games;
+        
+        // Trigger Update Check
+        self.check_updates_for_ids(ids);
     }
 
 
@@ -1660,8 +1667,7 @@ impl DarkCoreApp {
 
                                  let text = if is_installed { 
                                      if needs_update { "♻ UPDATE" }
-                                     else if is_up_to_date { "▶ PLAY" }
-                                     else { "⌛ CHECKING..." }
+                                     else { "▶ PLAY" } // Default to PLAY immediately, check in background
                                  } else { "🚀 INSTALL" };
 
                                  let time = ui.input(|i| i.time);
@@ -1673,12 +1679,9 @@ impl DarkCoreApp {
                                          egui::Color32::from_rgba_premultiplied(
                                              (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
                                          )
-                                     } else if is_up_to_date {
+                                     } else {
                                          // Green for Play (Solid)
                                          egui::Color32::from_rgb(0, 200, 100)
-                                     } else {
-                                         // Gray for Checking
-                                         egui::Color32::from_rgb(80, 80, 80)
                                      }
                                  } else {
                                      // Green/Cyan for Install
@@ -1735,8 +1738,21 @@ impl DarkCoreApp {
                                                   self.install_modal_open = true;
                                                }
                                             } else {
-                                               // Launch Game URL
-                                               let _ = open::that(format!("steam://rungameid/{}", display_id));
+                                               // Launch Game Directly via Steam EXE (More Robust than URL Protocol)
+                                               let steam_path = self.config.steam_path.clone();
+                                               let app_id_run = display_id.clone();
+                                               std::thread::spawn(move || {
+                                                   let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                                                   if steam_exe.exists() {
+                                                        let _ = std::process::Command::new(steam_exe)
+                                                            .arg("-applaunch")
+                                                            .arg(&app_id_run)
+                                                            .spawn();
+                                                   } else {
+                                                       // Fallback
+                                                       let _ = open::that(format!("steam://rungameid/{}", app_id_run));
+                                                   }
+                                               });
                                             }
                                       }
                                  }
@@ -2434,16 +2450,49 @@ impl DarkCoreApp {
                                               let mut best_match = String::new();
                                               let mut highest_score = 0;
                                               
-                                              // Simple fuzzy match
+                                              // Advanced "Brain" Scan Logic
+                                              let clean_tokenize = |s: &str| -> Vec<String> {
+                                                  s.to_lowercase()
+                                                   .replace(|c: char| !c.is_alphanumeric() && !c.is_whitespace(), "")
+                                                   .split_whitespace()
+                                                   .map(|s| s.to_string())
+                                                   .collect()
+                                              };
+                                              
+                                              let name_tokens = clean_tokenize(&name);
+                                              let name_clean = name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+
                                               for entry in entries.flatten() {
                                                   if let Ok(meta) = entry.metadata() {
                                                       if meta.is_dir() {
                                                           let folder_name = entry.file_name().to_string_lossy().to_string();
-                                                          // Score logic: Count matching words?
-                                                          let score = folder_name.to_lowercase().split_whitespace().filter(|w| name.to_lowercase().contains(w)).count();
+                                                          // Skip common utility folders
+                                                          if folder_name.eq_ignore_ascii_case("common") || folder_name.eq_ignore_ascii_case("Steamworks Shared") { continue; }
+
+                                                          let folder_tokens = clean_tokenize(&folder_name);
+                                                          let folder_clean = folder_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+
+                                                          // 1. Token Overlap
+                                                          let matches = folder_tokens.iter().filter(|ft| name_tokens.contains(ft)).count();
+                                                          
+                                                          // 2. Substring Check (Robust against "The", ":", "-")
+                                                          let is_substring = name_clean.contains(&folder_clean) && folder_clean.len() > 3;
+                                                          
+                                                          // Score Calculation
+                                                          let mut score = matches * 10;
+                                                          if is_substring { score += 50; }
+                                                          if folder_clean == name_clean { score += 100; }
+                                                          
+                                                          // Update Candidate
                                                           if score > highest_score {
                                                               highest_score = score;
                                                               best_match = folder_name;
+                                                          } else if score == highest_score && score > 0 {
+                                                              // Tie-breaker: Prefer shorter names (usually the main game vs soundtrack/demo)
+                                                              // UNLESS the name is extremely short (<3 chars)
+                                                              if folder_name.len() < best_match.len() {
+                                                                  best_match = folder_name;
+                                                              }
                                                           }
                                                       }
                                                   }
