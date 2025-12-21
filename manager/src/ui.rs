@@ -7,6 +7,7 @@ use crate::config::{load_config, save_config, AppConfig};
 use crate::profiles::{Profile, ProfileManager};
 use crate::steamless;
 use crate::vdf_injector::{inject_vdf, parse_lua_for_keys};
+use crate::vault::VaultManager;
 use eframe::egui;
 use rodio::Source;
 use std::collections::HashMap;
@@ -37,9 +38,10 @@ pub struct DarkCoreApp {
     last_searched_query: String,
     last_input_time: Option<Instant>,
     search_results: Arc<Mutex<Vec<SearchResult>>>,
-    active_games: Arc<Mutex<Vec<GameProfile>>>,
+    active_games: Arc<Mutex<Vec<GameProfile>>>, // Restored
     game_cache: Arc<Mutex<HashMap<String, String>>>,
     update_cache: Arc<Mutex<HashMap<String, bool>>>,
+    relationships: Arc<Mutex<crate::app_list::RelationshipMap>>, // New Relationship Map
 
     // Steamless
     target_exe: String,
@@ -113,6 +115,8 @@ impl DarkCoreApp {
 
         // Load cache
         let cache_map = load_game_cache();
+        // Load relationships
+        let rel_map = crate::app_list::load_relationships(".");
 
         // Always initialize client; it handles empty keys via Fallback to Steam Store API.
         let api_client = Some(ApiClient::new(config.api_key.clone()));
@@ -133,6 +137,7 @@ impl DarkCoreApp {
             active_games: Arc::new(Mutex::new(Vec::new())),
             game_cache: Arc::new(Mutex::new(cache_map)),
             update_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            relationships: Arc::new(Mutex::new(rel_map)),
             target_exe: String::new(),
             include_dlcs: true,
             status_msg: "System Ready".to_string(),
@@ -299,9 +304,14 @@ impl DarkCoreApp {
         let cache_lock = self.game_cache.lock().unwrap();
         let cache_snapshot = cache_lock.clone();
         drop(cache_lock);
+        
+        let rel_lock = self.relationships.lock().unwrap();
+        let rel_snapshot = rel_lock.clone();
+        drop(rel_lock);
+
         let target = self.active_games.clone();
         let steam_path = self.config.steam_path.clone();
-        let games = refresh_active_games_list(&gl_path, &steam_path, &cache_snapshot);
+        let games = refresh_active_games_list(&gl_path, &steam_path, &cache_snapshot, &rel_snapshot);
         
         // Collect IDs for update checking
         let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
@@ -819,6 +829,7 @@ impl DarkCoreApp {
         let include_dlcs = self.include_dlcs;
         let game_cache = self.game_cache.clone(); // Keep this for cache updates
         let api_key = self.config.api_key.clone(); // Keep this for API client creation inside thread
+        let relationships_arc = self.relationships.clone(); // New: Capture relationships map for thread
         
         // Use Arc/Mutex for status updates
         let status_queue = self.status_update_queue.clone();
@@ -910,49 +921,75 @@ impl DarkCoreApp {
                  log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
             }
 
-            // STEP 2: TRY MANIFEST (Priority)
+            // STEP 2: TRY MANIFEST (Priority + Vault)
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut manifest_success = false;
             let mut lua_content = String::new();
+            let vault = VaultManager::new(".");
 
-            // Only attempt manifest download if we have a key (saves a request) OR we assume empty key fails?
-            // Morrenus API definitely needs key.
-            if !api_key.is_empty() {
-                log(format!("STEP 2: Downloading Manifest for ID {}...", appid));
-                match runtime.block_on(client.download_manifest(&appid)) {
-                    Ok(bytes) => {
-                        log("Download successful. Extracting...".to_string());
-                        let reader = Cursor::new(bytes);
-                        if let Ok(mut zip) = ZipArchive::new(reader) {
-                            let depot_dir = Path::new(&steam_path).join("depotcache");
-                            if !depot_dir.exists() {
-                                 let _ = std::fs::create_dir_all(&depot_dir);
-                            }
-                            for i in 0..zip.len() {
-                                if let Ok(mut file) = zip.by_index(i) {
-                                    let raw_path = file.name().to_string();
-                                    if raw_path.ends_with(".manifest") {
-                                         if let Some(fname) = Path::new(&raw_path).file_name() {
-                                             let out_path = depot_dir.join(fname);
-                                             if let Ok(mut outfile) = std::fs::File::create(out_path) {
-                                                  let _ = std::io::copy(&mut file, &mut outfile);
-                                             }
-                                         }
-                                    } else if raw_path.ends_with(".lua") {
-                                         use std::io::Read;
-                                         let _ = file.read_to_string(&mut lua_content);
-                                    }
-                                }
-                            }
-                            manifest_success = true;
-                        }
-                    },
-                    Err(_) => {
-                        log("Manifest download failed (Invalid Key or Server Error). Skipping to Fallback...".to_string());
+            // Helper to process ZIP bytes
+            let process_zip = |bytes: Vec<u8>| -> (bool, String) {
+                let reader = Cursor::new(bytes);
+                if let Ok(mut zip) = ZipArchive::new(reader) {
+                    let depot_dir = Path::new(&steam_path).join("depotcache");
+                    if !depot_dir.exists() {
+                         let _ = std::fs::create_dir_all(&depot_dir);
                     }
+                    let mut extracted_lua = String::new();
+                    for i in 0..zip.len() {
+                        if let Ok(mut file) = zip.by_index(i) {
+                            let raw_path = file.name().to_string();
+                            if raw_path.ends_with(".manifest") {
+                                 if let Some(fname) = Path::new(&raw_path).file_name() {
+                                     let out_path = depot_dir.join(fname);
+                                     if let Ok(mut outfile) = std::fs::File::create(out_path) {
+                                          let _ = std::io::copy(&mut file, &mut outfile);
+                                     }
+                                 }
+                            } else if raw_path.ends_with(".lua") {
+                                 use std::io::Read;
+                                 let _ = file.read_to_string(&mut extracted_lua);
+                            }
+                        }
+                    }
+                    return (true, extracted_lua);
                 }
-            } else {
-                 log("OFFLINE MODE: Skipping Manifest Download (No API Key).".to_string());
+                (false, String::new())
+            };
+
+            // VAULT CHECK
+            let mut bytes_opt = None;
+            if vault.exists(&appid) {
+                log(format!("DarkVault: Found cached manifest for {}. Loading local... 🛡️", appid));
+                if let Ok(b) = vault.get(&appid) {
+                     bytes_opt = Some(b);
+                }
+            }
+
+            if bytes_opt.is_none() && !api_key.is_empty() {
+                log(format!("STEP 2: Downloading Manifest for ID {} (Online)...", appid));
+                match runtime.block_on(client.download_manifest(&appid)) {
+                     Ok(bytes) => {
+                         // Save to Vault
+                         if let Err(e) = vault.save(&appid, &bytes) {
+                             log(format!("Vault Save Error: {}", e));
+                         } else {
+                             log("Download successful. Saved to Vault.".to_string());
+                         }
+                         bytes_opt = Some(bytes.to_vec());
+                     },
+                     Err(_) => {
+                         log("Manifest download failed (Invalid Key or Server Error). Skipping to Fallback...".to_string());
+                     }
+                }
+            } else if bytes_opt.is_none() {
+                 log("OFFLINE MODE: No Key & No Cache. Skipping Manifest.".to_string());
+            }
+
+            if let Some(bytes) = bytes_opt {
+                let (ok, content) = process_zip(bytes);
+                manifest_success = ok;
+                lua_content = content;
             }
 
             // STEP 3: PREPARE IDs (Hybrid)
@@ -999,6 +1036,23 @@ impl DarkCoreApp {
                          Err(_) => log("Could not fetch DLC list (Connection Error).".to_string())
                      }
                  }
+            }
+
+            // STEP 3.5: LINK DLCs (Intelligent Linking)
+            {
+                if let Ok(mut map) = relationships_arc.lock() {
+                    let mut changed = false;
+                    for id in &final_ids {
+                        if *id != appid {
+                             map.insert(id.clone(), appid.clone());
+                             changed = true;
+                        }
+                    }
+                    if changed {
+                        crate::app_list::save_relationships(".", &map);
+                        log("DLC Relationships linked and saved.".to_string());
+                    }
+                }
             }
 
             // STEP 4: UPDATE APPLIST
@@ -1426,17 +1480,35 @@ impl eframe::App for DarkCoreApp {
                         }
 
                         if !self.is_scanning_dlcs {
+                            // OPTION 1: UNLINK (SAFE)
                             if ui
                                 .button(
-                                    egui::RichText::new("CONFIRM DELETE").color(egui::Color32::RED),
+                                    egui::RichText::new("🗑 UNLINK ID (SAFE)").color(egui::Color32::from_rgb(255, 165, 0)),
                                 )
+                                .on_hover_text("Removes from AppList & Config only.\nKEEPS game files and manifests on disk.")
                                 .clicked()
                             {
-                                // EXECUTE DELETE
                                 let mut to_delete = vec![self.delete_candidate_id.clone().unwrap()];
                                 to_delete.extend(self.delete_associated_dlcs.iter().cloned());
 
-                                self.remove_games_by_id(to_delete);
+                                self.remove_games_by_id(to_delete, false);
+
+                                self.delete_modal_open = false;
+                                self.refresh_library();
+                            }
+
+                            // OPTION 2: FULL WIPE
+                            if ui
+                                .button(
+                                    egui::RichText::new("🔥 FULL UNINSTALL").color(egui::Color32::RED).strong(),
+                                )
+                                .on_hover_text("DESTRUCTIVE.\nRemoves AppList, Config, Manifests AND DELETES GAME FILES.")
+                                .clicked()
+                            {
+                                let mut to_delete = vec![self.delete_candidate_id.clone().unwrap()];
+                                to_delete.extend(self.delete_associated_dlcs.iter().cloned());
+
+                                self.remove_games_by_id(to_delete, true);
 
                                 self.delete_modal_open = false;
                                 self.refresh_library();
@@ -1654,19 +1726,30 @@ impl DarkCoreApp {
                                  
                                  // PULSING BUTTON
                                  let mut needs_update = false;
-                                 let mut is_up_to_date = false;
+
+                                 let mut is_dlc_linked = false;
+                                 let mut parent_game_id = String::new();
                                  
                                  if is_installed {
+                                     // Check Update Status
                                      if let Ok(cache) = self.update_cache.lock() {
                                          if let Some(upd) = cache.get(&display_id) {
                                              if *upd { needs_update = true; }
-                                             else { is_up_to_date = true; }
+
+                                         }
+                                     }
+                                     // Check DLC Link
+                                     if let Ok(rel) = self.relationships.lock() {
+                                         if let Some(pid) = rel.get(&display_id) {
+                                             is_dlc_linked = true;
+                                             parent_game_id = pid.clone();
                                          }
                                      }
                                  }
 
                                  let text = if is_installed { 
-                                     if needs_update { "♻ UPDATE" }
+                                     if is_dlc_linked { "🔗 DLC LINKED" }
+                                     else if needs_update { "♻ UPDATE" }
                                      else { "▶ PLAY" } // Default to PLAY immediately, check in background
                                  } else { "🚀 INSTALL" };
 
@@ -1674,7 +1757,10 @@ impl DarkCoreApp {
                                  let alpha = (time * 3.0).sin().abs() as f32 * 0.5 + 0.5; // 0.5 to 1.0
                                  
                                  let bg_color = if is_installed {
-                                     if needs_update {
+                                     if is_dlc_linked {
+                                         // Passive Blue-Gray
+                                         egui::Color32::from_rgb(50, 60, 75)
+                                     } else if needs_update {
                                          // Orange/Yellow for Update
                                          egui::Color32::from_rgba_premultiplied(
                                              (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
@@ -1706,7 +1792,11 @@ impl DarkCoreApp {
                                       
                                       let mut btn_resp = ui.add(btn);
                                       if is_installed {
-                                           btn_resp = btn_resp.on_hover_text("Game is already installed. Right-click to Repair.");
+                                           if is_dlc_linked {
+                                               btn_resp = btn_resp.on_hover_text(format!("Linked to Parent ID: {}. Launch the main game to play.", parent_game_id));
+                                           } else {
+                                               btn_resp = btn_resp.on_hover_text("Game is already installed. Right-click to Repair.");
+                                           }
                                       }
                                       
                                       // Right-Click Context Menu for Repair
@@ -1724,7 +1814,10 @@ impl DarkCoreApp {
                                       });
                                       
                                       if btn_resp.clicked() {
-                                            if !is_installed || needs_update {
+                                            if is_dlc_linked {
+                                                // Prevent action
+                                                self.log(format!("DLC Content (Linked to {}). Please launch the base game.", parent_game_id));
+                                            } else if !is_installed || needs_update {
                                                 // Check if manifest exists (Automatic Resume)
                                                if let Some(path) = crate::game_path::GamePathFinder::find_manifest_path(&self.config.steam_path, &display_id) {
                                                    // Found it -> Resume/Update in place
@@ -2584,9 +2677,41 @@ impl DarkCoreApp {
     fn initiate_delete(&mut self, app_id: String, name: String) {
         self.delete_modal_open = true;
         self.delete_candidate_id = Some(app_id.clone());
-        self.delete_candidate_name = Some(name);
+        self.delete_candidate_name = Some(name.clone());
         self.delete_associated_dlcs.clear();
         self.is_scanning_dlcs = true;
+
+        // Local Relationship Scan
+        let mut known_child_ids = Vec::new();
+        if let Ok(rel) = self.relationships.lock() {
+            for (child, parent) in rel.iter() {
+                if parent == &app_id {
+                    known_child_ids.push(child.clone());
+                }
+            }
+        }
+
+        // Heuristic Name Scan (For "Borderlands 4" vs "Borderlands®4: ...")
+        let target_clean = name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+        if target_clean.len() >= 4 { 
+             if let Ok(games) = self.active_games.lock() {
+                 for game in games.iter() {
+                     if game.app_id == app_id { continue; } // Skip self
+                     
+                     // Detect if candidate is likely a DLC based on name overlap
+                     let candidate_clean = game.name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+                     
+                     if candidate_clean.starts_with(&target_clean) {
+                         // Additional content check
+                         if self.is_probable_dlc(&game.name) || candidate_clean.contains("pack") || candidate_clean.contains("content") || candidate_clean.contains("season") {
+                            if !known_child_ids.contains(&game.app_id) {
+                                known_child_ids.push(game.app_id.clone());
+                            }
+                         }
+                     }
+                 }
+             }
+        }
 
         // Spawn scan
         if let Some(client) = self.api_client.clone() {
@@ -2609,10 +2734,17 @@ impl DarkCoreApp {
                     games.iter().map(|g| g.app_id.clone()).collect()
                 };
 
-                let associated: Vec<String> = found
+                let mut associated: Vec<String> = found
                     .into_iter()
                     .filter(|id| installed_ids.contains(id))
                     .collect();
+                
+                // Merge Local Knowledge
+                for kid in known_child_ids {
+                    if !associated.contains(&kid) && installed_ids.contains(&kid) {
+                         associated.push(kid);
+                    }
+                }
 
                 *result_arc.lock().unwrap() = Some(associated);
             });
@@ -2621,10 +2753,12 @@ impl DarkCoreApp {
         }
     }
 
-    fn remove_games_by_id(&self, ids: Vec<String>) {
+    fn remove_games_by_id(&self, ids: Vec<String>, full_wipe: bool) {
         let gl_path = self.config.gl_path.clone();
+        let steam_path = self.config.steam_path.clone();
         let al_path = Path::new(&gl_path).join("AppList");
 
+        // 1. Remove from AppList (Always logic)
         if let Ok(paths) = glob::glob(&al_path.join("*.txt").to_string_lossy()) {
             for path in paths.flatten() {
                 if let Ok(content) = std::fs::read_to_string(&path) {
@@ -2634,7 +2768,72 @@ impl DarkCoreApp {
                 }
             }
         }
-        self.log(format!("Deleted {} items.", ids.len()));
+        
+        // 2. Full Wipe: Manifests AND Content (Surgical - Check All Libraries)
+        if full_wipe {
+            let libraries = crate::game_path::GamePathFinder::get_library_folders(&steam_path);
+            for id in &ids {
+                 // Define potential locations (Main + External Libs)
+                 let mut locations = libraries.clone();
+                 locations.push(std::path::Path::new(&steam_path).to_path_buf());
+                 
+                 for lib in &locations {
+                     let acf = lib.join("steamapps").join(format!("appmanifest_{}.acf", id));
+                     if acf.exists() {
+                         // A. READ MANIFEST TO FIND INSTALL DIR
+                         if let Ok(content) = std::fs::read_to_string(&acf) {
+                             // Simple parsing for "installdir"
+                             let mut install_dir = String::new();
+                             for line in content.lines() {
+                                 if line.to_lowercase().contains("installdir") {
+                                     let parts: Vec<&str> = line.split('"').collect();
+                                     if parts.len() >= 4 {
+                                         install_dir = parts[3].to_string();
+                                     }
+                                 }
+                             }
+                             
+                             // B. DELETE CONTENT FOLDER
+                             if !install_dir.is_empty() {
+                                 let content_path = lib.join("steamapps").join("common").join(&install_dir);
+                                 if content_path.exists() {
+                                     self.log(format!("Deleting Game Files: {:?}", content_path));
+                                     let _ = std::fs::remove_dir_all(&content_path);
+                                 }
+                             }
+                         }
+                         
+                         // C. DELETE MANIFEST
+                         let _ = std::fs::remove_file(acf); 
+                     }
+                 }
+            }
+        }
+
+        // 3. Remove from config.vdf (Surgical)
+        if let Err(e) = crate::vdf_injector::remove_vdf_keys(&steam_path, &ids) {
+            self.log(format!("VDF Cleanup Warning: {}", e));
+        }
+        
+        // 4. Update Relationships
+        if let Ok(mut map) = self.relationships.lock() {
+            let initial_len = map.len();
+            map.retain(|k, _| !ids.contains(k));
+            if map.len() != initial_len {
+                crate::app_list::save_relationships(".", &map);
+            }
+        }
+
+        // 5. Automatic Reorder (Fix gaps in 0.txt, 1.txt...)
+        self.log("Reordering AppList...".to_string());
+        let cache_guard = self.game_cache.lock().ok();
+        let cache_ref = cache_guard.as_deref();
+        
+        if let Err(e) = crate::app_list::nuke_reorder(&gl_path, &steam_path, None, cache_ref) {
+            self.log(format!("Reorder Warning: {}", e));
+        }
+
+        self.log(format!("Deleted {} items. Full Wipe: {}", ids.len(), full_wipe));
     }
 
     fn is_probable_dlc(&self, name: &str) -> bool {

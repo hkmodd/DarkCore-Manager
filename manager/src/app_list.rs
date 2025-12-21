@@ -8,12 +8,36 @@ pub struct GameProfile {
     pub app_id: String,
     pub name: String,
     pub filename: String,
+    #[allow(dead_code)]
+    pub parent_id: Option<String>,
+}
+
+pub type RelationshipMap = std::collections::HashMap<String, String>; // Child -> Parent
+
+pub fn load_relationships(data_dir: &str) -> RelationshipMap {
+    let path = Path::new(data_dir).join("relationships.json");
+    if path.exists() {
+        if let Ok(content) = fs::read_to_string(path) {
+            if let Ok(map) = serde_json::from_str(&content) {
+                return map;
+            }
+        }
+    }
+    RelationshipMap::new()
+}
+
+pub fn save_relationships(data_dir: &str, map: &RelationshipMap) {
+    let path = Path::new(data_dir).join("relationships.json");
+    if let Ok(content) = serde_json::to_string_pretty(map) {
+        let _ = fs::write(path, content);
+    }
 }
 
 pub fn refresh_active_games_list(
     gl_path: &str,
     steam_path: &str,
     cache: &std::collections::HashMap<String, String>,
+    relationships: &RelationshipMap,
 ) -> Vec<GameProfile> {
     let mut profiles = Vec::new();
     let al_path = Path::new(gl_path).join("AppList");
@@ -74,6 +98,7 @@ pub fn refresh_active_games_list(
                     .to_string();
 
                 profiles.push(GameProfile {
+                    parent_id: relationships.get(&app_id).cloned(),
                     app_id,
                     name,
                     filename,

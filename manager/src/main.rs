@@ -10,6 +10,7 @@ mod game_path;
 mod injector;
 mod ui;
 mod vdf_injector;
+mod vault;
 
 use ui::DarkCoreApp;
 

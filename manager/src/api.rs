@@ -170,6 +170,7 @@ impl ApiClient {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[allow(dead_code)]
 pub struct GameStatus {
     pub app_id: String,
     pub status: String,

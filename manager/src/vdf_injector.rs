@@ -97,3 +97,43 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
 
     (ids, keys)
 }
+
+pub fn remove_vdf_keys(
+    steam_path: &str,
+    target_ids: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg_path = Path::new(steam_path).join("config").join("config.vdf");
+    if !cfg_path.exists() {
+        return Ok(());
+    }
+
+    // Backup
+    let _ = fs::copy(&cfg_path, cfg_path.with_extension("vdf.bak"));
+
+    let content_bytes = fs::read(&cfg_path)?;
+    let content = String::from_utf8_lossy(&content_bytes).to_string();
+
+    let mut root = match GamePathFinder::parse_vdf(&content) {
+        Some(r) => r,
+        None => return Err("Failed to parse config.vdf".into()),
+    };
+
+    let base = if root.has_key("InstallConfigStore") {
+        root.get_mut("InstallConfigStore").unwrap()
+    } else {
+        return Ok(()); // Should fail silently or err? Silent is safer.
+    };
+
+    if let Some(steam_node) = base.ensure_path(&["Software", "Valve", "Steam"]) {
+        if let Some(depots) = steam_node.ensure_path(&["depots"]) {
+            if let VdfValue::Obj(fields) = depots {
+                fields.retain(|(k, _)| !target_ids.contains(k));
+            }
+        }
+    }
+
+    let new_content = GamePathFinder::serialize_vdf(&root);
+    fs::write(cfg_path, new_content)?;
+
+    Ok(())
+}
