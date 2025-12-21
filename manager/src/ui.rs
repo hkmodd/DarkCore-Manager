@@ -77,6 +77,7 @@ pub struct DarkCoreApp {
 
     // Feedback State
     config_saved_at: Option<Instant>,
+    api_refresh_timer: Option<Instant>, // Automation
 
     // UI State
     delete_modal_open: bool,
@@ -93,6 +94,10 @@ pub struct DarkCoreApp {
     selected_library_index: usize,
     install_dir_input: String, // NEW: Manual override for Folder Name
 
+    // New Profile Modal
+    create_profile_modal_open: bool,
+    create_profile_save_default: bool, // Checkbox state
+
     // Identity & Animation
     logo_texture: Option<egui::TextureHandle>,
     logo_data: Option<egui::ColorImage>,
@@ -108,8 +113,9 @@ pub struct DarkCoreApp {
     steamless_app_id: String,
     steamless_auto_titan: bool,
 
-    // Stats
     user_stats: Arc<Mutex<Option<crate::api::UserStats>>>,
+    api_last_error: Arc<Mutex<Option<String>>>,
+    is_validating_api: Arc<Mutex<bool>>, // New
 }
 
 impl Default for DarkCoreApp {
@@ -152,6 +158,9 @@ impl Default for DarkCoreApp {
             selected_library_index: 0,
             install_dir_input: String::new(),
             
+            create_profile_modal_open: false,
+            create_profile_save_default: true,
+            
             logo_texture: None,
             logo_data: None,
             tab_changed_at: Instant::now(),
@@ -164,8 +173,11 @@ impl Default for DarkCoreApp {
             steamless_auto_titan: false,
 
             user_stats: Arc::new(Mutex::new(None)),
+            api_last_error: Arc::new(Mutex::new(None)),
+            is_validating_api: Arc::new(Mutex::new(false)),
             matrix_trails: Vec::new(),
             config_saved_at: None,
+            api_refresh_timer: None,
         }
     }
 }
@@ -188,6 +200,9 @@ impl DarkCoreApp {
             logs.push("System Ready. Darkcore Rust Initialized.".to_string());
         }
 
+        let initial_profile = config.last_active_profile.clone();
+        let initial_api_key = config.api_key.clone();
+
         let mut app = Self {
             config,
             active_tab: 0,
@@ -208,7 +223,7 @@ impl DarkCoreApp {
             api_client,
             profile_manager: ProfileManager::new("."),
             profile_name_input: String::new(),
-            active_profile_name: "Default".to_string(),
+            active_profile_name: initial_profile,
             delete_modal_open: false,
             delete_candidate_id: None,
             delete_candidate_name: None,
@@ -222,6 +237,9 @@ impl DarkCoreApp {
             detected_libraries: Vec::new(),
             selected_library_index: 0,
             install_dir_input: String::new(), // Init
+            
+            create_profile_modal_open: false,
+            create_profile_save_default: true,
             
             logo_texture: None,
             logo_data: {
@@ -252,10 +270,13 @@ impl DarkCoreApp {
             status_update_queue: Arc::new(Mutex::new(None)),
             
             user_stats: Arc::new(Mutex::new(None)),
+            api_last_error: Arc::new(Mutex::new(None)),
+            is_validating_api: Arc::new(Mutex::new(false)),
             matrix_trails: Vec::new(),
             api_key_glitch_cache: String::new(),
             api_key_glitch_update: Instant::now(),
             config_saved_at: None,
+            api_refresh_timer: if !initial_api_key.is_empty() { Some(Instant::now() + std::time::Duration::from_millis(500)) } else { None }, // Auto-Start
         };
 
 
@@ -1273,7 +1294,7 @@ impl eframe::App for DarkCoreApp {
                 
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("MANAGER v1.2")
+                        egui::RichText::new("MANAGER v1.3")
                             .size(10.0)
                             .color(accent_pink)
                             .extra_letter_spacing(2.0),
@@ -1302,7 +1323,7 @@ impl eframe::App for DarkCoreApp {
                    let response = ui.add(btn);
                    
                    // HOVER / CLICK NAVIGATION
-                   if response.clicked() || response.hovered() {
+                if response.clicked() || response.hovered() {
                        if self.active_tab != tab_idx {
                             self.active_tab = tab_idx;
                             self.tab_changed_at = Instant::now(); // Trigger Fade
@@ -1321,7 +1342,7 @@ impl eframe::App for DarkCoreApp {
 
                 nav_btn("INSTALL", "🚀", 0);
                 nav_btn("LIBRARY", "📂", 2);
-                nav_btn("PROFILES", "💾", 3);
+                // nav_btn("PROFILES", "💾", 3); // Removed
                 nav_btn("DRM INTEL", "🔍", 1);
                 nav_btn("SETTINGS", "⚙", 4);
                 nav_btn("ABOUT", "💻", 5);
@@ -1476,7 +1497,7 @@ impl eframe::App for DarkCoreApp {
                     0 => self.ui_installation(ui),
                     1 => self.ui_drm(ui),
                     2 => self.ui_library(ui),
-                    3 => self.ui_profiles(ui),
+                    // 3 was Profiles
                     4 => self.ui_settings(ui),
                     5 => self.ui_info(ui),
                     _ => self.ui_installation(ui),
@@ -2046,6 +2067,200 @@ impl DarkCoreApp {
     }
 
     fn ui_library(&mut self, ui: &mut egui::Ui) {
+        // PROFILE MANAGER HEADER
+        ui.vertical(|ui| {
+            ui.add_space(5.0);
+            ui.horizontal(|ui| {
+                 ui.label(egui::RichText::new("PROFILE MANAGER & LIBRARY").size(16.0).strong().color(egui::Color32::from_rgb(0, 200, 255)));
+                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                      if ui.button(egui::RichText::new("➕ CREATE NEW PROFILE").strong().color(egui::Color32::GREEN)).clicked() {
+                          self.profile_name_input.clear(); // Reset input
+                          self.create_profile_modal_open = true;
+                      }
+                 });
+            });
+            
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_black_alpha(100))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(40)))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                         // PROFILE SELECTOR
+                         ui.label("Profile:");
+                         let profiles = self.profile_manager.list_profiles();
+                         let current_sel = self.active_profile_name.clone();
+                         
+                         // 1. WIDER COMBO & AUTO-LOAD
+                         egui::ComboBox::from_id_salt("profile_combo")
+                             .selected_text(if current_sel.is_empty() { "Select Profile..." } else { &current_sel })
+                             .width(250.0) // Aesthetic Width
+                             .show_ui(ui, |ui| {
+                                 for name in &profiles {
+                                     // AUTO-LOAD LOGIC
+                                     if ui.selectable_value(&mut self.active_profile_name, name.clone(), name).clicked() {
+                                         // User clicked a new profile -> Auto Load
+                                         match self.profile_manager.load_profile(&name) {
+                                             Ok(p) => {
+                                                 if p.app_ids.len() > 133 {
+                                                     self.status_msg = format!("⚠ LIMIT EXCEEDED ({} > 133). Steam may crash.", p.app_ids.len());
+                                                 }
+                                                 use crate::app_list::overwrite_app_list;
+                                                 if let Err(e) = overwrite_app_list(&self.config.gl_path, p.app_ids) {
+                                                     self.log(format!("Error applying profile: {}", e));
+                                                 } else {
+                                                     self.config.last_active_profile = p.name.clone();
+                                                     if let Err(e) = save_config(&self.config) {
+                                                         self.log(format!("Config Save Error: {}", e));
+                                                     }
+                                                     self.refresh_library(); // Auto Refresh
+                                                     self.log(format!("Profile '{}' loaded automatically.", p.name));
+                                                 }
+                                             },
+                                             Err(e) => self.log(format!("Load Error: {}", e)),
+                                         }
+                                     }
+                                 }
+                             });
+
+                         ui.add_space(10.0);
+                         
+                         // SAVE (UPDATE) BUTTON
+                         if ui.button(egui::RichText::new("💾 SAVE").strong().color(egui::Color32::GREEN)).on_hover_text("Save current library to SELECTED profile").clicked() {
+                             if !self.active_profile_name.is_empty() {
+                                 let games = self.active_games.lock().unwrap();
+                                 let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
+                                 drop(games);
+                                 
+                                 // 133 CHECK
+                                 if ids.len() > 133 {
+                                     self.log(format!("⚠ Warning: Saving {} apps (Limit 133).", ids.len()));
+                                 }
+                                 
+                                 let p = Profile { name: self.active_profile_name.clone(), app_ids: ids };
+                                 if let Err(e) = self.profile_manager.save_profile(&p) {
+                                     self.log(format!("Save Error: {}", e));
+                                 } else {
+                                     self.log(format!("Profile '{}' updated!", p.name));
+                                 }
+                             } else {
+                                 self.log("Please select a profile to save to first.".to_string());
+                             }
+                         }
+
+                         // DELETE BUTTON
+                         if ui.button(egui::RichText::new("🗑").color(egui::Color32::RED)).on_hover_text("Delete selected profile").clicked() {
+                             if !self.active_profile_name.is_empty() {
+                                 if let Err(e) = self.profile_manager.delete_profile(&self.active_profile_name) {
+                                     self.log(format!("Delete Error: {}", e));
+                                 } else {
+                                     self.log(format!("Profile '{}' deleted.", self.active_profile_name));
+                                     self.active_profile_name.clear();
+                                     // Don't clear list automatically on delete, just the selection
+                                 }
+                             }
+                         }
+                    });
+                });
+        });
+        
+        // NEW PROFILE MODAL
+        // NEW PROFILE MODAL (ANIMATED)
+        // 1. Calculate Ease-Out-Back (Bounce)
+        let ctx = ui.ctx();
+        let anim_t = ctx.animate_bool(egui::Id::new("create_profile_anim"), self.create_profile_modal_open);
+        
+        if anim_t > 0.0 {
+            // cubic-bezier approximation for backOut(1.7)
+            // t = anim_t
+            // c1 = 1.70158
+            // c3 = c1 + 1
+            // 1 + c3 * (t-1)^3 + c1 * (t-1)^2
+            let c1 = 1.70158;
+            let c3 = c1 + 1.0;
+            let t = anim_t - 1.0;
+            let ease_out_back = 1.0 + c3 * t.powi(3) + c1 * t.powi(2);
+            
+            // Drop In: Start -300px (Top), End 0px (Center)
+            let y_offset = (1.0 - ease_out_back) * -300.0;
+            
+             egui::Window::new(egui::RichText::new("➕ CREATE NEW PROFILE").strong().color(egui::Color32::GREEN))
+                 .collapsible(false)
+                 .resizable(false)
+                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, y_offset))
+                 .show(ctx, |ui| {
+                      ui.label("Enter name for new profile:");
+                      ui.text_edit_singleline(&mut self.profile_name_input).request_focus();
+                      
+                      ui.add_space(10.0);
+                      ui.label(egui::RichText::new("⚠ This will WIPE the current AppList.").color(egui::Color32::YELLOW));
+                      
+                      // SAFETY CHECKBOX
+                      if !self.active_profile_name.is_empty() {
+                          ui.add_space(5.0);
+                          ui.checkbox(&mut self.create_profile_save_default, 
+                              format!("Save changes to '{}' before wiping?", self.active_profile_name)
+                          );
+                      }
+                      
+                      ui.add_space(15.0);
+                      ui.horizontal(|ui| {
+                          if ui.button("CANCEL").clicked() {
+                              self.create_profile_modal_open = false;
+                          }
+                          
+                          if ui.button(egui::RichText::new("✅ CREATE & WIPE").strong().color(egui::Color32::RED)).clicked() {
+                              if !self.profile_name_input.is_empty() {
+                                  // 1. AUTO-SAVE CURRENT (Safety) - CONDITIONAL
+                                  if !self.active_profile_name.is_empty() && self.create_profile_save_default {
+                                      let games = self.active_games.lock().unwrap();
+                                      let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
+                                      let p = Profile { name: self.active_profile_name.clone(), app_ids: ids };
+                                      let _ = self.profile_manager.save_profile(&p); 
+                                      self.log(format!("Safety Save: Updated '{}'.", p.name));
+                                  } else {
+                                      self.log("Safety Save skipped by user.".to_string());
+                                  }
+                                  
+                                  // 2. CREATE NEW EMPTY PROFILE
+                                  let new_p = Profile { name: self.profile_name_input.clone(), app_ids: Vec::new() };
+                                  if let Err(e) = self.profile_manager.save_profile(&new_p) {
+                                      self.log(format!("Error creating profile: {}", e));
+                                  } else {
+                                      // 3. WIPE APPLIST
+                                      let res = {
+                                           use crate::app_list::overwrite_app_list;
+                                           overwrite_app_list(&self.config.gl_path, Vec::new())
+                                      };
+                                      
+                                      if let Err(e) = res {
+                                          self.log(format!("Error wiping AppList: {}", e));
+                                      } else {
+                                          // 4. SWITCH & REFRESH
+                                          self.active_profile_name = self.profile_name_input.clone();
+                                          
+                                          // PERSIST CONFIG
+                                          self.config.last_active_profile = self.active_profile_name.clone();
+                                          if let Err(e) = save_config(&self.config) {
+                                              self.log(format!("Config Save Error: {}", e));
+                                          }
+
+                                          self.refresh_library();
+                                          self.log(format!("Switched to new profile '{}'. List cleared.", self.active_profile_name));
+                                          self.create_profile_modal_open = false;
+                                      }
+                                  }
+                              }
+                          }
+                      });
+                 });
+        }
+        
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        // Standard Library Controls (Refresh, Nuke, Resolve)
         ui.horizontal(|ui| {
             if ui
                 .button(egui::RichText::new("🔄 Refresh").strong())
@@ -2084,7 +2299,7 @@ impl DarkCoreApp {
                 self.resolve_unknown_games();
             }
         });
-        ui.add_space(10.0);
+        ui.add_space(5.0);
 
         // Headers
         ui.horizontal(|ui| {
@@ -2419,6 +2634,9 @@ impl DarkCoreApp {
                  
                  if response.changed() {
                       self.api_key_glitch_update = Instant::now() - Duration::from_millis(100);
+                      // AUTO-REFRESH TIMER
+                      // Provide 1.5s debounce for typing entire key
+                      self.api_refresh_timer = Some(Instant::now() + Duration::from_millis(1500));
                  }
                  
                  ui.label(egui::RichText::new("❓").size(12.0))
@@ -2428,64 +2646,105 @@ impl DarkCoreApp {
 
         ui.add_space(10.0);
 
-        // API STATS DASHBOARD
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("📊 API USAGE:").strong().color(egui::Color32::from_rgb(0, 255, 255)));
-            if ui.button("🔄 Refresh Stats").clicked() {
-                 let client_opt = self.api_client.clone();
-                 let stats_arc = self.user_stats.clone();
-                 let status_queue = self.status_update_queue.clone();
-                 let ctx = ui.ctx().clone();
-                 
-                 // Async fetch
-                 std::thread::spawn(move || {
-                     if let Some(client) = client_opt {
+        // API STATS DASHBOARD & AUTOMATION CHECK
+        // Check Timer
+        if let Some(timer) = self.api_refresh_timer {
+            if Instant::now() > timer {
+                self.api_refresh_timer = None; // Reset
+                if !self.config.api_key.is_empty() {
+                     // TRIGGER SEARCH
+                     let stats_arc = self.user_stats.clone();
+                     let status_queue = self.status_update_queue.clone();
+                     let error_arc = self.api_last_error.clone();
+                     let validating_arc = self.is_validating_api.clone(); // Capture
+                     let cfg_key = self.config.api_key.clone(); 
+                     
+                     // Set VALIDATING flag immediately
+                     if let Ok(mut v) = self.is_validating_api.lock() { *v = true; }
+
+                     std::thread::spawn(move || {
+                         let client = ApiClient::new(cfg_key.clone()); 
+                         
                          let rt = tokio::runtime::Runtime::new().unwrap();
-                         match rt.block_on(client.get_user_stats()) {
+                         let result = rt.block_on(client.get_user_stats());
+                         
+                         // Clear Validating Flag
+                         if let Ok(mut v) = validating_arc.lock() { *v = false; }
+                         
+                         match result {
                              Ok(stats) => {
+                                 *error_arc.lock().unwrap() = None; // Clear error
                                  *stats_arc.lock().unwrap() = Some(stats);
-                                 if let Ok(mut msg) = status_queue.lock() {
-                                     *msg = Some("Stats Updated Successfully.".to_string());
+                                 if let Ok(mut q) = status_queue.lock() {
+                                     *q = Some("API Connection Established.".to_string());
                                  }
                              },
                              Err(e) => {
+                                 // Parse Error
                                  let err_str = e.to_string();
-                                 if err_str.contains("429") {
-                                     // Parse Limit/Usage from: "API Error 429: ... (25 manifests ...). Current usage: 25"
-                                     let limit = if err_str.contains("(25") { 25 } else { 25 }; 
-                                     let usage = limit; // Assume max if 429
-                                     
-                                     *stats_arc.lock().unwrap() = Some(crate::api::UserStats {
-                                         api_key_usage_count: usage,
-                                         daily_usage: usage,
-                                         daily_limit: limit,
-                                         can_make_requests: false,
-                                         role: Some("Rate Limited".to_string()),
-                                     });
-                                     
-                                     if let Ok(mut msg) = status_queue.lock() {
-                                         *msg = Some("Daily Limit Reached (429). Dashboard Updated.".to_string());
-                                     }
-                                 } else {
-                                     if let Ok(mut msg) = status_queue.lock() {
-                                         *msg = Some(format!("Stats Error: {}", e));
+                                 *error_arc.lock().unwrap() = Some(err_str.clone());
+                                 
+                                 if let Ok(mut q) = status_queue.lock() {
+                                     if err_str.contains("401") || err_str.contains("403") {
+                                         *q = Some("⛔ API KEY INVALID OR EXPIRED.".to_string());
+                                     } else {
+                                         *q = Some(format!("API Error: {}", err_str));
                                      }
                                  }
                              }
                          }
-                         ctx.request_repaint();
-                     } else {
-                         if let Ok(mut msg) = status_queue.lock() {
-                             *msg = Some("API Client not initialized.".to_string());
-                         }
-                         ctx.request_repaint();
-                     }
-                 });
+                     });
+                     self.log("Auto-Refreshing API Stats...".to_string());
+                }
+            } else {
+                 ui.ctx().request_repaint(); // Keep animating for timer
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("📊 API USAGE:").strong().color(egui::Color32::from_rgb(0, 255, 255)));
+            
+            // Check Validation Flag
+            let mut is_validating = false;
+            if let Ok(v) = self.is_validating_api.lock() { is_validating = *v; }
+            
+            if is_validating || self.api_refresh_timer.is_some() {
+                ui.spinner();
+                ui.label(egui::RichText::new("Verifying Key...").italics().color(egui::Color32::YELLOW));
             }
         });
 
+
         // NEON STATS FRAME
-        if let Ok(guard) = self.user_stats.lock() {
+        // NEON STATS / ERROR FRAME
+        let mut api_error_msg = None;
+        if let Ok(guard) = self.api_last_error.lock() {
+            api_error_msg = guard.clone();
+        }
+
+        if let Some(err_msg) = api_error_msg {
+             // RENDER ERROR FRAME
+             let theme_color = egui::Color32::from_rgb(255, 30, 30);
+             egui::Frame::none()
+                 .fill(egui::Color32::from_black_alpha(200))
+                 .stroke(egui::Stroke::new(1.5, theme_color))
+                 .rounding(6.0)
+                 .inner_margin(12.0)
+                 .show(ui, |ui| {
+                      ui.set_min_width(320.0);
+                      ui.horizontal(|ui| {
+                          ui.label("⛔");
+                          ui.label(egui::RichText::new("API STATUS CRITICAL").strong().color(theme_color));
+                      });
+                      ui.separator();
+                      ui.add_space(5.0);
+                      ui.label(egui::RichText::new(err_msg)
+                          .font(egui::FontId::monospace(12.0))
+                          .color(egui::Color32::WHITE)
+                          .strong());
+                 });
+        }
+        else if let Ok(guard) = self.user_stats.lock() {
             if let Some(stats) = guard.as_ref() {
                 let limit_ratio = if stats.daily_limit > 0 {
                     stats.daily_usage as f32 / stats.daily_limit as f32
@@ -2523,7 +2782,7 @@ impl DarkCoreApp {
                      // Usage Numbers
                      ui.horizontal(|ui| {
                          ui.label(egui::RichText::new(format!("{:02}", stats.daily_usage))
-                             .font(egui::FontId { size: 24.0, family: egui::FontFamily::Proportional }) // Bigger
+                             .font(egui::FontId { size: 24.0, family: egui::FontFamily::Proportional }) 
                              .color(egui::Color32::WHITE));
                          
                          ui.label(egui::RichText::new("/")
@@ -2556,7 +2815,6 @@ impl DarkCoreApp {
                          } else {
                              // Glitch Pattern for Critical
                              ui.painter().rect_filled(fill_rect, 3.0, theme_color); 
-                             // Add stripes? keeping it simple but bold
                          }
                      }
                      
@@ -2661,101 +2919,7 @@ impl DarkCoreApp {
         );
     }
 
-    fn ui_profiles(&mut self, ui: &mut egui::Ui) {
-        ui.heading("PROFILES MANAGER");
-        ui.separator();
-
-        ui.add_space(10.0);
-
-        // 1. CREATE NEW
-        ui.group(|ui| {
-            ui.label(
-                egui::RichText::new("SAVE CURRENT LIBRARY AS PROFILE")
-                    .strong()
-                    .color(egui::Color32::from_rgb(0, 255, 100)),
-            );
-            ui.horizontal(|ui| {
-                ui.label("Profile Name:");
-                ui.text_edit_singleline(&mut self.profile_name_input);
-                if ui.button("SAVE").clicked() {
-                    if !self.profile_name_input.is_empty() {
-                        // Gather IDs
-                        let games = self.active_games.lock().unwrap();
-                        let ids: Vec<String> = games.iter().map(|g| g.app_id.clone()).collect();
-                        drop(games);
-
-                        let p = Profile {
-                            name: self.profile_name_input.clone(),
-                            app_ids: ids,
-                        };
-
-                        if let Err(e) = self.profile_manager.save_profile(&p) {
-                            self.log(format!("Error saving profile: {}", e));
-                        } else {
-                            self.log(format!("Profile '{}' saved successfully.", p.name));
-                            self.profile_name_input.clear();
-                        }
-                    }
-                }
-            });
-        });
-
-        ui.add_space(20.0);
-
-        // 2. LIST
-        ui.label(egui::RichText::new("YOUR PROFILES").strong().size(18.0));
-        let profiles = self.profile_manager.list_profiles();
-
-        if profiles.is_empty() {
-            ui.label("No profiles found.");
-        }
-
-        for name in profiles {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(&name).size(16.0).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(egui::RichText::new("🗑 DELETE").color(egui::Color32::RED))
-                            .clicked()
-                        {
-                            if let Err(e) = self.profile_manager.delete_profile(&name) {
-                                self.log(format!("Error deleting profile: {}", e));
-                            } else {
-                                self.log(format!("Profile '{}' deleted.", name));
-                            }
-                        }
-
-                        if ui
-                            .button(egui::RichText::new("⚡ LOAD").color(egui::Color32::YELLOW))
-                            .clicked()
-                        {
-                            // LOAD LOGIC
-                            match self.profile_manager.load_profile(&name) {
-                                Ok(p) => {
-                                    use crate::app_list::overwrite_app_list;
-                                    if let Err(e) =
-                                        overwrite_app_list(&self.config.gl_path, p.app_ids)
-                                    {
-                                        self.log(format!("Error applying profile: {}", e));
-                                    } else {
-                                        self.log(format!(
-                                            "Profile '{}' loaded! Library updated.",
-                                            name
-                                        ));
-                                        self.refresh_library();
-                                        self.active_profile_name = name.clone();
-                                    }
-                                }
-                                Err(e) => self.log(format!("Error loading profile: {}", e)),
-                            }
-                        }
-                    });
-                });
-            });
-        }
-        
-    }
+    // ui_profiles Removed - Integrated into ui_library
     
     // Renders the Drive/Library Selection Modal
     fn show_install_modal(&mut self, ctx: &egui::Context) {

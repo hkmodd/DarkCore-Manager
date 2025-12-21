@@ -9,6 +9,13 @@ pub struct AppConfig {
     pub steam_path: String,
     pub gl_path: String,
     pub steamless_path: String,
+
+    #[serde(default = "default_profile")]
+    pub last_active_profile: String,
+}
+
+fn default_profile() -> String {
+    "Default".to_string()
 }
 
 impl Default for AppConfig {
@@ -18,6 +25,7 @@ impl Default for AppConfig {
             steam_path: find_default_steam().unwrap_or_default(),
             gl_path: String::new(),
             steamless_path: String::new(),
+            last_active_profile: "Default".to_string(),
         }
     }
 }

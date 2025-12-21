@@ -31,7 +31,7 @@ pub fn val_to_string(v: &Option<Value>) -> String {
 #[derive(Clone)]
 pub struct ApiClient {
     client: reqwest::Client,
-    api_key: String,
+    pub api_key: String,
 }
 
 impl ApiClient {
