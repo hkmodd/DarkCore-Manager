@@ -12,10 +12,17 @@ pub struct AppConfig {
 
     #[serde(default = "default_profile")]
     pub last_active_profile: String,
+
+    #[serde(default = "default_vec")]
+    pub family_godmode_ids: Vec<String>,
 }
 
 fn default_profile() -> String {
     "Default".to_string()
+}
+
+fn default_vec() -> Vec<String> {
+    Vec::new()
 }
 
 impl Default for AppConfig {
@@ -26,6 +33,7 @@ impl Default for AppConfig {
             gl_path: String::new(),
             steamless_path: String::new(),
             last_active_profile: "Default".to_string(),
+            family_godmode_ids: Vec::new(),
         }
     }
 }

@@ -301,3 +301,40 @@ pub fn nuke_unknowns(
 
     Ok(nuked_count)
 }
+
+pub fn remove_games_from_list(
+    gl_path: &str,
+    ids_to_remove: Vec<String>,
+) -> Result<(), std::io::Error> {
+    let al_path = Path::new(gl_path).join("AppList");
+    if !al_path.exists() {
+        return Ok(());
+    }
+
+    let remove_set: HashSet<_> = ids_to_remove.into_iter().collect();
+    let mut current_ids = HashSet::new();
+
+    // 1. Read & Consume Existing
+    let pattern = al_path.join("*.txt");
+    if let Ok(paths) = glob(&pattern.to_string_lossy()) {
+        for path in paths.flatten() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                let id = content.trim().to_string();
+                if !remove_set.contains(&id) {
+                    current_ids.insert(id);
+                }
+            }
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    // 2. Write Back Remaining
+    let mut final_list: Vec<_> = current_ids.into_iter().collect();
+    final_list.sort();
+
+    for (i, aid) in final_list.iter().enumerate() {
+        let text_path = al_path.join(format!("{}.txt", i));
+        fs::write(text_path, aid)?;
+    }
+    Ok(())
+}

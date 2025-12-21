@@ -74,7 +74,7 @@ impl VaultManager {
         let depot_cache = Path::new(steam_path).join("depotcache");
         if depot_cache.exists() {
             for depot_id in mounted_depots {
-                let pattern = format!("{}_{{*.manifest}}", depot_id); // e.g. 12345_*.manifest
+                let pattern = format!("{}*.manifest", depot_id); // e.g. 12345*.manifest
                 let glob_pat = depot_cache.join(&pattern);
 
                 if let Ok(paths) = glob::glob(&glob_pat.to_string_lossy()) {

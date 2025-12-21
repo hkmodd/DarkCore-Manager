@@ -97,6 +97,7 @@ pub struct DarkCoreApp {
     // New Profile Modal
     create_profile_modal_open: bool,
     create_profile_save_default: bool, // Checkbox state
+    delete_profile_modal_open: bool, // NEW: Delete Confirmation Modal
 
     // Identity & Animation
     logo_texture: Option<egui::TextureHandle>,
@@ -160,6 +161,9 @@ impl Default for DarkCoreApp {
             
             create_profile_modal_open: false,
             create_profile_save_default: true,
+            
+            // NEW:
+            delete_profile_modal_open: false,
             
             logo_texture: None,
             logo_data: None,
@@ -240,6 +244,9 @@ impl DarkCoreApp {
             
             create_profile_modal_open: false,
             create_profile_save_default: true,
+            
+            // NEW:
+            delete_profile_modal_open: false,
             
             logo_texture: None,
             logo_data: {
@@ -1749,15 +1756,37 @@ impl DarkCoreApp {
 
             ui.add_space(20.0);
             
-            // LAUNCH STEAM BUTTON
+            // MAJESTIC LAUNCH BUTTON
+            let time = ui.input(|i| i.time);
+            let pulse = (time * 3.0).sin().abs() as f32; // 0.0 to 1.0 rapid pulse
+            
+            // Animated Gold/Green Gradient logic (Approximated via pulsing fill)
+            let fill_col = egui::Color32::from_rgba_premultiplied(
+                0, 
+                ((pulse * 30.0) + 40.0) as u8, 
+                ((pulse * 10.0) + 20.0) as u8, 
+                255
+            );
+            let text_col = egui::Color32::from_rgb(
+                255, 
+                ((pulse * 55.0) + 200.0) as u8, 
+                ((pulse * 55.0) + 100.0) as u8
+            ); 
+            
             let btn_launch = egui::Button::new(
-                egui::RichText::new("🚀 LAUNCH STEAM (INJECTED)")
-                    .size(14.0)
-                    .color(egui::Color32::YELLOW)
+                egui::RichText::new("✨ LAUNCH GREENLUMA STEALTH")
+                    .size(15.0) // Slightly larger
+                    .color(text_col)
                     .strong()
-            ).fill(egui::Color32::from_rgb(50, 50, 60));
+            )
+            .fill(fill_col)
+            .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 100))) // Neon Green Border
+            .rounding(6.0);
+            
+            // Force animation
+            ui.ctx().request_repaint(); 
 
-            if ui.add(btn_launch).on_hover_text("Manually start Steam via GreenLuma Injector").clicked() {
+            if ui.add(btn_launch).on_hover_text("Initialize Stealth Injection Procedure (GreenLuma 2025)").clicked() {
                  let steam_path = self.config.steam_path.clone();
                  let gl_path = self.config.gl_path.clone();
                  let log_arc = self.system_log.clone();
@@ -1950,17 +1979,48 @@ impl DarkCoreApp {
                                            }
                                       }
                                       
-                                      // Right-Click Context Menu for Repair
+                                      // Right-Click Context Menu
                                       btn_resp.context_menu(|ui| {
-                                          if ui.button("🛠 Force Repair (Regenerate ACF)").clicked() {
-                                              ui.close_menu();
-                                              // FORCE MODAL: User explicitly wants to repair, so let them choose/confirm the drive.
-                                              // This is crucial if the game was falsely detected on C: (Ghost ACF) but is actually on D:.
-                                              self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
-                                              self.selected_library_index = 0;
-                                              self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                              self.install_dir_input = name.to_string(); // Pre-fill
-                                              self.install_modal_open = true;
+                                          let is_godmode_active = self.config.family_godmode_ids.contains(&display_id);
+
+                                          if is_godmode_active {
+                                              // GODMODE ACTIVE STATE
+                                              ui.label(egui::RichText::new("⚡ FAMILY GODMODE ACTIVE").color(egui::Color32::GREEN).size(10.0));
+                                              if ui.button(egui::RichText::new("💀 Disable Steam Family Godmode").color(egui::Color32::from_rgb(255, 100, 100))).clicked() {
+                                                  ui.close_menu();
+                                                  self.disable_family_godmode(display_id.clone());
+                                              }
+                                              // Hide "Force Repair" as requested
+                                          } else {
+                                              // STANDARD STATE
+                                              if is_installed {
+                                                  if ui.button("🛠 Force Repair (Regenerate ACF)").clicked() {
+                                                      ui.close_menu();
+                                                      // FORCE MODAL: User explicitly wants to repair
+                                                      self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                      self.selected_library_index = 0;
+                                                      self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                      self.install_dir_input = name.to_string(); // Pre-fill
+                                                      self.install_modal_open = true;
+                                                  }
+                                                  
+                                                  // Offer Godmode Enable for installed games too (e.g. converting a family share title)
+                                                  // Valid if API Key is present (if missing, Install button handles uninstalled, but installed ones need this)
+                                                  // Actually godmode works without API Key using fallback fetch, so we should allow it always?
+                                                  // User requirement: "launcher deve capire che il gioco selezionato è stato messo con Family Share mode"
+                                                  // Implies we can PUT it there.
+                                                  if ui.button(egui::RichText::new("👨‍👩‍👧 Enable Family Godmode (Unlock DLCs)").color(egui::Color32::from_rgb(100, 255, 255))).on_hover_text("Adds AppID + DLCs to GreenLuma.\nUseful for Family Shared games to unlock full content.").clicked() {
+                                                       ui.close_menu();
+                                                       self.install_game_family_godmode(display_id.clone());
+                                                  }
+                                              } else {
+                                                  // UNINSTALLED
+                                                  // Provide option explicitly
+                                                  if ui.button(egui::RichText::new("👨‍👩‍👧 Install (Family Shared Godmode)").color(egui::Color32::from_rgb(100, 255, 255))).on_hover_text("Adds AppID + DLCs only. Skips file download.").clicked() {
+                                                       ui.close_menu();
+                                                       self.install_game_family_godmode(display_id.clone());
+                                                  }
+                                              }
                                           }
                                       });
                                       
@@ -1974,12 +2034,18 @@ impl DarkCoreApp {
                                                    // Found it -> Resume/Update in place
                                                    self.install_game(display_id.clone(), name.to_string(), Some(path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&self.config.steam_path)).to_path_buf()), None);
                                                } else {
-                                                   // Not found -> New Install -> Ask User
-                                                  self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
-                                                  self.selected_library_index = 0;
-                                                  self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                                  self.install_dir_input = name.to_string(); // Pre-fill with name
-                                                  self.install_modal_open = true;
+                                                   // FALLBACK MODE CHECK
+                                                   if self.config.api_key.is_empty() {
+                                                       // NO API KEY -> Family Godmode is the ONLY way
+                                                       self.install_game_family_godmode(display_id.clone());
+                                                   } else {
+                                                       // STANDARD MODE -> Modal
+                                                       self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                       self.selected_library_index = 0;
+                                                       self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                       self.install_dir_input = name.to_string(); 
+                                                       self.install_modal_open = true;
+                                                   }
                                                }
                                             } else {
                                                // SMART LAUNCH SYSTEM
@@ -2070,16 +2136,171 @@ impl DarkCoreApp {
         egui::ScrollArea::vertical().id_salt("log_scroll").max_height(200.0).stick_to_bottom(true).show(ui, |ui| {
              if let Ok(log) = self.system_log.lock() {
                  for line in log.iter() {
-                     let color = if line.to_uppercase().contains("ERROR") { egui::Color32::from_rgb(255, 80, 80) } 
-                                 else if line.contains("SUCCESS") || line.contains("Done") || line.contains("Ready") { egui::Color32::from_rgb(80, 255, 80) } 
-                                 else if line.contains("WARN") { egui::Color32::from_rgb(255, 200, 0) } 
-                                 else { egui::Color32::from_rgb(180, 180, 190) };
-                     ui.label(egui::RichText::new(line).monospace().size(11.0).color(color));
+                     ui.label(egui::RichText::new(line).font(egui::FontId::monospace(10.0)).color(egui::Color32::LIGHT_GRAY));
                  }
              }
         });
         });
     }
+
+    // --- HELPER METHODS ---
+
+    fn install_game_family_godmode(&mut self, appid: String) {
+       // 1. Update Persistent State
+       if !self.config.family_godmode_ids.contains(&appid) {
+           self.config.family_godmode_ids.push(appid.clone());
+           let _ = crate::config::save_config(&self.config);
+       }
+
+       let gl_path = self.config.gl_path.clone();
+       let include_dlcs = self.include_dlcs;
+       // Clone client if it exists, otherwise we will rely on public API inside thread if possible or skip
+       let client_opt = self.api_client.clone(); 
+       let log_arc = self.system_log.clone();
+       let status_queue = self.status_update_queue.clone();
+
+       std::thread::spawn(move || {
+           let log = move |msg: String| {
+               if let Ok(mut logs) = log_arc.lock() { logs.push(msg); }
+           };
+           
+           log(format!("Family Godmode: Initializing for {}...", appid));
+
+           // Build ID List
+           let mut ids = vec![appid.clone()];
+
+           // FETCH DLCs (Even without API Key, using public store API)
+           // We use the method from api_client. If api_client is None (no key), we might need a fallback?
+           // Actually api_client is constructed with key, but methods like get_dlc_list use public endpoints mostly?
+           // Wait, get_dlc_list in api.rs uses self.client.get but doesn't strictly need API key for store.steampowered.com logic
+           // BUT api_client instance might not exist if key was empty? 
+           // In `new()`, api_client is Some(...) only if key is valid.
+           // However, for Fallback mode, we need to be able to call get_dlc_list.
+           // Ideally we should create a temporary client if None.
+           
+           // Simple workaround: Create a temporary one-off client in the thread if needed, or make get_dlc_list static?
+           // Easier: If client_opt is None, try to create a standard reqwest client.
+           
+           if include_dlcs {
+               let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+               log("Fetching DLCs...".to_string());
+               
+               let dlcs_result = if let Some(client) = client_opt {
+                    rt.block_on(client.get_dlc_list(&appid))
+               } else {
+                    // Fallback URL fetch
+                   rt.block_on(async {
+                       let client = reqwest::Client::new();
+                       let url = format!("https://store.steampowered.com/api/appdetails?appids={}&filters=dlc", appid);
+                       if let Ok(resp) = client.get(&url).send().await {
+                           if let Ok(root) = resp.json::<serde_json::Value>().await {
+                               let mut dlc_ids = Vec::new();
+                               if let Some(app_data) = root.get(&appid) {
+                                   if let Some(data) = app_data.get("data") {
+                                       if let Some(dlc_array) = data.get("dlc").and_then(|v| v.as_array()) {
+                                           for item in dlc_array {
+                                               if let Some(id) = item.as_u64() { dlc_ids.push(id.to_string()); }
+                                           }
+                                       }
+                                   }
+                               }
+                               return Ok(dlc_ids);
+                           }
+                       }
+                       Ok(vec![])
+                   })
+               };
+
+               match dlcs_result {
+                    Ok(dlcs) => {
+                        log(format!("Found {} DLCs to unlock.", dlcs.len()));
+                        ids.extend(dlcs);
+                    },
+                    Err(e) => log(format!("DLC Fetch Warning: {}", e)),
+               }
+           }
+
+           // Add to AppList
+           match crate::app_list::add_games_to_list(&gl_path, ids) {
+               Ok(_) => {
+                   log("✅ Family Shared Godmode Active.".to_string());
+                   if let Ok(mut q) = status_queue.lock() {
+                       *q = Some("REFRESH_LIB".to_string());
+                   }
+               },
+               Err(e) => log(format!("❌ Error writing AppList: {}", e)),
+           }
+       });
+    }
+
+    fn disable_family_godmode(&mut self, appid: String) {
+        // 1. Update Persistent State
+        if let Some(pos) = self.config.family_godmode_ids.iter().position(|x| *x == appid) {
+            self.config.family_godmode_ids.remove(pos);
+            let _ = crate::config::save_config(&self.config);
+        }
+
+        let gl_path = self.config.gl_path.clone();
+        let client_opt = self.api_client.clone();
+        let log_arc = self.system_log.clone();
+        let status_queue = self.status_update_queue.clone();
+
+        std::thread::spawn(move || {
+            let log = move |msg: String| {
+                if let Ok(mut logs) = log_arc.lock() { logs.push(msg); }
+            };
+            
+            log(format!("Disabling Family Godmode for {}...", appid));
+            
+            // To clean up, we need to know what to remove (AppID + DLCs).
+            // So we must fetch DLCs again to ensure we remove them.
+            let mut ids_to_remove = vec![appid.clone()];
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+            // Generic Fetch Logic (Duplicated slightly but safe)
+            let dlcs_result = if let Some(client) = client_opt {
+                 rt.block_on(client.get_dlc_list(&appid))
+            } else {
+                rt.block_on(async {
+                    let client = reqwest::Client::new();
+                    let url = format!("https://store.steampowered.com/api/appdetails?appids={}&filters=dlc", appid);
+                     if let Ok(resp) = client.get(&url).send().await {
+                           if let Ok(root) = resp.json::<serde_json::Value>().await {
+                               let mut dlc_ids = Vec::new();
+                               if let Some(app_data) = root.get(&appid) {
+                                   if let Some(data) = app_data.get("data") {
+                                       if let Some(dlc_array) = data.get("dlc").and_then(|v| v.as_array()) {
+                                           for item in dlc_array {
+                                               if let Some(id) = item.as_u64() { dlc_ids.push(id.to_string()); }
+                                           }
+                                       }
+                                   }
+                               }
+                               return Ok(dlc_ids);
+                           }
+                       }
+                       Ok(vec![])
+                })
+            };
+
+            if let Ok(dlcs) = dlcs_result {
+                ids_to_remove.extend(dlcs);
+            }
+
+            // Call Removal
+            match crate::app_list::remove_games_from_list(&gl_path, ids_to_remove) {
+                Ok(_) => {
+                    log("🚫 Family Godmode Disabled.".to_string());
+                    if let Ok(mut q) = status_queue.lock() {
+                       *q = Some("REFRESH_LIB".to_string());
+                   }
+                },
+                Err(e) => log(format!("❌ Error stripping AppList: {}", e)),
+            }
+        });
+    }
+
+
 
     fn ui_drm(&mut self, ui: &mut egui::Ui) {
         ui.heading("STEAMLESS DRM REMOVAL");
@@ -2216,16 +2437,16 @@ impl DarkCoreApp {
                              }
                          }
 
-                         // DELETE BUTTON
-                         if ui.button(egui::RichText::new("🗑").color(egui::Color32::RED)).on_hover_text("Delete selected profile").clicked() {
+                         // DELETE BUTTON (Protected)
+                         let is_default = self.active_profile_name == "Default";
+                         let btn = egui::Button::new(egui::RichText::new("🗑").color(if is_default { egui::Color32::GRAY } else { egui::Color32::RED }));
+                         
+                         if ui.add_enabled(!is_default, btn)
+                             .on_hover_text(if is_default { "Cannot delete Default profile" } else { "Delete selected profile" })
+                             .clicked() 
+                         {
                              if !self.active_profile_name.is_empty() {
-                                 if let Err(e) = self.profile_manager.delete_profile(&self.active_profile_name) {
-                                     self.log(format!("Delete Error: {}", e));
-                                 } else {
-                                     self.log(format!("Profile '{}' deleted.", self.active_profile_name));
-                                     self.active_profile_name.clear();
-                                     // Don't clear list automatically on delete, just the selection
-                                 }
+                                 self.delete_profile_modal_open = true;
                              }
                          }
                     });
@@ -2235,7 +2456,7 @@ impl DarkCoreApp {
         // NEW PROFILE MODAL
         // NEW PROFILE MODAL (ANIMATED)
         // 1. Calculate Ease-Out-Back (Bounce)
-        let ctx = ui.ctx();
+        let ctx = ui.ctx().clone();
         let anim_t = ctx.animate_bool(egui::Id::new("create_profile_anim"), self.create_profile_modal_open);
         
         if anim_t > 0.0 {
@@ -2256,7 +2477,7 @@ impl DarkCoreApp {
                  .collapsible(false)
                  .resizable(false)
                  .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, y_offset))
-                 .show(ctx, |ui| {
+                 .show(&ctx, |ui| {
                       ui.label("Enter name for new profile:");
                       ui.text_edit_singleline(&mut self.profile_name_input).request_focus();
                       
@@ -2327,6 +2548,41 @@ impl DarkCoreApp {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(10.0);
+
+        // DELETE CONFIRMATION MODAL
+        if self.delete_profile_modal_open {
+             // Animate or simple overlay
+             egui::Window::new(egui::RichText::new("🗑 DELETE PROFILE?").strong().color(egui::Color32::RED))
+                 .collapsible(false)
+                 .resizable(false)
+                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                 .show(&ctx, |ui| {
+                      ui.label(egui::RichText::new(format!("Are you sure you want to delete '{}'?", self.active_profile_name)).size(16.0));
+                      ui.add_space(5.0);
+                      ui.label(egui::RichText::new("⚠ This action cannot be undone.").color(egui::Color32::YELLOW));
+                      
+                      ui.add_space(15.0);
+                      ui.horizontal(|ui| {
+                          if ui.button("CANCEL").clicked() {
+                              self.delete_profile_modal_open = false;
+                          }
+                          
+                          ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                              if ui.button(egui::RichText::new("💀 DELETE FOREVER").strong().color(egui::Color32::RED)).clicked() {
+                                   if !self.active_profile_name.is_empty() {
+                                       if let Err(e) = self.profile_manager.delete_profile(&self.active_profile_name) {
+                                           self.log(format!("Delete Error: {}", e));
+                                       } else {
+                                           self.log(format!("Profile '{}' deleted.", self.active_profile_name));
+                                           self.active_profile_name.clear();
+                                       }
+                                   }
+                                   self.delete_profile_modal_open = false;
+                              }
+                          });
+                      });
+                 });
+        }
 
         // Standard Library Controls (Refresh, Nuke, Resolve)
         ui.horizontal(|ui| {
@@ -2651,7 +2907,7 @@ impl DarkCoreApp {
             Path::new(&self.config.gl_path).exists(),
             &mut self.config.gl_path,
             true,
-            Some("Folder containing DLLInjector.exe and AppList folder.\nSearch for 'GreenLuma 2024' on specialized forums."),
+            Some("Folder containing GreenLuma_2025_x64.dll and AppList folder.\nSearch for 'GreenLuma 2025' on specialized forums."),
         );
         path_row(
             ui,
@@ -2661,6 +2917,75 @@ impl DarkCoreApp {
             false,
             Some("Steamless.CLI.exe required for DRM analysis.\nSearch for 'Steamless' on GitHub (atom0s)."),
         );
+
+        ui.add_space(5.0);
+
+        // STEALTH MODE WARNING
+        if !self.config.steam_path.is_empty() && !self.config.gl_path.is_empty() {
+             let sp = Path::new(&self.config.steam_path);
+             let gp = Path::new(&self.config.gl_path);
+             // Simple contains check logic
+             if gp.starts_with(sp) || sp.starts_with(gp) {
+                 ui.group(|ui| {
+                      ui.horizontal(|ui| {
+                          ui.label(egui::RichText::new("⚠ STEALTH RISK:").color(egui::Color32::RED).strong());
+                          ui.label("GreenLuma is located INSIDE or CONTAINS the Steam folder.");
+                      });
+                      ui.label("For maximum safety, please move GreenLuma to a completely separate folder (e.g. C:\\GreenLuma).");
+                 });
+                 ui.add_space(10.0);
+             }
+        }
+
+        // LEGACY IMPORT RECOVERY
+        if !self.config.steam_path.is_empty() {
+             let legacy_alist = Path::new(&self.config.steam_path).join("AppList");
+             if legacy_alist.exists() && legacy_alist.is_dir() {
+                  // Check if it has txt files (naive check)
+                  let has_files = std::fs::read_dir(&legacy_alist).ok().map(|mut d| d.any(|e| e.ok().map(|e| e.path().extension().map(|x| x == "txt").unwrap_or(false)).unwrap_or(false))).unwrap_or(false);
+                  
+                  if has_files {
+                       ui.group(|ui| {
+                           ui.horizontal(|ui| {
+                               ui.label(egui::RichText::new("📂 LEGACY CONFIG FOUND").color(egui::Color32::YELLOW).strong());
+                               if ui.add(egui::Button::new(egui::RichText::new("📥 IMPORT LEGACY APPLIST").strong().color(egui::Color32::BLACK)).fill(egui::Color32::YELLOW)).clicked() {
+                                    // IMPORT LOGIC
+                                    let mut count = 0;
+                                    let mut new_ids = Vec::new();
+                                    if let Ok(entries) = std::fs::read_dir(&legacy_alist) {
+                                         for entry in entries.flatten() {
+                                             let path = entry.path();
+                                             if path.extension().map(|s| s == "txt").unwrap_or(false) {
+                                                  if let Ok(content) = std::fs::read_to_string(&path) {
+                                                      let clean = content.trim().to_string();
+                                                      if !clean.is_empty() && clean.chars().all(char::is_numeric) {
+                                                           new_ids.push(clean);
+                                                           count += 1;
+                                                      }
+                                                  }
+                                             }
+                                         }
+                                    }
+                                    
+                                    if count > 0 {
+                                        // Write to current GL AppList
+                                        if let Err(e) = crate::app_list::add_games_to_list(&self.config.gl_path, new_ids) {
+                                            self.log(format!("Import Error: {}", e));
+                                        } else {
+                                            self.refresh_library();
+                                            self.log(format!("Imported {} legacy games. Please SAVE PROFILE to keep them.", count));
+                                        }
+                                    } else {
+                                        self.log("No valid AppIDs found in legacy folder.".to_string());
+                                    }
+                               }
+                           });
+                           ui.label("Old GreenLuma AppList detected inside Steam. Migrate now?");
+                       });
+                       ui.add_space(10.0);
+                  }
+             }
+        }
 
         ui.separator();
         
@@ -3646,6 +3971,7 @@ pub fn setup_greenluma_config(gl_path: &str) -> std::io::Result<()> {
            // Create empty file
            std::fs::write(&p, "")?;
         }
+
     }
     
     Ok(())
