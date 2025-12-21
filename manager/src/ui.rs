@@ -2306,10 +2306,11 @@ impl DarkCoreApp {
             }
             if ui
                 .button(
-                    egui::RichText::new("☢ Nuke & Reorder")
+                    egui::RichText::new("🔃 Reorder List")
                         .strong()
-                        .color(egui::Color32::RED),
+                        .color(egui::Color32::LIGHT_BLUE),
                 )
+                .on_hover_text("Sorts the AppList alphabetically without deleting unknown items.")
                 .clicked()
             {
                 let result = {
@@ -2320,8 +2321,32 @@ impl DarkCoreApp {
                 if let Err(e) = result {
                     self.log(format!("Error: {}", e));
                 } else {
-                    self.log("Library Reordered (Alphabetical/Safe).".to_string());
+                    self.log("Library Reordered (Alphabetical).".to_string());
                     self.refresh_library();
+                }
+            }
+
+            if ui
+                .button(
+                    egui::RichText::new("☢ NUKE UNKNOWNS")
+                        .strong()
+                        .color(egui::Color32::RED),
+                )
+                .on_hover_text("Smart Delete: Removes 'Unknown' items ONLY if they are NOT linked DLCs.\nSafe to use: If a game breaks, simply re-add its AppID.")
+                .clicked()
+            {
+                let result = {
+                    let cache = self.game_cache.lock().unwrap();
+                    let rel = self.relationships.lock().unwrap();
+                    crate::app_list::nuke_unknowns(&self.config.gl_path, &cache, &rel)
+                };
+
+                match result {
+                    Ok(count) => {
+                         self.log(format!("☢ NUKE COMPLETE: Vaporized {} junk files.", count));
+                         self.refresh_library();
+                    },
+                    Err(e) => self.log(format!("Nuke Error: {}", e)),
                 }
             }
             if ui
@@ -2493,12 +2518,18 @@ impl DarkCoreApp {
                                         }
                                     } else {
                                          // Not installed or check if DLC
-                                         if self.is_probable_dlc(&game.name) {
+                                         if game.parent_id.is_some() || self.is_probable_dlc(&game.name) {
+                                            let label = if let Some(pid) = &game.parent_id {
+                                                format!("📦 DLC / CONTENT (Linked to {})", pid)
+                                            } else {
+                                                "📦 DLC / CONTENT".to_string()
+                                            };
+
                                             ui.label(
-                                                egui::RichText::new("📦 DLC / CONTENT")
+                                                egui::RichText::new(&label)
                                                     .color(egui::Color32::from_rgb(150, 150, 255))
                                                     .size(10.0)
-                                            ).on_hover_text("Detected as Downloadable Content (No standalone executable detected).");
+                                            ).on_hover_text("Detected as Downloadable Content (Linked to Parent).");
                                          } else {
                                              ui.label(
                                                  egui::RichText::new("NOT INSTALLED")
