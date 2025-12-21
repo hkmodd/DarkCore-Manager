@@ -14,6 +14,16 @@
   <p>
     <b>High-Performance. Memory-Safe. Cyberpunk Aesthetics.</b>
   </p>
+
+# 🌌 DarkCore Manager v1.4
+
+> **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
+> *Zero Dependency. Zero Bloat. Pure Power.*
+
+[![Rust Build](https://github.com/DarkCore-Team/DarkCore-Manager/actions/workflows/release.yml/badge.svg)](https://github.com/DarkCore-Team/DarkCore-Manager/actions/workflows/release.yml)
+![Version](https://img.shields.io/badge/version-1.4.0-blueviolet?style=for-the-badge&logo=rust)
+![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
+![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
   
   <p>
     <img src="https://img.shields.io/badge/Language-Rust_1.80+-orange?style=for-the-badge&logo=rust" alt="Rust">
