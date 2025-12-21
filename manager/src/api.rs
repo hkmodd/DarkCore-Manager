@@ -37,15 +37,17 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(api_key: String) -> Self {
         let mut headers = HeaderMap::new();
+        // Docs recommend Authorization: Bearer for production
+        let auth_value = format!("Bearer {}", api_key);
         headers.insert(
-            "X-API-Key",
-            HeaderValue::from_str(&api_key).unwrap_or(HeaderValue::from_static("")),
+            "Authorization",
+            HeaderValue::from_str(&auth_value).unwrap_or(HeaderValue::from_static("")),
         );
         headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
-            .danger_accept_invalid_certs(true) // Matches verify=False in Python
+            .danger_accept_invalid_certs(true) 
             .timeout(std::time::Duration::from_secs(25))
             .build()
             .unwrap_or_default();
@@ -78,8 +80,6 @@ impl ApiClient {
         }
 
         // 2. Fallback: Steam Store Search (Public)
-        // URL: https://store.steampowered.com/api/storesearch/?term={}&l=english&cc=US
-        // We use query params to ensure encoding (e.g. spaces)
         let fallback_url = "https://store.steampowered.com/api/storesearch/";
         let params = [
             ("term", query),
@@ -87,8 +87,6 @@ impl ApiClient {
             ("cc", "US")
         ];
         
-        // Don't fail immediately on fallback error, return empty vec? 
-        // No, if fallback fails, we should bubble up the error so user knows.
         let resp = self.client.get(fallback_url)
             .query(&params)
             .send().await?;
@@ -98,7 +96,6 @@ impl ApiClient {
         let mut results = Vec::new();
         if let Some(items) = root.get("items").and_then(|v| v.as_array()) {
             for item in items {
-                // Steam API returns: { "id": 123, "name": "Game", ... }
                 let id_val = item.get("id").cloned();
                 let name_str = item.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
                 
@@ -134,7 +131,6 @@ impl ApiClient {
             return Ok(vec![]);
         }
 
-        // Parse: {"12345": {"success": true, "data": {"dlc": [1, 2, 3]}}}
         let root: Value = resp.json().await?;
 
         let mut dlc_ids = Vec::new();
@@ -159,13 +155,36 @@ impl ApiClient {
         if self.api_key.is_empty() {
              return Err("No API Key".into());
         }
-        let url = format!("https://manifest.morrenus.xyz/api/v1/status/{}?api_key={}", appid, self.api_key);
+        let url = format!("https://manifest.morrenus.xyz/api/v1/status/{}", appid);
         let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {
              return Err(format!("API Error {}", resp.status()).into());
         }
         let status: GameStatus = resp.json().await?;
         Ok(status)
+    }
+
+    pub async fn get_user_stats(&self) -> Result<UserStats, Box<dyn Error>> {
+        if self.api_key.is_empty() { return Err("No API Key Provided".into()); }
+        
+        let url = "https://manifest.morrenus.xyz/api/v1/user/stats";
+        // No query param needed if header is set
+        let resp = self.client.get(url).send().await?;
+        
+        if !resp.status().is_success() { 
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            // Try to parse {"detail": "..."}
+            if let Ok(json) = serde_json::from_str::<Value>(&text) {
+                if let Some(detail) = json.get("detail").and_then(|v| v.as_str()) {
+                    return Err(format!("API Error {}: {}", status.as_u16(), detail).into());
+                }
+            }
+            return Err(format!("API Error {}: {}", status, text).into()); 
+        }
+        
+        let stats: UserStats = resp.json().await?;
+        Ok(stats)
     }
 }
 
@@ -177,4 +196,14 @@ pub struct GameStatus {
     pub needs_update: Option<bool>,
     pub file_modified: Option<String>,
     pub timestamp: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[allow(dead_code)]
+pub struct UserStats {
+    pub api_key_usage_count: i32,
+    pub daily_usage: i32,
+    pub daily_limit: i32,
+    pub can_make_requests: bool,
+    pub role: Option<String>,
 }

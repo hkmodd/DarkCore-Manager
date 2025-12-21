@@ -107,6 +107,67 @@ pub struct DarkCoreApp {
     // Steamless Context
     steamless_app_id: String,
     steamless_auto_titan: bool,
+
+    // Stats
+    user_stats: Arc<Mutex<Option<crate::api::UserStats>>>,
+}
+
+impl Default for DarkCoreApp {
+    fn default() -> Self {
+        Self {
+            config: crate::config::load_config(),
+            active_tab: 0,
+            search_query: String::new(),
+            last_searched_query: String::new(),
+            last_input_time: None,
+            search_results: Arc::new(Mutex::new(Vec::new())),
+            active_games: Arc::new(Mutex::new(Vec::new())),
+            game_cache: Arc::new(Mutex::new(HashMap::new())),
+            update_cache: Arc::new(Mutex::new(HashMap::new())),
+            relationships: Arc::new(Mutex::new(HashMap::new())), // New
+            target_exe: String::new(),
+            include_dlcs: true,
+            status_msg: "Ready.".to_string(),
+            status_update_queue: Arc::new(Mutex::new(None)),
+            system_log: Arc::new(Mutex::new(Vec::new())),
+            api_key_glitch_cache: String::new(),
+            api_key_glitch_update: Instant::now(),
+            cover_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            cover_queue: Arc::new(Mutex::new(Vec::new())),
+            api_client: None, // Init in new()
+            profile_manager: ProfileManager::new("."),
+            profile_name_input: String::new(),
+            active_profile_name: "Default".to_string(),
+            delete_modal_open: false,
+            delete_candidate_id: None,
+            delete_candidate_name: None,
+            delete_associated_dlcs: Vec::new(),
+            is_scanning_dlcs: false,
+            dlc_scan_result: Arc::new(Mutex::new(None)),
+            
+            // Install Modal
+            install_modal_open: false,
+            install_candidate: None,
+            detected_libraries: Vec::new(),
+            selected_library_index: 0,
+            install_dir_input: String::new(),
+            
+            logo_texture: None,
+            logo_data: None,
+            tab_changed_at: Instant::now(),
+            _audio_stream: None,
+            _audio_stream_handle: None,
+            audio_sink: None,
+            volume: 0.5,
+            
+            steamless_app_id: String::new(),
+            steamless_auto_titan: false,
+
+            user_stats: Arc::new(Mutex::new(None)),
+            matrix_trails: Vec::new(),
+            config_saved_at: None,
+        }
+    }
 }
 
 impl DarkCoreApp {
@@ -189,14 +250,15 @@ impl DarkCoreApp {
             steamless_auto_titan: true,
 
             status_update_queue: Arc::new(Mutex::new(None)),
-
-            matrix_trails: Vec::new(),
             
-            api_key_glitch_update: Instant::now(),
+            user_stats: Arc::new(Mutex::new(None)),
+            matrix_trails: Vec::new(),
             api_key_glitch_cache: String::new(),
-
+            api_key_glitch_update: Instant::now(),
             config_saved_at: None,
         };
+
+
 
         // Initialize Audio Thread
         if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
@@ -2363,6 +2425,161 @@ impl DarkCoreApp {
                    .on_hover_text("Optional API Key for Manifest Downloads.\nSearch for 'Morrenus API' on Google/Discord.");
             });
         });
+
+        ui.add_space(10.0);
+
+        // API STATS DASHBOARD
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("📊 API USAGE:").strong().color(egui::Color32::from_rgb(0, 255, 255)));
+            if ui.button("🔄 Refresh Stats").clicked() {
+                 let client_opt = self.api_client.clone();
+                 let stats_arc = self.user_stats.clone();
+                 let status_queue = self.status_update_queue.clone();
+                 let ctx = ui.ctx().clone();
+                 
+                 // Async fetch
+                 std::thread::spawn(move || {
+                     if let Some(client) = client_opt {
+                         let rt = tokio::runtime::Runtime::new().unwrap();
+                         match rt.block_on(client.get_user_stats()) {
+                             Ok(stats) => {
+                                 *stats_arc.lock().unwrap() = Some(stats);
+                                 if let Ok(mut msg) = status_queue.lock() {
+                                     *msg = Some("Stats Updated Successfully.".to_string());
+                                 }
+                             },
+                             Err(e) => {
+                                 let err_str = e.to_string();
+                                 if err_str.contains("429") {
+                                     // Parse Limit/Usage from: "API Error 429: ... (25 manifests ...). Current usage: 25"
+                                     let limit = if err_str.contains("(25") { 25 } else { 25 }; 
+                                     let usage = limit; // Assume max if 429
+                                     
+                                     *stats_arc.lock().unwrap() = Some(crate::api::UserStats {
+                                         api_key_usage_count: usage,
+                                         daily_usage: usage,
+                                         daily_limit: limit,
+                                         can_make_requests: false,
+                                         role: Some("Rate Limited".to_string()),
+                                     });
+                                     
+                                     if let Ok(mut msg) = status_queue.lock() {
+                                         *msg = Some("Daily Limit Reached (429). Dashboard Updated.".to_string());
+                                     }
+                                 } else {
+                                     if let Ok(mut msg) = status_queue.lock() {
+                                         *msg = Some(format!("Stats Error: {}", e));
+                                     }
+                                 }
+                             }
+                         }
+                         ctx.request_repaint();
+                     } else {
+                         if let Ok(mut msg) = status_queue.lock() {
+                             *msg = Some("API Client not initialized.".to_string());
+                         }
+                         ctx.request_repaint();
+                     }
+                 });
+            }
+        });
+
+        // NEON STATS FRAME
+        if let Ok(guard) = self.user_stats.lock() {
+            if let Some(stats) = guard.as_ref() {
+                let limit_ratio = if stats.daily_limit > 0 {
+                    stats.daily_usage as f32 / stats.daily_limit as f32
+                } else {
+                    0.0
+                };
+                
+                let is_critical = limit_ratio >= 1.0;
+                let theme_color = if is_critical { egui::Color32::from_rgb(255, 30, 30) } else { egui::Color32::from_rgb(0, 255, 200) };
+                
+                let frame = egui::Frame::none()
+                    .fill(egui::Color32::from_black_alpha(200))
+                    .stroke(egui::Stroke::new(1.5, theme_color))
+                    .rounding(6.0)
+                    .inner_margin(12.0);
+
+                frame.show(ui, |ui| {
+                     ui.set_min_width(320.0);
+                     
+                     // Header
+                     ui.horizontal(|ui| {
+                         ui.label(egui::RichText::new(if is_critical { "⚠ SYSTEM HALT" } else { "⚡ ONLINE" })
+                             .font(egui::FontId::monospace(12.0))
+                             .color(theme_color));
+                         
+                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                             ui.label(egui::RichText::new(format!("[{}]", stats.role.clone().unwrap_or("USER".to_string()).to_uppercase()))
+                                 .font(egui::FontId::monospace(10.0))
+                                 .color(egui::Color32::GRAY));
+                         });
+                     });
+                     
+                     ui.add_space(8.0);
+                     
+                     // Usage Numbers
+                     ui.horizontal(|ui| {
+                         ui.label(egui::RichText::new(format!("{:02}", stats.daily_usage))
+                             .font(egui::FontId { size: 24.0, family: egui::FontFamily::Proportional }) // Bigger
+                             .color(egui::Color32::WHITE));
+                         
+                         ui.label(egui::RichText::new("/")
+                             .size(18.0)
+                             .color(egui::Color32::GRAY));
+                             
+                         ui.label(egui::RichText::new(format!("{:02}", stats.daily_limit))
+                             .font(egui::FontId::monospace(18.0))
+                             .color(theme_color));
+                             
+                         ui.label(egui::RichText::new("REQUESTS")
+                             .size(10.0)
+                             .color(egui::Color32::GRAY));
+                     });
+                     
+                     ui.add_space(4.0);
+
+                     // Cyberpunk Progress Bar
+                     let (rect, _resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+                     ui.painter().rect_filled(rect, 3.0, egui::Color32::from_rgb(20, 20, 30)); // Track
+                     
+                     if limit_ratio > 0.0 {
+                         let fill_width = rect.width() * limit_ratio.clamp(0.0, 1.0);
+                         let fill_rect = egui::Rect::from_min_size(rect.min, egui::vec2(fill_width, rect.height()));
+                         
+                         // Glow effect
+                         if !is_critical {
+                             ui.painter().rect_filled(fill_rect, 3.0, theme_color);
+                             ui.painter().rect_stroke(fill_rect.expand(1.0), 3.0, egui::Stroke::new(2.0, theme_color.linear_multiply(0.3)));
+                         } else {
+                             // Glitch Pattern for Critical
+                             ui.painter().rect_filled(fill_rect, 3.0, theme_color); 
+                             // Add stripes? keeping it simple but bold
+                         }
+                     }
+                     
+                     if is_critical {
+                         ui.add_space(4.0);
+                         ui.label(egui::RichText::new("⛔ UPLINK SEVERED due to protocol limits.")
+                             .font(egui::FontId::monospace(10.0))
+                             .color(egui::Color32::from_rgb(255, 100, 100)));
+                     }
+                });
+            } else {
+                // Empty State with Style
+                let frame = egui::Frame::none()
+                    .fill(egui::Color32::from_black_alpha(150))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 50, 50)))
+                    .rounding(4.0)
+                    .inner_margin(8.0);
+                    
+                frame.show(ui, |ui| {
+                    ui.label(egui::RichText::new("Awaiting Downlink...").font(egui::FontId::monospace(12.0)).italics().color(egui::Color32::GRAY));
+                });
+            }
+        }
 
         ui.add_space(15.0);
         ui.add_space(20.0);
