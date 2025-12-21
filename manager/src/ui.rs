@@ -423,6 +423,7 @@ impl DarkCoreApp {
             let cover_queue = self.cover_queue.clone();
             let cover_cache = self.cover_cache.clone();
             let log_arc = self.system_log.clone();
+            let user_stats_arc = self.user_stats.clone(); // Capture Stats Arc
 
             self.log(&format!("Searching for: {}", query));
             if let Ok(mut res) = results_arc.lock() {
@@ -623,6 +624,17 @@ impl DarkCoreApp {
                                 let _ = h.await; 
                             }
                         });
+
+
+                        // AUTO-UPDATE STATS (Fix usage counter)
+                        match rt.block_on(client.get_user_stats()) {
+                            Ok(stats) => {
+                                if let Ok(mut s) = user_stats_arc.lock() {
+                                    *s = Some(stats);
+                                }
+                            }
+                            Err(_) => {} 
+                        }
                     }
                     Err(e) => {
                         if let Ok(mut logs) = log_arc.lock() {
@@ -1028,16 +1040,32 @@ impl DarkCoreApp {
                 }
             }
 
-            log(format!("Generating Ghost ACF at: {:?}", final_acf_path));
+            // VAULT RESTORE CHECK
+            let vault = VaultManager::new(".");
+            let mut skip_ghost = false;
             
-            // Use potentially overridden install dir name, or default to display name
-            let install_dir = install_dir_name.unwrap_or(name.clone());
+            if let Ok((restored_acf, count)) = vault.restore_manifests(&steam_path, &appid) {
+                if count > 0 { log(format!("Vault: Restored {} local depot manifests.", count)); }
+                if restored_acf {
+                    log("Vault: Restored AppManifest.acf. Skipping Ghost Generation. 🛡️".to_string());
+                    skip_ghost = true;
+                }
+            }
 
-            // Pass steam_path so we can calculate steam.exe location for the ACF
-            if let Err(e) = generate_acf(&steam_path, &final_acf_path, &appid, &install_dir, &timestamp) {
-                log(format!("Error writing ACF: {}", e));
+            if !skip_ghost {
+                log(format!("Generating Ghost ACF at: {:?}", final_acf_path));
+                
+                // Use potentially overridden install dir name, or default to display name
+                let install_dir = install_dir_name.unwrap_or(name.clone());
+
+                // Pass steam_path so we can calculate steam.exe location for the ACF
+                if let Err(e) = generate_acf(&steam_path, &final_acf_path, &appid, &install_dir, &timestamp) {
+                    log(format!("Error writing ACF: {}", e));
+                } else {
+                     log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
+                }
             } else {
-                 log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
+                log("Using Vaulted AppManifest.".to_string());
             }
 
             // STEP 2: TRY MANIFEST (Priority + Vault)
@@ -1094,6 +1122,10 @@ impl DarkCoreApp {
                              log(format!("Vault Save Error: {}", e));
                          } else {
                              log("Download successful. Saved to Vault.".to_string());
+                             // EXTRA: Backup Depots
+                             if let Ok(c) = vault.backup_manifests(&steam_path, &appid) {
+                                  if c > 0 { log(format!("Vault: Secured {} local depot manifests.", c)); }
+                             }
                          }
                          bytes_opt = Some(bytes.to_vec());
                      },
@@ -3220,7 +3252,14 @@ impl DarkCoreApp {
         // 2. Full Wipe: Manifests AND Content (Surgical - Check All Libraries)
         if full_wipe {
             let libraries = crate::game_path::GamePathFinder::get_library_folders(&steam_path);
+            let vault = crate::vault::VaultManager::new("."); // Initialize Vault
+
             for id in &ids {
+                 // SAFETY FIRST: Backup Manifests before any deletion
+                 if let Ok(c) = vault.backup_manifests(&steam_path, id) {
+                     if c > 0 { self.log(format!("Vault: Secured {} manifests for {} before deletion.", c, id)); }
+                 }
+
                  // Define potential locations (Main + External Libs)
                  let mut locations = libraries.clone();
                  locations.push(std::path::Path::new(&steam_path).to_path_buf());
