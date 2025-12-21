@@ -1,13 +1,6 @@
-[workspace]
-members = [
-    "manager",
-    "titan_hook",
-]
-resolver = "2"
-
 [profile.release]
 strip = true      # Automatically strip symbols from the binary.
 opt-level = "z"   # Optimize for size.
 lto = true        # Enable Link Time Optimization.
 codegen-units = 1 # Maximum optimization (slower build).
-# panic = "abort" # Commented out for debugging
+panic = "abort"   # Remove unwind tables (reduces size/metadata).

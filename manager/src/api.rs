@@ -151,6 +151,34 @@ impl ApiClient {
         Ok(dlc_ids)
     }
 
+    pub async fn get_details_parent(&self, appid: &str) -> Result<Option<String>, Box<dyn Error>> {
+        let url = format!(
+            "https://store.steampowered.com/api/appdetails?appids={}&filters=basic,fullgame",
+            appid
+        );
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+
+        let root: Value = resp.json().await?;
+        if let Some(app_data) = root.get(appid) {
+             if let Some(true) = app_data.get("success").and_then(|v| v.as_bool()) {
+                 if let Some(data) = app_data.get("data") {
+                     // Check if type is DLC
+                     if let Some("dlc") = data.get("type").and_then(|s| s.as_str()) {
+                         if let Some(fullgame) = data.get("fullgame") {
+                             if let Some(pid) = fullgame.get("appid").and_then(|v| v.as_str()) {
+                                 return Ok(Some(pid.to_string())); 
+                             }
+                         }
+                     }
+                 }
+             }
+        }
+        Ok(None)
+    }
+
     pub async fn get_status(&self, appid: &str) -> Result<GameStatus, Box<dyn Error>> {
         if self.api_key.is_empty() {
              return Err("No API Key".into());

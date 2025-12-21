@@ -641,31 +641,42 @@ impl DarkCoreApp {
         let client_key = self.config.api_key.clone();
         let steam_path = self.config.steam_path.clone();
         let status_queue = self.status_update_queue.clone();
+        let relationships = self.relationships.clone(); // Capture relationships
 
-        self.status_msg = "Resolving unknown games...".to_string();
+        self.status_msg = "Resolving unknown games & DLCs...".to_string();
 
         std::thread::spawn(move || {
             let mut ids_to_resolve = Vec::new();
 
-            // Identify unknowns
+            // Identify unknowns OR orphans (possible unlinked DLCs)
             {
                 if let Ok(games) = active_games.lock() {
                     for g in games.iter() {
-                        if g.name == "Unknown" || g.name.starts_with("Depot of") {
+                        // Check if needs Name Resolution OR Relationship Check
+                        if g.name == "Unknown" || g.name.starts_with("Depot of") || g.parent_id.is_none() {
                             ids_to_resolve.push(g.app_id.clone());
                         }
                     }
                 }
             }
 
-            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build() 
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
 
             runtime.block_on(async {
                 let mut handles = Vec::new();
+                let shared_client = ApiClient::new(client_key.clone());
 
                 for id in ids_to_resolve {
-                    let client = ApiClient::new(client_key.clone());
+                    let client = shared_client.clone();
                     let game_cache = game_cache.clone();
+                    let rel_map = relationships.clone();
                     let id_clone = id.clone();
                     let steam_path_ref = steam_path.clone();
 
@@ -793,6 +804,23 @@ impl DarkCoreApp {
                             }
                         }
 
+                        // 5. DLC Auto-Link (Store API)
+                        // This fixes "Standalone DLC" issues by finding the fullgame ID
+                        if let Ok(Some(parent_id)) = client.get_details_parent(&id_clone).await {
+                             if let Ok(mut map) = rel_map.lock() {
+                                 // Only link if not already linked (or orphan)
+                                 if !map.contains_key(&id_clone) {
+                                     map.insert(id_clone.clone(), parent_id.clone());
+                                     crate::app_list::save_relationships(".", &map);
+                                     
+                                     // If we found a parent, try to make the name nicer if it's still generic
+                                     if found_name.is_none() || found_name.as_deref() == Some("Unknown") {
+                                          found_name = Some(format!("DLC (Parent: {})", parent_id));
+                                     }
+                                 }
+                             }
+                        }
+
                         // 3. Save if found
                         if let Some(name) = found_name {
                             if let Ok(mut cache) = game_cache.lock() {
@@ -822,7 +850,15 @@ impl DarkCoreApp {
 
         std::thread::spawn(move || {
             let client = if let Some(c) = client_opt { c } else { return; };
-            let rt = tokio::runtime::Runtime::new().unwrap();
+            // Safe Runtime
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build() 
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
             
             let mut handles = Vec::new();
             
