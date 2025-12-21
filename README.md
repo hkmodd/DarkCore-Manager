@@ -20,7 +20,6 @@
 > **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
-[![Rust Build](https://github.com/DarkCore-Team/DarkCore-Manager/actions/workflows/release.yml/badge.svg)](https://github.com/DarkCore-Team/DarkCore-Manager/actions/workflows/release.yml)
 ![Version](https://img.shields.io/badge/version-1.4.0-blueviolet?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
