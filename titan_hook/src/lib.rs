@@ -13,7 +13,7 @@ extern "system" fn DllMain(_: HMODULE, call_reason: u32, _: *mut std::ffi::c_voi
     match call_reason {
         DLL_PROCESS_ATTACH => {
             init_logging();
-            info!("TitanHook loaded successfully!");
+            info!("TitanHook v1.3 loaded successfully!");
             unsafe {
                 hooks::steam_api::install_hooks();
             }
