@@ -14,14 +14,13 @@ jobs:
 
     steps:
     - name: Checkout Code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Install Rust
-      uses: actions-rs/toolchain@v1
+      uses: dtolnay/rust-toolchain@stable
       with:
         toolchain: stable
-        target: x86_64-pc-windows-msvc
-        override: true
+        targets: x86_64-pc-windows-msvc
 
     - name: Build Release
       run: cargo build --release --workspace --verbose
@@ -35,7 +34,7 @@ jobs:
 
     - name: Create Release
       id: create_release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           DarkCore-Manager-v${{ github.ref_name }}.zip

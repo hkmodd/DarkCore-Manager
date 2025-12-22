@@ -291,8 +291,8 @@ impl DarkCoreApp {
         // Initialize Audio Thread
         if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
             if let Ok(sink) = rodio::Sink::try_new(&handle) {
-                // Load embedded track
-                let bytes = include_bytes!("../Neon Veins.mp3");
+                // Load embedded track (Obfuscated as system data)
+                let bytes = include_bytes!("../core_data/sys_audio_01.dat");
                 let cursor = std::io::Cursor::new(bytes);
                 if let Ok(source) = rodio::Decoder::new(cursor) {
                      sink.append(source.repeat_infinite());
@@ -1369,7 +1369,7 @@ impl eframe::App for DarkCoreApp {
                 
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("MANAGER v1.3")
+                        egui::RichText::new("MANAGER v1.4")
                             .size(10.0)
                             .color(accent_pink)
                             .extra_letter_spacing(2.0),
