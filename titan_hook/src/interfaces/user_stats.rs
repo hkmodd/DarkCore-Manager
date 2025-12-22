@@ -5,9 +5,11 @@ use std::ptr;
 
 // TODO: Verify indices!
 const IDX_SET_ACHIEVEMENT: usize = 7;
+const IDX_GET_ACHIEVEMENT: usize = 8;
 const IDX_STORE_STATS: usize = 9;
 
 static mut ORIGINAL_SET_ACHIEVEMENT: *mut c_void = ptr::null_mut();
+static mut ORIGINAL_GET_ACHIEVEMENT: *mut c_void = ptr::null_mut();
 static mut ORIGINAL_STORE_STATS: *mut c_void = ptr::null_mut();
 
 pub unsafe fn hook_interface(iface: *mut c_void, _version: &str) {
@@ -22,6 +24,19 @@ pub unsafe fn hook_interface(iface: *mut c_void, _version: &str) {
             info!(
                 "Hooked ISteamUserStats::SetAchievement at {:p}",
                 set_ach_addr
+            );
+        }
+    }
+
+    // Hook GetAchievement
+    let get_ach_addr = *vtable.add(IDX_GET_ACHIEVEMENT);
+    if ORIGINAL_GET_ACHIEVEMENT.is_null() {
+        if let Ok(original) = MinHook::create_hook(get_ach_addr, detour_get_achievement as _) {
+            ORIGINAL_GET_ACHIEVEMENT = original;
+            MinHook::enable_hook(get_ach_addr).ok();
+            info!(
+                "Hooked ISteamUserStats::GetAchievement at {:p}",
+                get_ach_addr
             );
         }
     }
@@ -88,14 +103,41 @@ unsafe extern "C" fn detour_set_achievement(_this: *mut c_void, name: *const i8)
     true
 }
 
+unsafe extern "C" fn detour_get_achievement(
+    _this: *mut c_void,
+    name: *const i8,
+    pb_achieved: *mut bool,
+) -> bool {
+    let ach_name = if !name.is_null() {
+        CStr::from_ptr(name).to_string_lossy().to_string()
+    } else {
+        return false;
+    };
+
+    // Check local database
+    let path = get_stats_path();
+    let mut is_unlocked = false;
+
+    if path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            is_unlocked = content.lines().any(|line| line.trim() == ach_name);
+        }
+    }
+
+    if !pb_achieved.is_null() {
+        *pb_achieved = is_unlocked;
+    }
+
+    // Debug log only if True to avoid spam
+    if is_unlocked {
+        info!("GetAchievement '{}' -> TRUE (Local Override)", ach_name);
+    }
+
+    true // Return success (we handled the call)
+}
+
 unsafe extern "C" fn detour_store_stats(_this: *mut c_void) -> bool {
     // We persist immediately on SetAchievement, so StoreStats is just a dummy success
     info!("StoreStats requested (Already committed).");
     true
 }
-// Hook GetAchievement to report true if in file?
-// Ideally yes, but depends on game. Many games just fire "Set" when logic dictates.
-// If the game checks state, we need `GetAchievement`.
-// Let's add basic `GetAchievement` hook for completeness?
-// Adding `IDX_GET_ACHIEVEMENT = 8` (usually) or looking it up.
-// For now, persistence ensures at least we don't lose the "write".

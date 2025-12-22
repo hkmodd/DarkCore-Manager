@@ -1369,7 +1369,7 @@ impl eframe::App for DarkCoreApp {
                 
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("MANAGER v1.4")
+                        egui::RichText::new("MANAGER v1.5")
                             .size(10.0)
                             .color(accent_pink)
                             .extra_letter_spacing(2.0),
@@ -1900,6 +1900,7 @@ impl DarkCoreApp {
                                  }
 
                              ui.vertical(|ui| {
+                                 ui.label(egui::RichText::new("MANAGER v1.4").size(10.0).color(egui::Color32::from_rgb(100, 100, 120)));
                                  ui.label(egui::RichText::new(name).size(16.0).color(egui::Color32::WHITE).strong());
                                  ui.label(egui::RichText::new(format!("ID: {}", display_id)).size(10.0).color(egui::Color32::GRAY));
                                  ui.add_space(5.0);

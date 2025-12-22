@@ -12,8 +12,7 @@ use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessW, CreateRemoteThread, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
-    INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessW, QueueUserAPC, ResumeThread, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 // --- CORE LAUNCHER ---
@@ -75,10 +74,11 @@ pub fn launch_injected(exe_path: &str, dll_path: &str, args: Option<&str>) -> Re
             return Err(format!("CreateProcessW failed."));
         }
 
-        // 3. Inject DLL into the suspended process
-        match inject_dll_handle(pi.hProcess, dll_abs.to_str().unwrap_or("")) {
+        // 3. Inject DLL into the suspended process via APC
+        // Note: passing both process handle (force memory write) AND thread handle (for APC)
+        match inject_dll_apc(pi.hProcess, pi.hThread, dll_abs.to_str().unwrap_or("")) {
             Ok(_) => {
-                // 4. Resume Thread if injection succeeded
+                // 4. Resume Thread - This triggers the APC which executes LoadLibrary
                 ResumeThread(pi.hThread);
 
                 let _ = CloseHandle(pi.hProcess);
@@ -86,28 +86,32 @@ pub fn launch_injected(exe_path: &str, dll_path: &str, args: Option<&str>) -> Re
                 Ok(())
             }
             Err(e) => {
+                // Kill process on failure? For now just close handles and error out
                 let _ = CloseHandle(pi.hProcess);
                 let _ = CloseHandle(pi.hThread);
-                Err(format!("Injection into suspended process failed: {}", e))
+                Err(format!("APC Injection failed: {}", e))
             }
         }
     }
 }
 
-// Internal helper that takes a raw handle
-unsafe fn inject_dll_handle(handle: HANDLE, dll_path: &str) -> Result<(), String> {
+// Internal helper using APC (Stealthier than CreateRemoteThread)
+unsafe fn inject_dll_apc(
+    h_process: HANDLE,
+    h_thread: HANDLE,
+    dll_path: &str,
+) -> Result<(), String> {
     // 1. Path Processing
     let path_os = Path::new(dll_path);
     let path_str = path_os.to_string_lossy();
 
-    // Fix: Cow<str> handling
     let mut path_wide: Vec<u16> = OsStr::new(path_str.as_ref()).encode_wide().collect();
     path_wide.push(0);
     let path_len = path_wide.len() * size_of::<u16>();
 
-    // 2. Allocation
+    // 2. Allocation in Remote Process
     let remote_mem = VirtualAllocEx(
-        handle,
+        h_process,
         None,
         path_len,
         MEM_COMMIT | MEM_RESERVE,
@@ -117,10 +121,10 @@ unsafe fn inject_dll_handle(handle: HANDLE, dll_path: &str) -> Result<(), String
         return Err("VirtualAllocEx failed".to_string());
     }
 
-    // 3. Write
+    // 3. Write DLL Path to Remote Memory
     let mut written = 0;
     if WriteProcessMemory(
-        handle,
+        h_process,
         remote_mem,
         path_wide.as_ptr() as *const _,
         path_len,
@@ -129,11 +133,11 @@ unsafe fn inject_dll_handle(handle: HANDLE, dll_path: &str) -> Result<(), String
     .is_err()
         || written != path_len
     {
-        let _ = VirtualFreeEx(handle, remote_mem, 0, MEM_RELEASE);
+        let _ = VirtualFreeEx(h_process, remote_mem, 0, MEM_RELEASE);
         return Err("WriteProcessMemory failed".to_string());
     }
 
-    // 4. Resolve LoadLibraryW
+    // 4. Resolve LoadLibraryW Address
     let kernel32_str = "kernel32.dll\0";
     let kernel32_wide: Vec<u16> = OsStr::new(kernel32_str).encode_wide().collect();
     let module =
@@ -143,37 +147,28 @@ unsafe fn inject_dll_handle(handle: HANDLE, dll_path: &str) -> Result<(), String
     let load_library_addr = GetProcAddress(module, PCSTR(func_name.as_ptr()));
 
     if load_library_addr.is_none() {
-        let _ = VirtualFreeEx(handle, remote_mem, 0, MEM_RELEASE);
+        let _ = VirtualFreeEx(h_process, remote_mem, 0, MEM_RELEASE);
         return Err("Failed to find LoadLibraryW".to_string());
     }
 
-    let start_routine: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 =
-        std::mem::transmute(load_library_addr);
+    // Transmute to PAPCFUNC signature: unsafe extern "system" fn(usize)
+    let pfn_apc: unsafe extern "system" fn(usize) = std::mem::transmute(load_library_addr);
 
-    // 5. Execute
-    let thread_handle = CreateRemoteThread(
-        handle,
-        None,
-        0,
-        Some(start_routine),
-        Some(remote_mem),
-        0,
-        None,
+    // 5. Queue User APC
+    // This queues the LoadLibraryW call to the main thread.
+    // Since the process is suspended, this will be the VERY FIRST thing it does when resumed.
+    let apc_result = QueueUserAPC(
+        Some(pfn_apc),
+        h_thread,
+        remote_mem as usize, // Pass pointer as argument
     );
 
-    match thread_handle {
-        Ok(th) => {
-            WaitForSingleObject(th, INFINITE); // Wait for DllMain
-
-            // Cleanup memory (ACTIVE)
-            let _ = VirtualFreeEx(handle, remote_mem, 0, MEM_RELEASE);
-
-            let _ = CloseHandle(th);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = VirtualFreeEx(handle, remote_mem, 0, MEM_RELEASE);
-            Err(e.to_string())
-        }
+    if apc_result == 0 {
+        let _ = VirtualFreeEx(h_process, remote_mem, 0, MEM_RELEASE);
+        return Err("QueueUserAPC failed".to_string());
     }
+
+    // Success! We do NOT free memory here because LoadLibraryW needs it when thread resumes.
+    // It's a small leak (path string) but standard for injection.
+    Ok(())
 }

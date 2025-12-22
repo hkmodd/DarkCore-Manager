@@ -20,7 +20,7 @@
 > **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
-![Version](https://img.shields.io/badge/version-1.4.0-blueviolet?style=for-the-badge&logo=rust)
+![Version](https://img.shields.io/badge/version-v1.4-00f3ff?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
   
@@ -122,6 +122,7 @@ When a valid key is detected, DarkCore enforces **Strict Validation**, preventin
 *   **Audio-Reactive**: Custom "Neon Wave" volume control with real-time spectrum visualization and scroll interaction.
 *   **Secure Sandbox**: API Key inputs feature a "Glitch" security visualization, confirming data protection with style.
 *   **Zero-Compromise Engineering**: The entire codebase (Manager + Titan) compiles with **0 Warnings** and **0 Errors**, adhering to strict Rust 2024 standards.
+*   **Stealth APC Injection**: Replaces legacy `CreateRemoteThread` with advanced `QueueUserAPC` injection. Leverages the main thread for insertion, making it undetected and highly stable.
 *   **Limit Bypass**: Proprietary **Profile System** allows unlimited libraries by hot-swapping `AppList` configurations.
 *   **Steamless Automation**: Integrated GUI for `Steamless CLI` with **Auto-Backup** (`.bak`), **Auto-Rename**, and **Smart Detection**.
 

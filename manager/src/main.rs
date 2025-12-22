@@ -46,7 +46,7 @@ async fn main() -> Result<(), eframe::Error> {
     };
 
     eframe::run_native(
-        "DarkCore Manager v1.4",
+        "DarkCore Manager v1.5",
         options,
         Box::new(|cc| Ok(Box::new(DarkCoreApp::new(cc)))),
     )
