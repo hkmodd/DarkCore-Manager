@@ -93,6 +93,17 @@ impl VaultManager {
         Ok(count)
     }
 
+    pub fn store_manifest(&self, appid: &str, source: &Path) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            fs::create_dir_all(&storage_dir)?;
+        }
+        if let Some(fname) = source.file_name() {
+            fs::copy(source, storage_dir.join(fname))?;
+        }
+        Ok(())
+    }
+
     /// Restores AppManifest and Depot Manifests from the Vault to Steam.
     /// Returns: (restored_acf, restored_depots_count)
     pub fn restore_manifests(

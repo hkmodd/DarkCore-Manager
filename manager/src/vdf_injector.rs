@@ -77,6 +77,82 @@ pub fn inject_vdf(
     Ok(())
 }
 
+// New function to inject into UserLocalConfigStore (userdata/ID/config/localconfig.vdf)
+pub fn inject_localconfig_vdf(
+    steam_root: &str,
+    vdf_keys: &HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let userdata = Path::new(steam_root).join("userdata");
+    if !userdata.exists() {
+        return Ok(());
+    }
+
+    // Iterate over all user folders
+    for entry in fs::read_dir(userdata)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let local_cfg = path.join("config").join("localconfig.vdf");
+            if local_cfg.exists() {
+                // Backup
+                let _ = fs::copy(&local_cfg, local_cfg.with_extension("vdf.bak"));
+
+                let content_bytes = fs::read(&local_cfg)?;
+                let content = String::from_utf8_lossy(&content_bytes).to_string();
+
+                if let Some(mut root) = GamePathFinder::parse_vdf(&content) {
+                    // Check for UserLocalConfigStore (Root) -> Software -> Valve -> Steam -> depots
+                    let base = if root.has_key("UserLocalConfigStore") {
+                        root.get_mut("UserLocalConfigStore").unwrap()
+                    } else {
+                        continue; // Skip if structure mismatch
+                    };
+
+                    if let Some(steam_node) = base.ensure_path(&["Software", "Valve", "Steam"]) {
+                        // In localconfig, structure might be similar for depots
+                        if let Some(depots) = steam_node.ensure_path(&["depots"]) {
+                            for (appid, key) in vdf_keys {
+                                // Same logic: Insert DecryptionKe
+                                if !depots.has_key(appid) {
+                                    let mut new_obj = Vec::new();
+                                    new_obj.push((
+                                        "DecryptionKey".to_string(),
+                                        VdfValue::Str(key.clone()),
+                                    ));
+                                    depots.insert_or_update(appid.clone(), VdfValue::Obj(new_obj));
+                                } else {
+                                    if let Some(app_node) = depots.get_mut(appid) {
+                                        if let VdfValue::Obj(fields) = app_node {
+                                            let mut found = false;
+                                            for (k, v) in fields.iter_mut() {
+                                                if k.eq_ignore_ascii_case("DecryptionKey") {
+                                                    *v = VdfValue::Str(key.clone());
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                fields.push((
+                                                    "DecryptionKey".to_string(),
+                                                    VdfValue::Str(key.clone()),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let new_content = GamePathFinder::serialize_vdf(&root);
+                    fs::write(local_cfg, new_content)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, String>) {
     let mut ids = Vec::new();
     let mut keys = HashMap::new();

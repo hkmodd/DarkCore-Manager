@@ -968,6 +968,7 @@ impl DarkCoreApp {
         let game_cache = self.game_cache.clone(); // Keep this for cache updates
         let api_key = self.config.api_key.clone(); // Keep this for API client creation inside thread
         let relationships_arc = self.relationships.clone(); // New: Capture relationships map for thread
+        let enable_stealth = self.config.enable_stealth_mode;
         
         // Use Arc/Mutex for status updates
         let status_queue = self.status_update_queue.clone();
@@ -995,63 +996,70 @@ impl DarkCoreApp {
 
             // STEP 0.5: SETUP GREENLUMA CONFIG (Stealth Mode)
             // Ensure .bin files exist
-            if let Err(e) = setup_greenluma_config(&gl_path) {
+            if let Err(e) = setup_greenluma_config(&gl_path, enable_stealth) {
                  log(format!("Warning: Could not setup GreenLuma config: {}", e));
             } else {
-                 log("GreenLuma configured (NoQuestion/NoSplash).".to_string());
+                 if enable_stealth {
+                     log("GreenLuma configured (Stealth Mode: ON).".to_string());
+                 } else {
+                     log("GreenLuma configured (Stealth Mode: OFF).".to_string());
+                 }
             }
+
 
             // STEP 1: Kill Steam
             log("STEP 1: Killing Steam Process...".to_string());
             let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
             std::thread::sleep(std::time::Duration::from_millis(2000));
 
+            // PATH DEFINITIONS
+            // `steam_path` from config is the Steam Installation Root (e.g. C:\Program Files\Steam).
+            // We rename it to `steam_root` for clarity.
+            let steam_root = steam_path.clone(); 
+            
+            // `library_path` is the target for the game (e.g. D:\Giochi Steam).
+            // If target_library is set, use it. Otherwise, default to steam_root.
+            let library_path = if let Some(target) = target_library {
+                log(format!("Using selected library: {:?}", target));
+                target.to_string_lossy().to_string()
+            } else {
+                steam_path.clone()
+            };
+
+            log(format!("Steam Root (Config): {}", steam_root));
+            log(format!("Library Path (Game): {}", library_path));
+
             // STEP 1.5: GHOST INSTALLATION -> GENERATE ACF
             let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
             let timestamp = time.to_string(); 
 
             let acf_filename = format!("appmanifest_{}.acf", appid);
+            let acf_path = std::path::Path::new(&library_path).join("steamapps").join(&acf_filename);
             
-            // PATH LOGIC
-            let (final_acf_path, target_root) = if let Some(target) = target_library {
-                // USER SELECTED or ENFORCED PATH
-                log(format!("Using selected library: {:?}", target));
-                (target.join("steamapps").join(&acf_filename), target)
-            } else if let Some(existing_path) = crate::game_path::GamePathFinder::find_manifest_path(&steam_path, &appid) {
-                // AUTO-DETECTED
-                log(format!("Found existing manifest at: {:?}", existing_path));
-                let root = existing_path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&steam_path)).to_path_buf();
-                (existing_path, root)
-            } else {
-                // DEFAULT
-                let root = std::path::Path::new(&steam_path).to_path_buf();
-                (root.join("steamapps").join(&acf_filename), root)
-            };
-
+            // Check for existing manifest in other libraries (Conflict Cleanup)
             // CRITICAL FIX: CLEANUP CONFLICTS
-            // If we are writing to Drive D, we MUST ensure no manifest exists for this ID on Drive C.
-            // Steam gets confused if two manifests exist.
-            let all_libs = crate::game_path::GamePathFinder::get_library_folders(&steam_path);
+            let all_libs = crate::game_path::GamePathFinder::get_library_folders(&steam_root);
             for lib in all_libs {
-                // Check if this lib is effectively the same as our target (canonicalize or simple eq)
-                if lib != target_root {
-                    let conflict_path = lib.join("steamapps").join(&acf_filename);
-                    if conflict_path.exists() {
-                        log(format!("Found conflicting manifest at {:?}. Deleting...", conflict_path));
-                        if let Err(e) = std::fs::remove_file(&conflict_path) {
-                             log(format!("Error deleting conflict: {}", e));
-                        } else {
-                             log("Conflict cleaned.".to_string());
-                        }
-                    }
-                }
+                 let lib_str = lib.to_string_lossy().to_string();
+                 if lib_str != library_path {
+                     let conflict = lib.join("steamapps").join(&acf_filename);
+                     if conflict.exists() {
+                         log(format!("Removing conflicting manifest at: {:?}", conflict));
+                         let _ = std::fs::remove_file(conflict);
+                     }
+                 }
             }
 
             // VAULT RESTORE CHECK
             let vault = VaultManager::new(".");
             let mut skip_ghost = false;
             
-            if let Ok((restored_acf, count)) = vault.restore_manifests(&steam_path, &appid) {
+            // HOISTED: Calculate Install Dir Name (Available for both Ghost ACF and Tactical Bypass)
+            // Use potentially overridden install dir name, or default to display name
+            let final_install_dir = install_dir_name.as_ref().map(|s| s.clone()).unwrap_or(name.clone());
+
+            // Use library_path for restore check/logic
+            if let Ok((restored_acf, count)) = vault.restore_manifests(&library_path, &appid) {
                 if count > 0 { log(format!("Vault: Restored {} local depot manifests.", count)); }
                 if restored_acf {
                     log("Vault: Restored AppManifest.acf. Skipping Ghost Generation. 🛡️".to_string());
@@ -1060,13 +1068,11 @@ impl DarkCoreApp {
             }
 
             if !skip_ghost {
-                log(format!("Generating Ghost ACF at: {:?}", final_acf_path));
-                
-                // Use potentially overridden install dir name, or default to display name
-                let install_dir = install_dir_name.unwrap_or(name.clone());
+                log(format!("Generating Ghost ACF at: {:?}", acf_path));
 
-                // Pass steam_path so we can calculate steam.exe location for the ACF
-                if let Err(e) = generate_acf(&steam_path, &final_acf_path, &appid, &install_dir, &timestamp) {
+                // Pass steam_root so we can calculate steam.exe location for the ACF
+                let empty_depots = Vec::new();
+                if let Err(e) = generate_acf(&steam_root, &acf_path, &appid, &final_install_dir, &timestamp, &empty_depots, 0) {
                     log(format!("Error writing ACF: {}", e));
                 } else {
                      log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
@@ -1075,6 +1081,8 @@ impl DarkCoreApp {
                 log("Using Vaulted AppManifest.".to_string());
             }
 
+
+
             // STEP 2: TRY MANIFEST (Priority + Vault)
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let mut manifest_success = false;
@@ -1082,8 +1090,9 @@ impl DarkCoreApp {
             let vault = VaultManager::new(".");
 
             // Helper to process ZIP bytes
-            let process_zip = |bytes: Vec<u8>| -> (bool, String) {
+            let process_zip = |bytes: Vec<u8>| -> (bool, String, Vec<std::path::PathBuf>) {
                 let reader = Cursor::new(bytes);
+                let mut manifest_paths = Vec::new();
                 if let Ok(mut zip) = ZipArchive::new(reader) {
                     let depot_dir = Path::new(&steam_path).join("depotcache");
                     if !depot_dir.exists() {
@@ -1096,8 +1105,9 @@ impl DarkCoreApp {
                             if raw_path.ends_with(".manifest") {
                                  if let Some(fname) = Path::new(&raw_path).file_name() {
                                      let out_path = depot_dir.join(fname);
-                                     if let Ok(mut outfile) = std::fs::File::create(out_path) {
+                                     if let Ok(mut outfile) = std::fs::File::create(&out_path) {
                                           let _ = std::io::copy(&mut file, &mut outfile);
+                                          manifest_paths.push(out_path);
                                      }
                                  }
                             } else if raw_path.ends_with(".lua") {
@@ -1106,9 +1116,9 @@ impl DarkCoreApp {
                             }
                         }
                     }
-                    return (true, extracted_lua);
+                    return (true, extracted_lua, manifest_paths);
                 }
-                (false, String::new())
+                (false, String::new(), Vec::new())
             };
 
             // VAULT CHECK
@@ -1145,9 +1155,24 @@ impl DarkCoreApp {
             }
 
             if let Some(bytes) = bytes_opt {
-                let (ok, content) = process_zip(bytes);
+                let (ok, content, paths) = process_zip(bytes);
                 manifest_success = ok;
                 lua_content = content;
+                
+                if !paths.is_empty() {
+                    log(format!("✅ Extracted {} manifests. Backing up to Vault...", paths.len()));
+                    let mut saved_count = 0;
+                    for p in paths {
+                        if vault.store_manifest(&appid, &p).is_ok() {
+                            saved_count += 1;
+                        }
+                    }
+                    if saved_count > 0 {
+                         log(format!("✅ Vault: Secured {}/{} manifests.", saved_count, saved_count));
+                    }
+                } else if ok {
+                    log("Warning: No manifests found in zip bundle.".to_string());
+                }
             }
 
             // STEP 3: PREPARE IDs (Hybrid)
@@ -1156,17 +1181,151 @@ impl DarkCoreApp {
             // 3A. If Manifest/Lua success -> Use Lua IDs (Best)
             if manifest_success && !lua_content.is_empty() {
                 let (all_ids, keys) = parse_lua_for_keys(&lua_content);
+                log(format!("🔑 LUA Analysis: Found {} AppIDs and {} Depot Keys.", all_ids.len(), keys.len()));
+
+                // Debug: Log the keys we found (Masked)
+                for (d_id, d_key) in &keys {
+                    let mask = if d_key.len() > 8 { &d_key[0..8] } else { "???" };
+                    log(format!("   - Key for Depot {}: {}...", d_id, mask));
+                }
+
+                if keys.is_empty() {
+                    log("⚠️ WARNING: No Depot Keys found in LUA! Steam download will likely fail with 'Content Encrypted'.".to_string());
+                }
             
             // VDF Injection (Steam Native)
-            if let Err(e) = inject_vdf(&steam_path, &keys) {
-                log(format!("Steam VDF Error: {}", e));
+            let vdf_file = std::path::Path::new(&steam_root).join("config").join("config.vdf");
+            if !vdf_file.exists() {
+                log(format!("⚠️ CRITICAL WARNING: config.vdf NOT FOUND at {:?}.", vdf_file));
             }
-            
+
+            if let Err(e) = inject_vdf(&steam_root, &keys) {
+                log(format!("Steam VDF Error: {}", e));
+            } else {
+                log(format!("✅ Depot Keys Injected. Verifying persistence in {:?}...", vdf_file));
+                
+                // VERIFICATION: Read back to confirm
+                if let Ok(written_content) = std::fs::read_to_string(&vdf_file) {
+                    let mut all_found = true;
+                    for (d_id, d_key) in &keys {
+                         if !written_content.contains(d_key) {
+                             log(format!("❌ CRITICAL: Key for Depot {} NOT FOUND in config.vdf after write!", d_id));
+                             all_found = false;
+                         }
+                    }
+                    if all_found {
+                        log("✨ SUCCESS: All Depot Keys verified physically present in config.vdf.".to_string());
+                    } else {
+                        log("⚠️ WARNING: Some keys failed to persist. Check permissions or file locks.".to_string());
+                    }
+                } else {
+                    log("❌ Error reading config.vdf for verification.".to_string());
+                }
+            }
+
+            // VDF Injection (User Local Config) - New Fix
+            if let Err(e) = crate::vdf_injector::inject_localconfig_vdf(&steam_root, &keys) {
+                 log(format!("LocalConfig VDF Error: {}", e));
+            } else {
+                 log("✅ Depot Keys Injected into UserData localconfig.vdf.".to_string());
+            }
+
+// --- TACTICAL BYPASS: DepotDownloader ---
+// --- TACTICAL BYPASS: NATIVE DOWNLOADER (Mk3) ---
+            log("⚔️ TACTICAL PROTOCOL: Engaging Native Downloader Bypass (Mk3)...".to_string());
+
+            let full_install_path = std::path::Path::new(&library_path).join("steamapps").join("common").join(&final_install_dir);
+            let install_dir_str = full_install_path.to_string_lossy().to_string();
+
+            // Stats Collection for ACF
+            let mut installed_depots_data: Vec<(String, u64, String)> = Vec::new(); // (DepotID, Size, ManifestID)
+            let mut total_bytes_downloaded: u64 = 0;
+
+            for (d_id, d_key) in &keys {
+                log(format!("⬇️ Processing Depot {}...", d_id));
+
+                // 1. Locate Manifest
+                let mut manifest_path = String::new();
+                let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
+                if let Ok(entries) = std::fs::read_dir(&depot_cache) {
+                    for entry in entries.flatten() {
+                       let fname = entry.file_name().to_string_lossy().to_string();
+                       // Pattern: {depot_id}_{manifest_id}.manifest
+                       if fname.starts_with(d_id) && fname.ends_with(".manifest") {
+                            manifest_path = entry.path().to_string_lossy().to_string();
+                            log(format!("   - Found Manifest: {}", fname));
+                            break;
+                       }
+                    }
+                }
+
+                if !manifest_path.is_empty() {
+                    // 2. Execute Async Downloader via Blocking Runtime
+                    let rt_result = tokio::runtime::Runtime::new();
+                    match rt_result {
+                        Ok(runtime) => {
+                             let mp = manifest_path.clone();
+                             let did = d_id.clone();
+                             let dkey = d_key.clone();
+                             let idir = install_dir_str.clone();
+                             let log_clone = log.clone();
+                             
+                             let res = runtime.block_on(crate::downloader::tactical_download(
+                                 &mp, &did, &dkey, &idir, move |msg| log_clone(msg)
+                             ));
+                             
+                             match res {
+                                 Ok((size, mid)) => {
+                                     log(format!("✅ Depot {} Download Success ({} bytes).", d_id, size));
+                                     installed_depots_data.push((d_id.clone(), size, mid));
+                                     total_bytes_downloaded += size;
+                                 },
+                                 Err(e) => log(format!("❌ Depot {} Download FAILED: {}", d_id, e)),
+                             }
+                        },
+                        Err(e) => log(format!("❌ Failed to start Tokio Runtime: {}", e)),
+                    }
+                } else {
+                    log(format!("❌ Missing Manifest for Depot {}. Cannot download.", d_id));
+                    log("   (Ensure GreenLuma has run at least once to fetch manifest)".to_string());
+                }
+            }
+            log("✨ Tactical Download Phase Ended.".to_string());
+
+            // 4. Generate ACF (Manifest) - FINAL COMMIT
+            // CRITICAL: We regenerate the ACF to update the timestamp and re-assert StateFlags "4" (Installed).
+            {
+                let time_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                let timestamp_end = time_end.to_string();
+                log(format!("Finalizing AppManifest for {}...", appid));
+                
+                if let Err(e) = generate_acf(
+                    &steam_root, &acf_path, &appid, &final_install_dir, &timestamp_end, 
+                    &installed_depots_data, total_bytes_downloaded
+                ) {
+                    log(format!("❌ Final ACF Write Failed: {}", e));
+                } else {
+                     log("✅ AppManifest.acf committed (State: Fully Installed).".to_string());
+                }
+                
+                // NUKE SQUAD: Physically remove installscript.vdf
+                // This prevents Steam from triggering the "SteamService" install phase which fails.
+                let script_path = full_install_path.join("installscript.vdf");
+                if script_path.exists() {
+                     if std::fs::remove_file(&script_path).is_ok() {
+                         log("☢️ NUKE: installscript.vdf deleted to bypass SteamService error.".to_string());
+                     } else {
+                         log("⚠️ Failed to delete installscript.vdf (Permission Denied?).".to_string());
+                     }
+                }
+            }
+
             // VDF Injection (GreenLuma Override)
             // GreenLuma 2025 often uses its own config.vdf in its folder.
             if let Err(e) = inject_vdf(&gl_path, &keys) {
-                 // Not critical if it doesn't exist, but worth trying
                  log(format!("GreenLuma VDF Warning (Non-Fatal): {}", e));
+            } else {
+                 log("✅ Depot Keys Injected into GreenLuma config.".to_string());
             }
 
             // Filter IDs - FIX: Always include ALL IDs from Lua (Depots + DLCs)
@@ -1262,13 +1421,17 @@ impl DarkCoreApp {
                                  std::thread::sleep(std::time::Duration::from_secs(5));
     
                                  // PHASE 3: Trigger Install Trigger
-                                 log("Triggering Installation Command (Phase 2)...".to_string());
+                                 // v1.3 Logic Restoration + v1.4 Refinement (StateFlags 4)
+                                 // We use -applaunch because it's the native Steam method and v1.3 used it successfully.
+                                 // The key is StateFlags=4 which prevents the "Unknown Error" loop.
+                                 
+                                 log("Triggering via -applaunch (v1.3 Style)...".to_string());
                                  let _ = std::process::Command::new(steam_exe)
                                      .arg("-applaunch")
                                      .arg(&appid)
                                      .spawn();
-                                     
-                                 log("✅ INSTALL COMMAND SENT.".to_string());
+
+                                 log("✅ LAUNCH COMMAND SENT.".to_string());
                              },
                              Err(e) => log(format!("❌ LAUNCH FAILED: {}", e)),
                          }
@@ -1369,7 +1532,7 @@ impl eframe::App for DarkCoreApp {
                 
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("MANAGER v1.5")
+                        egui::RichText::new("MANAGER v1.5.0")
                             .size(10.0)
                             .color(accent_pink)
                             .extra_letter_spacing(2.0),
@@ -1790,6 +1953,7 @@ impl DarkCoreApp {
                  let steam_path = self.config.steam_path.clone();
                  let gl_path = self.config.gl_path.clone();
                  let log_arc = self.system_log.clone();
+                 let enable_stealth = self.config.enable_stealth_mode;
 
                  std::thread::spawn(move || {
                      let log = move |msg: String| {
@@ -1811,7 +1975,7 @@ impl DarkCoreApp {
                              
                              // SETUP CONFIG (Create .bin files in GL folder)
                              // Helper function is now public
-                             let _ = crate::ui::setup_greenluma_config(&gl_path);
+                             let _ = crate::ui::setup_greenluma_config(&gl_path, enable_stealth);
 
                              // DIRECT INJECTION (No copying to Steam folder)
                              match crate::injector::launch_injected(
@@ -2035,17 +2199,35 @@ impl DarkCoreApp {
                                                    // Found it -> Resume/Update in place
                                                    self.install_game(display_id.clone(), name.to_string(), Some(path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&self.config.steam_path)).to_path_buf()), None);
                                                } else {
-                                                   // FALLBACK MODE CHECK
-                                                   if self.config.api_key.is_empty() {
-                                                       // NO API KEY -> Family Godmode is the ONLY way
-                                                       self.install_game_family_godmode(display_id.clone());
+                                                   // 2. AUTO-DETECT FOLDER (Smart Scan)
+                                                   // If we can find the folder, we skip the modal entirely.
+                                                   let libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                   let (found_dir, found_lib, confidence) = self.detect_auto_install_path(&name, &libraries);
+
+                                                   if let Some(dir_name) = found_dir {
+                                                       self.log(format!("Auto-Detected Install Dir: '{}' (Confidence: {:?})", dir_name, confidence));
+                                                       // High confidence or exact match -> One-Click Install
+                                                       self.install_game(display_id.clone(), name.to_string(), Some(found_lib.unwrap_or(std::path::Path::new(&self.config.steam_path).to_path_buf())), Some(dir_name));
                                                    } else {
-                                                       // STANDARD MODE -> Modal
-                                                       self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
-                                                       self.selected_library_index = 0;
-                                                       self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                                       self.install_dir_input = name.to_string(); 
-                                                       self.install_modal_open = true;
+                                                       // 3. FALLBACK -> MODAL (Fresh Install / No Trace Found)
+                                                       // Pre-fill with sanitized name for user convenience
+                                                       let sanitized = name.chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect::<String>().trim().to_string();
+                                                       
+                                                       if self.config.api_key.is_empty() {
+                                                           // NO API KEY -> Family Godmode Warning/Offer? No, proceed to manual Install.
+                                                            self.detected_libraries = libraries;
+                                                            self.selected_library_index = 0;
+                                                            self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                            self.install_dir_input = sanitized; 
+                                                            self.install_modal_open = true;
+                                                       } else {
+                                                           // STANDARD MODE -> Modal
+                                                           self.detected_libraries = libraries;
+                                                           self.selected_library_index = 0;
+                                                           self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                           self.install_dir_input = sanitized; 
+                                                           self.install_modal_open = true;
+                                                       }
                                                    }
                                                }
                                             } else {
@@ -2494,6 +2676,7 @@ impl DarkCoreApp {
                       }
                       
                       ui.add_space(15.0);
+
                       ui.horizontal(|ui| {
                           if ui.button("CANCEL").clicked() {
                               self.create_profile_modal_open = false;
@@ -2918,6 +3101,14 @@ impl DarkCoreApp {
             false,
             Some("Steamless.CLI.exe required for DRM analysis.\nSearch for 'Steamless' on GitHub (atom0s)."),
         );
+
+        ui.add_space(5.0);
+        
+        // Settings Toggles
+        ui.horizontal(|ui| {
+             ui.checkbox(&mut self.config.enable_stealth_mode, egui::RichText::new("Enable GreenLuma Stealth Mode").strong());
+             ui.label("ℹ").on_hover_text("Enables 'StealthMode.bin' for GreenLuma.\nDisables some file system hooks to reduce ban risk.\nDisable this if you have issues with downloads or installation errors.");
+        });
 
         ui.add_space(5.0);
 
@@ -3904,9 +4095,82 @@ impl DarkCoreApp {
     }
 }
 
+impl DarkCoreApp {
+    fn detect_auto_install_path(&self, game_name: &str, libraries: &[std::path::PathBuf]) -> (Option<String>, Option<std::path::PathBuf>, String) {
+        // Returns: (DirName, LibraryPath, ConfidenceLevel)
+        let target_tokens = clean_tokenize(game_name);
+        let target_clean = game_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+        
+        let mut best_match: Option<String> = None;
+        let mut best_lib: Option<std::path::PathBuf> = None;
+        let mut best_score = 0;
+
+        for lib in libraries {
+            let common = lib.join("steamapps").join("common");
+            if let Ok(entries) = std::fs::read_dir(common) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                         if let Some(folder_name) = path.file_name().and_then(|s| s.to_str()) {
+                              // Skip Utility Folders
+                              if folder_name.eq_ignore_ascii_case("common") || folder_name.eq_ignore_ascii_case("Steamworks Shared") { continue; }
+
+                              let folder_clean = folder_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "");
+                              
+                              // 1. Exact Match (Sanitized)
+                              if folder_clean == target_clean {
+                                  return (Some(folder_name.to_string()), Some(lib.clone()), "EXACT".to_string());
+                              }
+
+                              // 2. Token Overlap
+                              let folder_tokens = clean_tokenize(folder_name);
+                              let mut overlap = 0;
+                              for t in &target_tokens {
+                                  if folder_tokens.contains(t) { overlap += 1; }
+                              }
+                              
+                              let score = if !target_tokens.is_empty() {
+                                  (overlap * 100) / target_tokens.len()
+                              } else { 0 };
+
+                              if score > best_score && score > 60 {
+                                   best_score = score;
+                                   best_match = Some(folder_name.to_string());
+                                   best_lib = Some(lib.clone());
+                              }
+                         }
+                    }
+                }
+            }
+        }
+        
+        if let Some(dir) = best_match {
+            (Some(dir), best_lib, format!("FUZZY_{}%", best_score))
+        } else {
+            (None, None, "NONE".to_string())
+        }
+    }
+}
+
+// Helper Tokenizer
+fn clean_tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != ' ', " ")
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 // Helper function to write the ACF file content
-// Helper function to write the ACF file content
-pub fn generate_acf(steam_path: &str, acf_path: &std::path::Path, appid: &str, name: &str, timestamp: &str) -> std::io::Result<()> {
+pub fn generate_acf(
+    steam_path: &str, 
+    acf_path: &std::path::Path, 
+    appid: &str, 
+    name: &str, 
+    timestamp: &str,
+    installed_depots: &Vec<(String, u64, String)>,
+    total_size: u64
+) -> std::io::Result<()> {
     // Ensure parent dir exists
     if let Some(parent) = acf_path.parent() {
         if !parent.exists() {
@@ -3917,30 +4181,76 @@ pub fn generate_acf(steam_path: &str, acf_path: &std::path::Path, appid: &str, n
     let steam_exe = std::path::Path::new(steam_path).join("steam.exe");
     let steam_exe_str = steam_exe.to_str().unwrap_or("steam.exe").replace("\\", "\\\\");
 
-    // StateFlags 6 = 4 (Installed) | 2 (UpdateRequired). 
-    // This tricks Steam into thinking the game is installed but needs an update.
+    // Sanitize installdir (Matches SteamDB convention: Remove non-alphanumeric, keep spaces)
+    let install_dir_sanitized: String = name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    // Create the game directory in steamapps/common
+    if let Some(parent) = acf_path.parent() {
+        let common_dir = parent.join("common");
+        let game_dir = common_dir.join(&install_dir_sanitized);
+        if !game_dir.exists() {
+            let _ = std::fs::create_dir_all(&game_dir);
+        }
+    }
+    
+    // Check for InstallScript
+    // Check for InstallScript
+    // BYPASS: We deliberately SKIP injecting the InstallScript to prevent "SteamService.exe" errors.
+    // This assumes the user has standard VCRedists installed.
+    // Use "Repair" to re-generate the ACF without this section if stuck.
+    let install_script_entry = String::new();
+    /*
+    if let Some(parent) = acf_path.parent() {
+         let common_dir = parent.join("common");
+         let game_dir = common_dir.join(&install_dir_sanitized);
+         if game_dir.join("installscript.vdf").exists() {
+             // Heuristic: Usually the first depot ID is the main one that has the script
+             if let Some((first_depot, _, _)) = installed_depots.first() {
+                 install_script_entry = format!("\n\t\"InstallScripts\"\n\t{{\n\t\t\"{}\"		\"installscript.vdf\"\n\t}}", first_depot);
+             }
+         }
+    }
+    */
+
+    // Build InstalledDepots Section
+    let mut depots_section = String::from("\n\t\"InstalledDepots\"\n\t{");
+    for (d_id, d_size, d_manifest) in installed_depots {
+        depots_section.push_str(&format!(r#"
+		"{}"
+		{{
+			"manifest"		"{}"
+			"size"		"{}"
+		}}"#, d_id, d_manifest, d_size));
+    }
+    depots_section.push_str("\n\t}");
+
+    // StateFlags 4 = Fully Installed.
     let content = format!(r#""AppState"
 {{
 	"appid"		"{}"
 	"Universe"		"1"
 	"LauncherPath"		"{}"
 	"name"		"{}"
-	"StateFlags"		"6"
+	"StateFlags"		"4"
 	"installdir"		"{}"
 	"LastUpdated"		"{}"
-	"SizeOnDisk"		"0"
+	"SizeOnDisk"		"{}"
 	"StagingSize"		"0"
 	"buildid"		"0"
 	"LastOwner"		"0"
 	"UpdateResult"		"0"
-	"BytesToDownload"		"0"
-	"BytesDownloaded"		"0"
+	"BytesToDownload"		"{}"
+	"BytesDownloaded"		"{}"
 	"BytesToStage"		"0"
 	"BytesStaged"		"0"
 	"TargetBuildID"		"0"
 	"AutoUpdateBehavior"		"0"
 	"AllowOtherDownloadsWhileRunning"		"0"
-	"ScheduledAutoUpdate"		"0"
+	"ScheduledAutoUpdate"		"0"{}{}
 	"UserConfig"
 	{{
 		"language"		"english"
@@ -3950,30 +4260,58 @@ pub fn generate_acf(steam_path: &str, acf_path: &std::path::Path, appid: &str, n
 		"language"		"english"
 	}}
 }}
-"#, appid, steam_exe_str, name, name, timestamp);
+"#,
+        appid,
+        steam_exe_str.replace("\\", "\\\\"),
+        name,
+        install_dir_sanitized,
+        timestamp,
+        total_size,
+        total_size, // BytesToDownload
+        total_size, // BytesDownloaded
+        depots_section,
+        install_script_entry
+    );
 
-    std::fs::write(acf_path, content)?;
+    std::fs::write(&acf_path, content)?;
     Ok(())
 }
 
 
 
 
-pub fn setup_greenluma_config(gl_path: &str) -> std::io::Result<()> {
+pub fn setup_greenluma_config(gl_path: &str, enable_stealth: bool) -> std::io::Result<()> {
     let path = std::path::Path::new(gl_path);
     if !path.exists() { return Ok(()); }
 
     // GreenLuma uses these empty files as flags for Stealth Mode and NoQuestion
-    let files = ["StealthMode.bin", "NoQuestion.bin"];
-    
+    let files = ["NoQuestion.bin"];
     for f in files.iter() {
         let p = path.join(f);
         if !p.exists() {
-           // Create empty file
-           std::fs::write(&p, "")?;
+           let _ = std::fs::write(&p, "");
         }
-
     }
+    
+    // Stealth Mode Toggle
+    let stealth_bin = path.join("StealthMode.bin");
+    if enable_stealth {
+        if !stealth_bin.exists() {
+            let _ = std::fs::write(&stealth_bin, "");
+        }
+    } else {
+        if stealth_bin.exists() {
+             let _ = std::fs::remove_file(&stealth_bin);
+        }
+    }
+
+    // GreenLuma INI Configuration (Analysis Mode)
+    // To solve "Unknown Error", we need logs from the DLL.
+    let ini_path = path.join("GreenLuma_2025_x64.ini");
+    // LogFile=1 -> Creates GreenLuma_2025_x64.log
+    // ModifyLauncher=1 -> Standard hook
+    let ini_content = "[GreenLuma]\nLogFile=1\nModifyLauncher=1\n";
+    let _ = std::fs::write(&ini_path, ini_content);
     
     Ok(())
 }

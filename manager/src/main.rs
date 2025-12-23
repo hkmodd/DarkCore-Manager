@@ -11,6 +11,7 @@ mod injector;
 mod ui;
 mod vdf_injector;
 mod vault;
+mod downloader;
 
 use ui::DarkCoreApp;
 
@@ -32,7 +33,7 @@ async fn main() -> Result<(), eframe::Error> {
             .with_inner_size([1280.0, 950.0]) // Optimized for 1080p+ and Sidebar content
             .with_min_inner_size([1100.0, 720.0])
             .with_resizable(true)
-            .with_title("DarkCore Manager v1.4");
+            .with_title("DarkCore Manager v1.5.0");
 
     let viewport = if let Some(icon) = icon_data {
         viewport.with_icon(icon)

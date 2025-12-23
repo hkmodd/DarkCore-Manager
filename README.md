@@ -119,6 +119,7 @@ When a valid key is detected, DarkCore enforces **Strict Validation**, preventin
 ### ⚡ Technical Highlights
 *   **Rust Native**: Compiled to machine code. Zero interpreter overhead. 15.1MB standalone binary.
 *   **Project Neon UI**: Rebuilt with a "Glass & Glow" design language. Features a fixed Sidebar navigation, adaptive layouts, and 250ms fade animations for a premium feel.
+*   **One-Click Installation**: New smart detection algorithm scans library folders to auto-fill installation paths, skipping manual inputs for repair workflows.
 *   **Audio-Reactive**: Custom "Neon Wave" volume control with real-time spectrum visualization and scroll interaction.
 *   **Secure Sandbox**: API Key inputs feature a "Glitch" security visualization, confirming data protection with style.
 *   **Zero-Compromise Engineering**: The entire codebase (Manager + Titan) compiles with **0 Warnings** and **0 Errors**, adhering to strict Rust 2024 standards.

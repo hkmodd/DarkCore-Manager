@@ -15,6 +15,9 @@ pub struct AppConfig {
 
     #[serde(default = "default_vec")]
     pub family_godmode_ids: Vec<String>,
+
+    #[serde(default = "default_true")]
+    pub enable_stealth_mode: bool,
 }
 
 fn default_profile() -> String {
@@ -23,6 +26,10 @@ fn default_profile() -> String {
 
 fn default_vec() -> Vec<String> {
     Vec::new()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -34,6 +41,7 @@ impl Default for AppConfig {
             steamless_path: String::new(),
             last_active_profile: "Default".to_string(),
             family_godmode_ids: Vec::new(),
+            enable_stealth_mode: true,
         }
     }
 }
@@ -69,6 +77,30 @@ pub fn save_config(config: &AppConfig) -> Result<(), std::io::Error> {
 }
 
 fn find_default_steam() -> Option<String> {
+    // 1. Try Registry (Most Reliable)
+    let keys = [
+        ("SOFTWARE\\WOW6432Node\\Valve\\Steam", "InstallPath"), // x64 OS
+        ("SOFTWARE\\Valve\\Steam", "InstallPath"),              // x86 OS
+    ];
+
+    for (key_path, value_name) in keys.iter() {
+        if let Ok(hk_lm) = std::process::Command::new("reg")
+            .args(&["query", &format!("HKLM\\{}", key_path), "/v", value_name])
+            .output()
+        {
+            let out = String::from_utf8_lossy(&hk_lm.stdout);
+            // Reg query output format: ... REG_SZ    C:\Program Files (x86)\Steam
+            if let Some(pos) = out.find("REG_SZ") {
+                let path_part = out[pos + 6..].trim();
+                let path_str = path_part.to_string();
+                if Path::new(&path_str).exists() {
+                    return Some(path_str);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to Common Paths
     let paths = [r"C:\Program Files (x86)\Steam", r"C:\Program Files\Steam"];
     for p in paths {
         if Path::new(p).exists() {
