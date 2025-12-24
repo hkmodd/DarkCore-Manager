@@ -15,7 +15,7 @@
     <b>High-Performance. Memory-Safe. Cyberpunk Aesthetics.</b>
   </p>
 
-# 🌌 DarkCore Manager v1.4
+# 🌌 DarkCore Manager v1.5
 
 > **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
