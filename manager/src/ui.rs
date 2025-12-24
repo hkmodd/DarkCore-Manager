@@ -1726,13 +1726,81 @@ impl eframe::App for DarkCoreApp {
                 if alpha < 1.0 {
                     ui.ctx().request_repaint();
                 }
-                // WARNING
+                // WARNING - SUPER ANIMATED CONFIGURATION REQUIRED
                 if self.config.steam_path.is_empty() || self.config.gl_path.is_empty() {
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("⚠️ CONFIGURATION REQUIRED").color(egui::Color32::RED).strong());
-                        ui.label("Please go to Settings and configure paths.");
-                    });
-                    ui.add_space(20.0);
+                    let time = ui.input(|i| i.time);
+                    
+                    // Pulsing red glow effect
+                    let pulse = ((time * 3.0).sin() * 0.5 + 0.5) as f32;
+                    let glow_alpha = (pulse * 100.0) as u8 + 50;
+                    let border_color = egui::Color32::from_rgba_unmultiplied(255, 50, 50, glow_alpha + 100);
+                    let bg_color = egui::Color32::from_rgba_unmultiplied(80, 0, 0, glow_alpha);
+                    
+                    // Animated border thickness
+                    let border_width = 2.0 + pulse * 2.0;
+                    
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .stroke(egui::Stroke::new(border_width, border_color))
+                        .rounding(8.0)
+                        .inner_margin(15.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                // Animated warning icon (alternating)
+                                let icon = if (time * 2.0) as i32 % 2 == 0 { "⚠" } else { "🔧" };
+                                ui.label(
+                                    egui::RichText::new(icon)
+                                        .size(28.0)
+                                        .color(egui::Color32::from_rgb(255, (100.0 + pulse * 155.0) as u8, 50))
+                                );
+                                
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("CONFIGURATION REQUIRED")
+                                            .size(18.0)
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(255, (200.0 - pulse * 100.0) as u8, (200.0 - pulse * 100.0) as u8))
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Steam and GreenLuma paths must be configured.")
+                                            .size(12.0)
+                                            .color(egui::Color32::from_gray(180))
+                                    );
+                                });
+                                
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    // Animated button with glow
+                                    let btn_color = egui::Color32::from_rgb(
+                                        (100.0 + pulse * 155.0) as u8,
+                                        255,
+                                        (100.0 + pulse * 155.0) as u8
+                                    );
+                                    
+                                    let btn = ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("⚙ GO TO SETTINGS")
+                                                .size(14.0)
+                                                .strong()
+                                                .color(egui::Color32::BLACK)
+                                        )
+                                        .fill(btn_color)
+                                        .rounding(6.0)
+                                    );
+                                    
+                                    if btn.clicked() {
+                                        self.active_tab = 4; // Settings tab
+                                        self.tab_changed_at = std::time::Instant::now();
+                                    }
+                                    
+                                    if btn.hovered() {
+                                        ui.ctx().request_repaint();
+                                    }
+                                });
+                            });
+                        });
+                    
+                    ui.add_space(15.0);
+                    ui.ctx().request_repaint(); // Keep animating
                 }
 
                 // CONTENT
@@ -3123,6 +3191,11 @@ impl DarkCoreApp {
                     } else {
                         egui::Color32::RED
                     };
+                    // Auto-clean UNC prefix if present
+                    if txt.starts_with(r"\\?\") {
+                        *txt = txt.replace(r"\\?\", "");
+                    }
+
                     ui.add(
                         egui::TextEdit::singleline(txt)
                             .desired_width(400.0)
@@ -3131,14 +3204,16 @@ impl DarkCoreApp {
                     if ui.button("📂").clicked() {
                         if is_dir {
                             if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                *txt = path.to_string_lossy().to_string();
+                                let p_str = path.to_string_lossy().to_string();
+                                *txt = p_str.replace(r"\\?\", "");
                             }
                         } else {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("exe", &["exe"])
                                 .pick_file()
                             {
-                                *txt = path.to_string_lossy().to_string();
+                                let p_str = path.to_string_lossy().to_string();
+                                *txt = p_str.replace(r"\\?\", "");
                             }
                         }
                     }
