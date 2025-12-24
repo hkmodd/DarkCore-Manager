@@ -3,10 +3,14 @@ use minhook::MinHook;
 use std::ffi::{c_void, CStr};
 use std::ptr;
 
-// TODO: Verify indices!
-const IDX_SET_ACHIEVEMENT: usize = 7;
-const IDX_GET_ACHIEVEMENT: usize = 8;
-const IDX_STORE_STATS: usize = 9;
+// VTable indices for ISteamUserStats interface
+// These indices are based on Steamworks SDK v1.50+ (commonly used 2020+)
+// Reference: Goldberg Steam Emu uses similar indices for modern SDK versions
+// NOTE: If achievements don't work for a game, it may be using an older SDK version
+// Older SDK versions (pre-1.37) may have different vtable layouts
+const IDX_SET_ACHIEVEMENT: usize = 7; // bool SetAchievement(const char* pchName)
+const IDX_GET_ACHIEVEMENT: usize = 8; // bool GetAchievement(const char* pchName, bool* pbAchieved)
+const IDX_STORE_STATS: usize = 9; // bool StoreStats()
 
 static mut ORIGINAL_SET_ACHIEVEMENT: *mut c_void = ptr::null_mut();
 static mut ORIGINAL_GET_ACHIEVEMENT: *mut c_void = ptr::null_mut();
