@@ -11,7 +11,8 @@ mod injector;
 mod ui;
 mod vdf_injector;
 mod vault;
-mod downloader;
+// REMOVED: mod downloader (switched to SMD approach - Steam downloads files)
+// REMOVED: mod manifest_parser (unused native parser)
 
 use ui::DarkCoreApp;
 

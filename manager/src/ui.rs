@@ -43,7 +43,8 @@ pub struct DarkCoreApp {
     update_cache: Arc<Mutex<HashMap<String, bool>>>,
     relationships: Arc<Mutex<crate::app_list::RelationshipMap>>, // New Relationship Map
 
-    // Steamless
+    // Legacy: Steamless DRM tab fields (now integrated into Library)
+    #[allow(dead_code)]
     target_exe: String,
 
     // Options
@@ -110,8 +111,10 @@ pub struct DarkCoreApp {
     audio_sink: Option<rodio::Sink>,
     volume: f32,
 
-    // Steamless Context
+    // Legacy: Steamless Context (DRM tab removed - now in Library)
+    #[allow(dead_code)]
     steamless_app_id: String,
+    #[allow(dead_code)]
     steamless_auto_titan: bool,
 
     user_stats: Arc<Mutex<Option<crate::api::UserStats>>>,
@@ -969,6 +972,7 @@ impl DarkCoreApp {
         let api_key = self.config.api_key.clone(); // Keep this for API client creation inside thread
         let relationships_arc = self.relationships.clone(); // New: Capture relationships map for thread
         let enable_stealth = self.config.enable_stealth_mode;
+        let user_stats_arc = self.user_stats.clone(); // For refreshing token count after download
         
         // Use Arc/Mutex for status updates
         let status_queue = self.status_update_queue.clone();
@@ -1031,7 +1035,7 @@ impl DarkCoreApp {
 
             // STEP 1.5: GHOST INSTALLATION -> GENERATE ACF
             let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            let timestamp = time.to_string(); 
+            let _timestamp = time.to_string(); 
 
             let acf_filename = format!("appmanifest_{}.acf", appid);
             let acf_path = std::path::Path::new(&library_path).join("steamapps").join(&acf_filename);
@@ -1068,14 +1072,14 @@ impl DarkCoreApp {
             }
 
             if !skip_ghost {
-                log(format!("Generating Ghost ACF at: {:?}", acf_path));
+                log(format!("Generating Ghost ACF (SMD-Style) at: {:?}", acf_path));
 
-                // Pass steam_root so we can calculate steam.exe location for the ACF
-                let empty_depots = Vec::new();
-                if let Err(e) = generate_acf(&steam_root, &acf_path, &appid, &final_install_dir, &timestamp, &empty_depots, 0) {
+                // Use SMD-style minimal ACF (5 fields only)
+                // This matches exactly what SMD does - Steam will fill in the rest during download
+                if let Err(e) = generate_smd_style_acf(&acf_path, &appid, &final_install_dir) {
                     log(format!("Error writing ACF: {}", e));
                 } else {
-                     log("Ghost ACF generated. Steam will see game as 'Update Required'.".to_string());
+                     log("Ghost ACF generated (SMD-Style). Steam will see game as 'Update Required'.".to_string());
                 }
             } else {
                 log("Using Vaulted AppManifest.".to_string());
@@ -1142,6 +1146,13 @@ impl DarkCoreApp {
                              // EXTRA: Backup Depots
                              if let Ok(c) = vault.backup_manifests(&steam_path, &appid) {
                                   if c > 0 { log(format!("Vault: Secured {} local depot manifests.", c)); }
+                             }
+                             
+                             // AUTO-REFRESH TOKEN COUNTER (so user sees updated count immediately)
+                             if let Ok(new_stats) = runtime.block_on(client.get_user_stats()) {
+                                 if let Ok(mut stats) = user_stats_arc.lock() {
+                                     *stats = Some(new_stats);
+                                 }
                              }
                          }
                          bytes_opt = Some(bytes.to_vec());
@@ -1235,17 +1246,19 @@ impl DarkCoreApp {
             log("⚔️ TACTICAL PROTOCOL: Engaging Native Downloader Bypass (Mk3)...".to_string());
 
             let full_install_path = std::path::Path::new(&library_path).join("steamapps").join("common").join(&final_install_dir);
-            let install_dir_str = full_install_path.to_string_lossy().to_string();
+            let _install_dir_str = full_install_path.to_string_lossy().to_string();
 
             // Stats Collection for ACF
-            let mut installed_depots_data: Vec<(String, u64, String)> = Vec::new(); // (DepotID, Size, ManifestID)
-            let mut total_bytes_downloaded: u64 = 0;
+            let _installed_depots_data: Vec<(String, u64, String)> = Vec::new(); // (DepotID, Size, ManifestID)
+            let _total_bytes_downloaded: u64 = 0;
 
-            for (d_id, d_key) in &keys {
+            for (d_id, _d_key) in &keys {
                 log(format!("⬇️ Processing Depot {}...", d_id));
 
-                // 1. Locate Manifest
+                // 1. Locate Manifest (check multiple locations)
                 let mut manifest_path = String::new();
+                
+                // 1a. Check Steam depotcache first (primary location)
                 let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
                 if let Ok(entries) = std::fs::read_dir(&depot_cache) {
                     for entry in entries.flatten() {
@@ -1253,69 +1266,61 @@ impl DarkCoreApp {
                        // Pattern: {depot_id}_{manifest_id}.manifest
                        if fname.starts_with(d_id) && fname.ends_with(".manifest") {
                             manifest_path = entry.path().to_string_lossy().to_string();
-                            log(format!("   - Found Manifest: {}", fname));
+                            log(format!("   - Found Manifest (depotcache): {}", fname));
                             break;
                        }
                     }
                 }
-
-                if !manifest_path.is_empty() {
-                    // 2. Execute Async Downloader via Blocking Runtime
-                    let rt_result = tokio::runtime::Runtime::new();
-                    match rt_result {
-                        Ok(runtime) => {
-                             let mp = manifest_path.clone();
-                             let did = d_id.clone();
-                             let dkey = d_key.clone();
-                             let idir = install_dir_str.clone();
-                             let log_clone = log.clone();
-                             
-                             let res = runtime.block_on(crate::downloader::tactical_download(
-                                 &mp, &did, &dkey, &idir, move |msg| log_clone(msg)
-                             ));
-                             
-                             match res {
-                                 Ok((size, mid)) => {
-                                     log(format!("✅ Depot {} Download Success ({} bytes).", d_id, size));
-                                     installed_depots_data.push((d_id.clone(), size, mid));
-                                     total_bytes_downloaded += size;
-                                 },
-                                 Err(e) => log(format!("❌ Depot {} Download FAILED: {}", d_id, e)),
-                             }
-                        },
-                        Err(e) => log(format!("❌ Failed to start Tokio Runtime: {}", e)),
+                
+                // 1b. Check Vault folder (cached from previous API downloads)
+                if manifest_path.is_empty() {
+                    let vault_dir = std::path::Path::new("Vault").join(&appid);
+                    if vault_dir.exists() {
+                        if let Ok(entries) = std::fs::read_dir(&vault_dir) {
+                            for entry in entries.flatten() {
+                               let fname = entry.file_name().to_string_lossy().to_string();
+                               if fname.starts_with(d_id) && fname.ends_with(".manifest") {
+                                    manifest_path = entry.path().to_string_lossy().to_string();
+                                    log(format!("   - Found Manifest (Vault): {}", fname));
+                                    break;
+                               }
+                            }
+                        }
                     }
+                }
+
+                // NOTE: Per-depot API download REMOVED.
+                // The API at /api/v1/manifest/ expects APP_ID, not DEPOT_ID.
+                // Calling it with depot_id wastes tokens and returns wrong data.
+                // All manifests should be included in the main app bundle.
+                // If a manifest is missing here, it means:
+                // 1. The app bundle from API doesn't include this depot
+                // 2. Steam will need to fetch it during the download phase
+
+
+                // SMD APPROACH: We do NOT download chunks ourselves.
+                // Manifests are already in depotcache, keys are in config.vdf.
+                // Steam will handle the actual download when the user clicks "Update" in library.
+                if !manifest_path.is_empty() {
+                    log(format!("📦 Manifest prepared for Depot {}: {}", d_id, manifest_path));
                 } else {
-                    log(format!("❌ Missing Manifest for Depot {}. Cannot download.", d_id));
-                    log("   (Ensure GreenLuma has run at least once to fetch manifest)".to_string());
+                    log(format!("⚠️ No manifest found for Depot {}. Steam may need to fetch it.", d_id));
                 }
             }
-            log("✨ Tactical Download Phase Ended.".to_string());
+            log("✅ SMD-Style Preparation Complete. Manifests + Keys Ready.".to_string());
+            log("   → Steam will download the game files when you click 'Update' in the Library.".to_string());
 
-            // 4. Generate ACF (Manifest) - FINAL COMMIT
-            // CRITICAL: We regenerate the ACF to update the timestamp and re-assert StateFlags "4" (Installed).
+            // SMD APPROACH: We do NOT regenerate the ACF here.
+            // The minimal ACF was already created at the start.
+            // Steam will update it automatically during the download process.
+            
+            // NUKE SQUAD: Preemptively remove installscript.vdf if it exists in the game folder
+            // This prevents Steam from triggering the "SteamService" install phase which often fails.
             {
-                let time_end = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-                let timestamp_end = time_end.to_string();
-                log(format!("Finalizing AppManifest for {}...", appid));
-                
-                if let Err(e) = generate_acf(
-                    &steam_root, &acf_path, &appid, &final_install_dir, &timestamp_end, 
-                    &installed_depots_data, total_bytes_downloaded
-                ) {
-                    log(format!("❌ Final ACF Write Failed: {}", e));
-                } else {
-                     log("✅ AppManifest.acf committed (State: Fully Installed).".to_string());
-                }
-                
-                // NUKE SQUAD: Physically remove installscript.vdf
-                // This prevents Steam from triggering the "SteamService" install phase which fails.
                 let script_path = full_install_path.join("installscript.vdf");
                 if script_path.exists() {
                      if std::fs::remove_file(&script_path).is_ok() {
                          log("☢️ NUKE: installscript.vdf deleted to bypass SteamService error.".to_string());
-                     } else {
-                         log("⚠️ Failed to delete installscript.vdf (Permission Denied?).".to_string());
                      }
                 }
             }
@@ -1581,7 +1586,7 @@ impl eframe::App for DarkCoreApp {
                 nav_btn("INSTALL", "🚀", 0);
                 nav_btn("LIBRARY", "📂", 2);
                 // nav_btn("PROFILES", "💾", 3); // Removed
-                nav_btn("DRM INTEL", "🔍", 1);
+                // nav_btn("DRM INTEL", "🔍", 1); // MOVED: Steamless now integrated into Library
                 nav_btn("SETTINGS", "⚙", 4);
                 nav_btn("ABOUT", "💻", 5);
 
@@ -1733,7 +1738,7 @@ impl eframe::App for DarkCoreApp {
                 // CONTENT
                 match self.active_tab {
                     0 => self.ui_installation(ui),
-                    1 => self.ui_drm(ui),
+                    // 1 was DRM INTEL - now integrated into Library per-game
                     2 => self.ui_library(ui),
                     // 3 was Profiles
                     4 => self.ui_settings(ui),
@@ -2485,8 +2490,10 @@ impl DarkCoreApp {
 
 
 
+    // Legacy: Manual DRM INTEL tab (functionality migrated to Library per-game)
+    #[allow(dead_code)]
     fn ui_drm(&mut self, ui: &mut egui::Ui) {
-        ui.heading("STEAMLESS DRM REMOVAL");
+        ui.heading("STEAMLESS AUTOMATION");
         ui.add_space(10.0);
 
         ui.label("Target Executable:");
@@ -2901,8 +2908,11 @@ impl DarkCoreApp {
                                     // TITAN MODE CHECK
                                     let steam_path = self.config.steam_path.clone();
                                     
+                                    // SKIP Steamless/Titan for Family Shared games
+                                    let is_family_shared = self.config.family_godmode_ids.contains(&game.app_id);
+                                    
                                     // Use helper methods from game_path.rs
-                                    if crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id).is_some() {
+                                    if !is_family_shared && crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id).is_some() {
                                         if crate::game_path::GamePathFinder::is_titan_active(&steam_path, &game.app_id) {
                                             ui.label(
                                                 egui::RichText::new("✅ TITAN ACTIVE")
@@ -2988,6 +2998,61 @@ impl DarkCoreApp {
                                                 }
                                             }
                                         }
+                                        
+                                        // STEAMLESS AUTOMATION BUTTON
+                                        let steamless_btn = ui.button(
+                                            egui::RichText::new("⚡ STEAMLESS")
+                                                .color(egui::Color32::from_rgb(255, 150, 0))
+                                                .size(10.0)
+                                        ).on_hover_text("Auto-patch all DRM-protected EXEs in game folder.\nGenerates steam_appid.txt for Titan.");
+                                        
+                                        if steamless_btn.clicked() {
+                                            if let Some(game_path) = crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id) {
+                                                let steamless_cli = self.config.steamless_path.clone();
+                                                let app_id = game.app_id.clone();
+                                                let log_arc = self.system_log.clone();
+                                                
+                                                if steamless_cli.is_empty() || !std::path::Path::new(&steamless_cli).exists() {
+                                                    self.log("❌ Steamless CLI not configured. Go to Settings.".to_string());
+                                                } else {
+                                                    // Log start
+                                                    self.log(format!("⚡ Starting Steamless on: {:?}", game_path));
+                                                    
+                                                    // Find all EXEs first (for logging)
+                                                    let exes = crate::steamless::find_game_executables(&game_path);
+                                                    self.log(format!("   Found {} potential game executables", exes.len()));
+                                                    
+                                                    // Run in thread to not block UI
+                                                    let path_clone = game_path.clone();
+                                                    std::thread::spawn(move || {
+                                                        let log = move |msg: String| {
+                                                            if let Ok(mut logs) = log_arc.lock() {
+                                                                logs.push(msg);
+                                                            }
+                                                        };
+                                                        
+                                                        let (success, total, results) = crate::steamless::run_steamless_folder(
+                                                            &path_clone,
+                                                            &steamless_cli,
+                                                            &app_id,
+                                                        );
+                                                        
+                                                        // Log results
+                                                        for r in results {
+                                                            if r.success {
+                                                                log(format!("   ✅ {}: {}", r.exe_path, r.message));
+                                                            } else {
+                                                                log(format!("   ⚠️ {}: {}", r.exe_path, r.message));
+                                                            }
+                                                        }
+                                                        
+                                                        log(format!("⚡ Steamless Complete: {}/{} EXEs patched", success, total));
+                                                    });
+                                                }
+                                            } else {
+                                                self.log("❌ Game folder not found. Is it installed?".to_string());
+                                            }
+                                        }
                                     } else {
                                          // Not installed or check if DLC
                                          if game.parent_id.is_some() || self.is_probable_dlc(&game.name) {
@@ -3002,6 +3067,13 @@ impl DarkCoreApp {
                                                     .color(egui::Color32::from_rgb(150, 150, 255))
                                                     .size(10.0)
                                             ).on_hover_text("Detected as Downloadable Content (Linked to Parent).");
+                                         } else if is_family_shared {
+                                             // Family Shared game - show special label
+                                             ui.label(
+                                                 egui::RichText::new("👨‍👩‍👧 FAMILY GODMODE")
+                                                     .color(egui::Color32::from_rgb(100, 255, 255))
+                                                     .size(10.0)
+                                             ).on_hover_text("Game activated via Steam Family Sharing.\nNo patching needed - works natively!");
                                          } else {
                                              ui.label(
                                                  egui::RichText::new("NOT INSTALLED")
@@ -3855,6 +3927,8 @@ impl DarkCoreApp {
         false
     }
 
+    // Legacy: Called from old DRM INTEL tab
+    #[allow(dead_code)]
     fn deploy_titan_auto(&mut self, app_id: &str) {
         let steam_path = self.config.steam_path.clone();
         
@@ -4162,6 +4236,9 @@ fn clean_tokenize(text: &str) -> Vec<String> {
 }
 
 // Helper function to write the ACF file content
+// DEPRECATED: Use generate_smd_style_acf instead for minimal ACF (SMD approach)
+// Kept for potential future use if detailed ACF generation is needed
+#[allow(dead_code)]
 pub fn generate_acf(
     steam_path: &str, 
     acf_path: &std::path::Path, 
@@ -4271,6 +4348,70 @@ pub fn generate_acf(
         total_size, // BytesDownloaded
         depots_section,
         install_script_entry
+    );
+
+    std::fs::write(&acf_path, content)?;
+    Ok(())
+}
+
+/// Generate a MINIMAL ACF file matching SMD's format exactly.
+/// This creates a "ghost" ACF that tells Steam the game needs to be downloaded.
+/// Steam will populate all the other fields (InstalledDepots, etc.) during download.
+/// 
+/// SMD Reference (smd/lua/writer.py lines 35-44):
+/// ```python
+/// acf_contents = {
+///     "AppState": {
+///         "AppID": lua.app_id,
+///         "Universe": "1",
+///         "name": app_name,
+///         "installdir": sanitize_filename(app_name),
+///         "StateFlags": "4",
+///     }
+/// }
+/// ```
+pub fn generate_smd_style_acf(
+    acf_path: &std::path::Path, 
+    appid: &str, 
+    game_name: &str,
+) -> std::io::Result<()> {
+    // Ensure parent dir exists
+    if let Some(parent) = acf_path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
+    // Sanitize installdir (Remove non-alphanumeric except spaces, similar to pathvalidate)
+    let install_dir_sanitized: String = game_name.chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    // Create the game directory in steamapps/common (Steam expects this to exist)
+    if let Some(parent) = acf_path.parent() {
+        let common_dir = parent.join("common");
+        let game_dir = common_dir.join(&install_dir_sanitized);
+        if !game_dir.exists() {
+            let _ = std::fs::create_dir_all(&game_dir);
+        }
+    }
+
+    // MINIMAL ACF - Exactly 5 fields like SMD
+    // StateFlags "4" = Fully Installed (tells Steam game is ready but needs update)
+    let content = format!(r#""AppState"
+{{
+	"appid"		"{}"
+	"Universe"		"1"
+	"name"		"{}"
+	"installdir"		"{}"
+	"StateFlags"		"4"
+}}
+"#,
+        appid,
+        game_name,
+        install_dir_sanitized,
     );
 
     std::fs::write(&acf_path, content)?;

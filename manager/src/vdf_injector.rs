@@ -157,16 +157,44 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
     let mut ids = Vec::new();
     let mut keys = HashMap::new();
 
-    // Regex: addappid\s*\(\s*(\d+)(?:[^)]*?["']([a-fA-F0-9]{64})["'])?
-    let re = Regex::new(r#"addappid\s*\(\s*(\d+)(?:[^)]*?["']([a-fA-F0-9]{64})["'])?"#).unwrap();
+    // Primary Regex: addappid(depot_id, flag, "key") - 3 argument format (SMD Compatible)
+    // Example: addappid(228989, 1, "ad69276eabc12345...")
+    let re_3arg =
+        Regex::new(r#"addappid\s*\(\s*(\d+)\s*,\s*\d+\s*,\s*["']([a-fA-F0-9]{64})["']"#).unwrap();
 
-    for cap in re.captures_iter(lua_content) {
-        if let Some(id_match) = cap.get(1) {
+    // Fallback Regex: addappid(depot_id, "key") - 2 argument format (some older LUA files)
+    let re_2arg = Regex::new(r#"addappid\s*\(\s*(\d+)\s*,\s*["']([a-fA-F0-9]{64})["']"#).unwrap();
+
+    // Simple ID-only Regex: addappid(depot_id) - just the ID, no key
+    let re_id_only = Regex::new(r#"addappid\s*\(\s*(\d+)"#).unwrap();
+
+    // First pass: Extract 3-arg matches (most reliable)
+    for cap in re_3arg.captures_iter(lua_content) {
+        if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
             let id = id_match.as_str().to_string();
             ids.push(id.clone());
+            keys.insert(id, key_match.as_str().to_string());
+        }
+    }
 
-            if let Some(key_match) = cap.get(2) {
+    // Second pass: Extract 2-arg matches (fallback)
+    for cap in re_2arg.captures_iter(lua_content) {
+        if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
+            let id = id_match.as_str().to_string();
+            if !keys.contains_key(&id) {
+                // Don't overwrite 3-arg results
+                ids.push(id.clone());
                 keys.insert(id, key_match.as_str().to_string());
+            }
+        }
+    }
+
+    // Third pass: Extract ID-only (for DLCs without keys)
+    for cap in re_id_only.captures_iter(lua_content) {
+        if let Some(id_match) = cap.get(1) {
+            let id = id_match.as_str().to_string();
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
     }

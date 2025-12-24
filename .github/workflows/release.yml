@@ -30,14 +30,14 @@ jobs:
         mkdir DarkCore-Release
         copy target\release\darkcore-manager.exe DarkCore-Release\
         copy target\release\titan_hook.dll DarkCore-Release\Titan_Hook.dll
-        7z a -tzip -mx=9 DarkCore-Manager-v${{ github.ref_name }}.zip .\DarkCore-Release\*
+        7z a -tzip -mx=9 DarkCore-Manager-${{ github.ref_name }}.zip .\DarkCore-Release\*
 
     - name: Create Release
       id: create_release
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          DarkCore-Manager-v${{ github.ref_name }}.zip
+          DarkCore-Manager-${{ github.ref_name }}.zip
         name: Release ${{ github.ref_name }}
         draft: false
         prerelease: false
