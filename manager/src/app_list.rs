@@ -86,7 +86,19 @@ pub fn refresh_active_games_list(
                     .cloned()
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                // Fix Unknown Label if it's a Depot
+                // 1. Smart Naming: Resolve Parent Name ONLY if current name is Unknown
+                // This preserves known DLC names (e.g., "CoD: BO3 - Multiplayer Starter Pack")
+                // while still grouping unknown depots with their parent game
+                if name == "Unknown" {
+                    if let Some(parent_id) = relationships.get(&app_id) {
+                        if let Some(parent_name) = cache.get(parent_id) {
+                            name = format!("{} (Content)", parent_name);
+                        }
+                        // If parent not in cache, fall through to Depot fallback
+                    }
+                }
+
+                // 2. Fallback to Depot ID if still unknown and present in depotcache/
                 if name == "Unknown" && depot_ids.contains(&app_id) {
                     name = format!("Depot ({})", app_id);
                 }
@@ -242,65 +254,7 @@ pub fn overwrite_app_list(gl_path: &str, new_ids: Vec<String>) -> Result<(), std
     Ok(())
 }
 
-pub fn nuke_unknowns(
-    gl_path: &str,
-    cache: &std::collections::HashMap<String, String>,
-    relationships: &RelationshipMap,
-) -> Result<usize, std::io::Error> {
-    let al_path = Path::new(gl_path).join("AppList");
-    if !al_path.exists() {
-        return Ok(0);
-    }
-
-    let mut entries = Vec::new();
-    let mut nuked_count = 0;
-
-    // 1. Read Valid IDs
-    let pattern = al_path.join("*.txt");
-    if let Ok(paths) = glob(&pattern.to_string_lossy()) {
-        for path in paths.flatten() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let aid = content.trim().to_string();
-
-                // INTELLIGENT FILTER
-                let name = cache.get(&aid).map(|s| s.as_str()).unwrap_or("Unknown");
-                let is_unknown = name == "Unknown" || name.starts_with("Depot (");
-                let is_linked_dlc = relationships.contains_key(&aid);
-
-                // RULE: If it's Unknown/Depot AND NOT LINKED -> NUKE IT
-                if is_unknown && !is_linked_dlc {
-                    nuked_count += 1;
-                    let _ = fs::remove_file(&path);
-                    continue;
-                }
-
-                entries.push(aid);
-            }
-            let _ = fs::remove_file(&path);
-        }
-    }
-
-    // 2. Re-sort (Alphabetical)
-    entries.sort_by(|a, b| {
-        let name_a = cache.get(a).map(|s| s.as_str()).unwrap_or("zzz_unknown");
-        let name_b = cache.get(b).map(|s| s.as_str()).unwrap_or("zzz_unknown");
-        let name_cmp = name_a.to_lowercase().cmp(&name_b.to_lowercase());
-        if name_cmp != std::cmp::Ordering::Equal {
-            return name_cmp;
-        }
-        a.cmp(b)
-    });
-
-    entries.dedup();
-
-    // 3. Write Back
-    for (i, aid) in entries.iter().enumerate() {
-        let text_path = al_path.join(format!("{}.txt", i));
-        fs::write(text_path, aid)?;
-    }
-
-    Ok(nuked_count)
-}
+// function nuke_unknowns removed (Obsolete logic replaced by Smart Naming + Linked Deletion)
 
 pub fn remove_games_from_list(
     gl_path: &str,

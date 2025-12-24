@@ -1093,34 +1093,46 @@ impl DarkCoreApp {
             let mut lua_content = String::new();
             let vault = VaultManager::new(".");
 
-            // Helper to process ZIP bytes
-            let process_zip = |bytes: Vec<u8>| -> (bool, String, Vec<std::path::PathBuf>) {
+            // Helper to process ZIP bytes - ENHANCED LOGGING
+            let process_zip = |bytes: Vec<u8>, log_fn: &dyn Fn(String)| -> (bool, String, Vec<std::path::PathBuf>) {
                 let reader = Cursor::new(bytes);
                 let mut manifest_paths = Vec::new();
                 if let Ok(mut zip) = ZipArchive::new(reader) {
+                    log_fn(format!("📦 ZIP contains {} files:", zip.len()));
+                    
                     let depot_dir = Path::new(&steam_path).join("depotcache");
                     if !depot_dir.exists() {
                          let _ = std::fs::create_dir_all(&depot_dir);
                     }
+                    log_fn(format!("   Depot cache dir: {:?}", depot_dir));
+                    
                     let mut extracted_lua = String::new();
                     for i in 0..zip.len() {
                         if let Ok(mut file) = zip.by_index(i) {
                             let raw_path = file.name().to_string();
+                            log_fn(format!("   [{}] {}", i, raw_path));
+                            
                             if raw_path.ends_with(".manifest") {
                                  if let Some(fname) = Path::new(&raw_path).file_name() {
                                      let out_path = depot_dir.join(fname);
                                      if let Ok(mut outfile) = std::fs::File::create(&out_path) {
-                                          let _ = std::io::copy(&mut file, &mut outfile);
+                                          let bytes_copied = std::io::copy(&mut file, &mut outfile).unwrap_or(0);
+                                          log_fn(format!("      ✅ Extracted manifest: {:?} ({} bytes)", out_path, bytes_copied));
                                           manifest_paths.push(out_path);
+                                     } else {
+                                         log_fn(format!("      ❌ Failed to create file: {:?}", out_path));
                                      }
                                  }
                             } else if raw_path.ends_with(".lua") {
                                  use std::io::Read;
                                  let _ = file.read_to_string(&mut extracted_lua);
+                                 log_fn(format!("      ✅ Extracted LUA ({} chars)", extracted_lua.len()));
                             }
                         }
                     }
                     return (true, extracted_lua, manifest_paths);
+                } else {
+                    log_fn("❌ Failed to open as ZIP archive".to_string());
                 }
                 (false, String::new(), Vec::new())
             };
@@ -1166,7 +1178,7 @@ impl DarkCoreApp {
             }
 
             if let Some(bytes) = bytes_opt {
-                let (ok, content, paths) = process_zip(bytes);
+                let (ok, content, paths) = process_zip(bytes, &log);
                 manifest_success = ok;
                 lua_content = content;
                 
@@ -1333,10 +1345,41 @@ impl DarkCoreApp {
                  log("✅ Depot Keys Injected into GreenLuma config.".to_string());
             }
 
-            // Filter IDs - FIX: Always include ALL IDs from Lua (Depots + DLCs)
-                // Filtering caused issues where required Depots were skipped if include_dlcs was false.
+            // Filter IDs - SMART: Only add IDs we have manifests/keys for
+                // Adding IDs without corresponding manifests causes 'Data Encrypted' errors!
+                let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
+                let mut skipped_count = 0;
+                
                 for id in all_ids.iter() {
-                    final_ids.push(id.clone());
+                    // Always include main AppID
+                    if *id == appid {
+                        final_ids.push(id.clone());
+                        continue;
+                    }
+                    
+                    // Check if we have a key for this ID
+                    let has_key = keys.contains_key(id);
+                    
+                    // Check if manifest exists in depotcache
+                    let has_manifest = if depot_cache.exists() {
+                        // Look for any manifest file starting with this ID
+                        glob::glob(&depot_cache.join(format!("{}_*.manifest", id)).to_string_lossy())
+                            .map(|paths| paths.filter_map(|p| p.ok()).next().is_some())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    
+                    if has_key || has_manifest {
+                        final_ids.push(id.clone());
+                    } else {
+                        skipped_count += 1;
+                        log(format!("⚠️ Skipping ID {} (no manifest/key available)", id));
+                    }
+                }
+                
+                if skipped_count > 0 {
+                    log(format!("📋 Filtered: {} IDs skipped (no manifest). {} IDs will be injected.", skipped_count, final_ids.len()));
                 }
                  log(format!("Lua Intelligence: Found {} IDs (Game + Depots + DLCs).", final_ids.len()));
             } 
@@ -2873,39 +2916,10 @@ impl DarkCoreApp {
                 }
             }
 
-            if ui
-                .button(
-                    egui::RichText::new("☢ NUKE UNKNOWNS")
-                        .strong()
-                        .color(egui::Color32::RED),
-                )
-                .on_hover_text("Smart Delete: Removes 'Unknown' items ONLY if they are NOT linked DLCs.\nSafe to use: If a game breaks, simply re-add its AppID.")
-                .clicked()
-            {
-                let result = {
-                    let cache = self.game_cache.lock().unwrap();
-                    let rel = self.relationships.lock().unwrap();
-                    crate::app_list::nuke_unknowns(&self.config.gl_path, &cache, &rel)
-                };
-
-                match result {
-                    Ok(count) => {
-                         self.log(format!("☢ NUKE COMPLETE: Vaporized {} junk files.", count));
-                         self.refresh_library();
-                    },
-                    Err(e) => self.log(format!("Nuke Error: {}", e)),
-                }
-            }
-            if ui
-                .button(
-                    egui::RichText::new("🔎 Resolve Unknown")
-                        .strong()
-                        .color(egui::Color32::YELLOW),
-                )
-                .clicked()
-            {
-                self.resolve_unknown_games();
-            }
+            // REMOVED: "NUKE UNKNOWNS" and "Resolve Unknown" buttons
+            // These are no longer needed because:
+            // 1. Linked depot/DLC IDs are now hidden from the main list
+            // 2. The relationship system properly tracks child→parent links
         });
         ui.add_space(5.0);
 
@@ -2943,6 +2957,7 @@ impl DarkCoreApp {
             let mut delete_req = None;
 
             for (idx, game) in games.iter().enumerate() {
+                // IDs are shown so user knows exact AppList usage count
                 let bg_color = if idx % 2 == 0 {
                     egui::Color32::from_rgb(25, 25, 30)
                 } else {
@@ -3897,7 +3912,28 @@ impl DarkCoreApp {
         }
     }
 
-    fn remove_games_by_id(&self, ids: Vec<String>, full_wipe: bool) {
+    fn remove_games_by_id(&self, mut ids: Vec<String>, full_wipe: bool) {
+        // AUTO-DETECT CHILDREN (Fix for Hidden Orphans)
+        // If we are deleting a Parent, we must also delete its Children (DLCs/Depots)
+        // because they are now hidden in the UI and can't be deleted manually!
+        {
+            let mut children_to_add = Vec::new();
+            if let Ok(map) = self.relationships.lock() {
+                for target_id in &ids {
+                    // Find all children where parent == target_id
+                    for (child, parent) in map.iter() {
+                        if parent == target_id && !ids.contains(child) {
+                            children_to_add.push(child.clone());
+                        }
+                    }
+                }
+            }
+            if !children_to_add.is_empty() {
+                self.log(format!("♻ Linked Deletion: Found {} attached DLCs/Depots.", children_to_add.len()));
+                ids.extend(children_to_add);
+            }
+        }
+
         let gl_path = self.config.gl_path.clone();
         let steam_path = self.config.steam_path.clone();
         let al_path = Path::new(&gl_path).join("AppList");
@@ -4521,13 +4557,10 @@ pub fn setup_greenluma_config(gl_path: &str, enable_stealth: bool) -> std::io::R
         }
     }
 
-    // GreenLuma INI Configuration (Analysis Mode)
-    // To solve "Unknown Error", we need logs from the DLL.
-    let ini_path = path.join("GreenLuma_2025_x64.ini");
-    // LogFile=1 -> Creates GreenLuma_2025_x64.log
-    // ModifyLauncher=1 -> Standard hook
-    let ini_content = "[GreenLuma]\nLogFile=1\nModifyLauncher=1\n";
-    let _ = std::fs::write(&ini_path, ini_content);
+    // NOTE: Removed GreenLuma_2025_x64.ini creation
+    // The .ini file was for debug logging (LogFile=1) but it breaks
+    // DLLInjector.exe for users who want to use the original tool.
+    // Our Rust APC injector does not need this file at all.
     
     Ok(())
 }

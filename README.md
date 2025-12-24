@@ -20,7 +20,7 @@
 > **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
-![Version](https://img.shields.io/badge/version-v1.4-00f3ff?style=for-the-badge&logo=rust)
+![Version](https://img.shields.io/badge/version-v1.5-00f3ff?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
   

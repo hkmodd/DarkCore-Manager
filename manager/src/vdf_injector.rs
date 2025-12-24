@@ -168,33 +168,49 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
     // Simple ID-only Regex: addappid(depot_id) - just the ID, no key
     let re_id_only = Regex::new(r#"addappid\s*\(\s*(\d+)"#).unwrap();
 
-    // First pass: Extract 3-arg matches (most reliable)
-    for cap in re_3arg.captures_iter(lua_content) {
-        if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
-            let id = id_match.as_str().to_string();
-            ids.push(id.clone());
-            keys.insert(id, key_match.as_str().to_string());
-        }
-    }
+    // Process LINE BY LINE to respect Lua comments
+    // Morrenus marks missing DLCs with "-- addappid(...)" - we must skip these!
+    for line in lua_content.lines() {
+        let trimmed = line.trim();
 
-    // Second pass: Extract 2-arg matches (fallback)
-    for cap in re_2arg.captures_iter(lua_content) {
-        if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
-            let id = id_match.as_str().to_string();
-            if !keys.contains_key(&id) {
-                // Don't overwrite 3-arg results
-                ids.push(id.clone());
+        // Skip commented lines (Lua comment: --)
+        if trimmed.starts_with("--") {
+            continue;
+        }
+
+        // First: Try 3-arg match (most reliable - has decryption key)
+        if let Some(cap) = re_3arg.captures(trimmed) {
+            if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
+                let id = id_match.as_str().to_string();
+                if !ids.contains(&id) {
+                    ids.push(id.clone());
+                }
                 keys.insert(id, key_match.as_str().to_string());
+                continue; // Move to next line
             }
         }
-    }
 
-    // Third pass: Extract ID-only (for DLCs without keys)
-    for cap in re_id_only.captures_iter(lua_content) {
-        if let Some(id_match) = cap.get(1) {
-            let id = id_match.as_str().to_string();
-            if !ids.contains(&id) {
-                ids.push(id);
+        // Second: Try 2-arg match (fallback)
+        if let Some(cap) = re_2arg.captures(trimmed) {
+            if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
+                let id = id_match.as_str().to_string();
+                if !keys.contains_key(&id) {
+                    if !ids.contains(&id) {
+                        ids.push(id.clone());
+                    }
+                    keys.insert(id, key_match.as_str().to_string());
+                }
+                continue;
+            }
+        }
+
+        // Third: ID-only (for main app without key)
+        if let Some(cap) = re_id_only.captures(trimmed) {
+            if let Some(id_match) = cap.get(1) {
+                let id = id_match.as_str().to_string();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
             }
         }
     }
