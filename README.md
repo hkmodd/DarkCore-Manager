@@ -10,14 +10,14 @@
 ██████╔╝██║  ██║██║  ██║██║  ██╗╚██████╗╚██████╔╝██║  ██║███████╗
 ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
   </pre>
-  <h3>System Orchestration & Compatibility Layer</h3>
+  <h3>Advanced System Orchestration & Compatibility Layer</h3>
   <p>
     <b>High-Performance. Memory-Safe. Aesthetics.</b>
   </p>
 
 # 🌌 DarkCore Manager v1.5
 
-> **The Ultimate Rust-Native Game Manager for GreenLuma & Morrenus.**
+> **The Rust-Native Orchestrator for External Compatibility Layers.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
 ![Version](https://img.shields.io/badge/version-v1.5-00f3ff?style=for-the-badge&logo=rust)
@@ -31,99 +31,91 @@
     <img src="https://img.shields.io/badge/License-Educational-green?style=for-the-badge">
     <img src="https://img.shields.io/badge/Theme-Cyberpunk_2077-yellow?style=for-the-badge">
   </p>
-
-  <p>
-    <a href="#features">Features</a> •
-    <a href="#architecture">Architecture</a> •
-    <a href="#compilation">Compilation</a> •
-    <a href="#disclaimer">Disclaimer</a>
-  </p>
 </div>
 
 ---
 
 <br>
 
-> [!CAUTION]
-> **LEGAL DISCLAIMER & ZERO LIABILITY**
+> [!NOTE]
+> **RESEARCH & INTEROPERABILITY DISCLAIMER**
 >
-> 1.  **Independent Research**: **DarkCore Manager** is an independent project created solely for educational purposes, demonstrating advanced Rust UI patterns and process orchestration.
-> 2.  **No Affiliation**: This software is **NOT** affiliated with, endorsed by, or connected to Valve Corporation, Steam, GreenLuma, Steamless, or Morrenus.
-> 3.  **No Proprietary Data**: This tool **does NOT** contain, distribute, or host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
-> 4.  **User Responsibility**: The user assumes full responsibility for compliance with all applicable Terms of Service and local laws. The author assumes **NO LIABILITY** for bans, data loss, or system instability.
+> 1.  **Educational Sandbox**: **DarkCore Manager** is a technical demonstration of Rust UI patterns, IPC (Inter-Process Communication), and local file system management.
+> 2.  **External Dependencies**: This tool acts solely as a **Launcher/Manager** for third-party tools (GreenLuma, Steamless, etc.). It does not contain, distribute, or modify their binaries.
+> 3.  **No Proprietary Data**: This repository **does NOT** host any copyrighted game binaries or proprietary code. It operates strictly by managing local configuration text files (e.g., `AppList/*.txt`).
+> 4.  **User Agency**: The user retains full control over their local environment. The author assumes **NO LIABILITY** for the usage of this tool or the behavior of third-party dependencies managed by it.
 
 <br>
 
 ## 🚀 System Overview
 
-**DarkCore Manager** redefines the compatibility layer experience. Abandoning legacy Python scripts, it introduces a **Rust-native architecture** designed for speed, safety, and visual immersion.
+**DarkCore Manager** redefines the local library management experience. Abandoning legacy script-based approaches, it introduces a **Rust-native architecture** designed for speed, safety, and visual immersion.
 
-Acting as a sophisticated **Middleware Orchestrator**, it automates the complex interplay between Steam, GL(AppList), lua and manifest files, wrapping it all in a "God-Tier" interface.
+Acting as a sophisticated **Middleware Orchestrator**, it automates the complex interplay between the Client environment, external compatibility layers, and local configuration files, wrapping it all in a "God-Tier" interface.
 
 ## 🧠 Architecture: Under the Hood
 
-*   **Deterministic Loading**: Dynamically builds and sorts the `AppList` directory structure (`0.txt`, `1.txt`...), ensuring deterministic loading of entitlements.
-*   **Easy Search**: powered by Steam/Morrenus API, search the title, go for it, let DarkCore handle the rest.
-*   **Depot Auto Management**: Parses Lua scripts to surgically write key-values into Steam's `config/config.vdf`, copies .manifest to `depotcache` and create ghost .acf file into `steamapps`. (requires Morrenus API key)
-*   **AppList's Profiles**: Easy overcome the hardcoded 130 .txt GL's AppList limit.
-*   **Process Orchestration**: Manages the lifecycle of child processes via native Win32 calls.
+* **Deterministic Configuration**: Dynamically builds and sorts the `AppList` directory structure, ensuring precise loading orders for external injectors.
+* **Search & Indexing**: Powered by external Metadata APIs, enabling rapid retrieval of AppID information for local configuration.
+* **Depot Management**: Parses Lua scripts to structurally align key-values into `config.vdf` and manages `depotcache` manifest placement for correct client recognition.
+* **Profile Virtualization**: Overcomes legacy limitations by implementing a hot-swappable Profile System for `AppList` configurations.
+* **Process Supervision**: Manages the lifecycle of child processes via native Win32 calls, ensuring clean startup and termination sequences.
 
-**It doesn't just run commands. It manages the environment.**
+**It doesn't just run commands. It governs the environment.**
 
 ## 🗝️ System Attributes: Core Modules
-To achieve seamless interoperability, four things must work in unison. DarkCore orchestrates them all:
+To achieve seamless interoperability, four components must work in unison. DarkCore orchestrates them all:
 
-### 1. 🔓 Steamless 
-*   **Role**: **Executable Unpacker**.
-*   **Function**: Automated handling of the "SteamStub" wrapper. It preserves the integrity of the original binary while preparing it for an offline or sandboxed execution environment.
-*   **DarkCore Integration**: Fully automated via the "Steamless" tab. Handles backup (`.bak`), unpacking, and replacement with 100% safety.
+### 1. 🔓 Binary Preprocessor (Wrapper for Steamless)
+* **Role**: **Automated File Preparation**.
+* **Function**: Interfacing with the Steamless CLI to prepare executables for offline or sandboxed execution, ensuring compatibility with custom environments.
+* **DarkCore Integration**: Fully automated workflow. Handles `.bak` creation, processing, and file restoration with 100% safety checks.
 
-### 2. 🔑 GreenLuma 
-*   **Role**: **Client Debug Parameter Override**.
-*   **Function**: Leveraging the Steam Client's "Family Sharing" protocols, it allows for the loading of specific AppIDs into the local context for testing and library management purposes.
-*   **DarkCore Integration**: Feeds the `AppList` to it, based on profile chosen.
+### 2. 🔑 Parameter Injection (Wrapper for GreenLuma)
+* **Role**: **Environment Variable Management**.
+* **Function**: Orchestrates the injection of specific AppIDs into the client's runtime context, leveraging legitimate "Family Sharing" protocols for extended library management.
+* **DarkCore Integration**: Feeds the `AppList` configuration dynamically based on the active user profile.
 
-### 3. 📡 Morrenus Integration 
-*   **Role**: **Manifest & Key Aggregation**.
-*   **Function**: Facilitates the retrieval of **Manifests** and **lua** necessary for the client to validate / download.
-*   **DarkCore Integration**: Automates the retrieval of Lua scripts and Manifests, ensuring correct `config.vdf` and `depotcache` alignment.
+### 3. 📡 Metadata Aggregation (Morrenus Integration)
+* **Role**: **Manifest & Config Synchronization**.
+* **Function**: Facilitates the retrieval of public **Manifests** and configuration scripts necessary for client validation.
+* **DarkCore Integration**: Automates the alignment of Lua scripts and Manifests to ensure `config.vdf` and `depotcache` consistency.
 
 ### 4. 🧠 TITAN Module - *NEW!*
-*   **Role**: **Early-Stage Steamworks API Emulation**.
-*   **Function**: A custom `dll` proxy that intercepts and handles `ISteamRemoteStorage` and `ISteamUserStats` calls locally.
-*   **Capabilities**:
-    *   **💾 Local Storage Virtualization**: Redirects save game I/O to a sandboxed local directory.
-    *   **☁️ State Harmonization**: Patches `localconfig.vdf` and manages `remotecache.vdf` to ensure the Client UI reflects a "Healthy/Updated" state, eliminating synchronization errors.
-    *   **🏆 Offline Achievement Tracking**: Persists unlocked achievements to a local `stats.txt` database, preserving user progress across sessions without upstream server dependency.
+* **Role**: **Local API Proxy & State Virtualization**.
+* **Function**: A custom `dll` layer that intercepts `ISteamRemoteStorage` and `ISteamUserStats` calls to virtualize them locally.
+* **Capabilities**:
+    * **💾 Local Storage Sandbox**: Redirects save game I/O to a user-controlled local directory, decoupling it from cloud dependencies.
+    * **☁️ State Harmonization**: Manages `localconfig.vdf` and `remotecache.vdf` to ensure the Client UI reflects a consistent state, resolving synchronization conflicts.
+    * **🏆 Offline Statistics**: Persists unlocked statistics to a local database (`stats.txt`), preserving user progress in offline/sandboxed scenarios.
 
 ---
 
 ## ✨ Feature Matrix
 
-### 🟢 Hybrid API
+### 🟢 Hybrid Operation Mode
 DarkCore adapts to your environment in real-time.
 
-| Mode          | Status       | Functionality                                                                                                        |
-| :------------ | :----------- | :------------------------------------------------------------------------------------------------------------------- |
-| **Valid Key** | **UNLOCKED** | Full Morrenus API integration. Precise AppID resolution. Manifest / lua resolution.          |
-| **No Key**    | **FALLBACK** | **Silent Fallback to Public Steam Store**. Instant Search & DLC listings via public API. Perfect for Family Sharing. |
+| Mode | Status | Functionality |
+| :--- | :--- | :--- |
+| **Authenticated** | **FULL ACCESS** | Complete API integration. Precise AppID resolution. Manifest/Lua synchronization enabled. |
+| **Standard** | **LOCAL ONLY** | **Fallback to Public Store API**. Instant Search & DLC listings. Ideal for local Family Sharing management. |
 
 > [!NOTE]
-> **External Resources**: GreenLuma, Steamless, and API Keys are third-party resources. You must acquire them independently.
+> **BYOL (Bring Your Own License)**: GreenLuma, Steamless, and API Keys are third-party resources. You must acquire and configure them independently.
 
-### 🛡️ Smart "Strict Check"
-When a valid key is detected, DarkCore enforces **Strict Validation**, preventing the installation of broken or unsupported AppIDs. If it's not in the database, it doesn't touch your disk.
+### 🛡️ Integrity Validation
+When a valid API connection is established, DarkCore enforces **Strict Validation**, preventing the configuration of invalid AppIDs. If the metadata doesn't exist, the configuration is rejected to maintain system stability.
 
 ### ⚡ Technical Highlights
-*   **Rust Native**: Compiled to machine code. Zero interpreter overhead. Only **18,5MB** standalone binary!
-*   **Project Neon UI**: Rebuilt with a "Glass & Glow" design language. Features a fixed Sidebar navigation, adaptive layouts, and fade animations.
-*   **One-Click Installation**: New smart detection algorithm scans library folders to auto-fill installation paths, skipping manual inputs for repair workflows.
-*   **Audio-Reactive**: Custom "Neon Wave" volume control with real-time spectrum visualization and scroll interaction.
-*   **Secure Sandbox**: API Key inputs feature a "Glitch" security visualization, confirming data protection with style.
-*   **Zero-Compromise Engineering**: The entire codebase (Manager + Titan) compiles with **0 Warnings** and **0 Errors**, adhering to strict Rust 2024 standards.
-*   **Stealth APC Injection**: Replaces legacy `CreateRemoteThread` with advanced `QueueUserAPC` injection. Leverages the main thread for insertion, making it undetected and highly stable.
-*   **Limit Bypass**: Proprietary **Profile System** allows unlimited libraries by hot-swapping `AppList` configurations.
-*   **Steamless Automation**: Integrated GUI for `Steamless CLI` with **Auto-Backup** (`.bak`), **Auto-Rename**, and **Smart Detection**.
+* **Rust Native**: Compiled to machine code. Zero interpreter overhead. Only **18.5MB** standalone binary.
+* **Project Neon UI**: Rebuilt with a "Glass & Glow" design language. Features fixed Sidebar navigation, adaptive layouts, and fade animations.
+* **Smart Discovery**: Algorithms scan library folders to auto-fill installation paths, minimizing manual configuration.
+* **Audio-Reactive**: Custom "Neon Wave" volume control with real-time spectrum visualization.
+* **Secure Input**: API Key fields feature a "Glitch" security visualization.
+* **Zero-Compromise Engineering**: The entire codebase (Manager + Titan) compiles with **0 Warnings**, adhering to strict Rust 2024 standards.
+* **Native Process Injection**: Utilizes advanced `QueueUserAPC` calls for stable, thread-safe module loading. This ensures seamless integration without the instability of legacy injection methods.
+* **Profile Swapping**: Proprietary system allows for unlimited library configurations by hot-swapping `AppList` files.
 
 ---
 
@@ -132,28 +124,28 @@ When a valid key is detected, DarkCore enforces **Strict Validation**, preventin
 We believe in transparency. Build it yourself.
 
 ### Prerequisites
-*   [**Rust Toolchain (rustup)**](https://rustup.rs/)
-*   **Git** & **Windows SDK**
+* [**Rust Toolchain (rustup)**](https://rustup.rs/)
+* **Git** & **Windows SDK**
 
 ### Build Sequence
 
 1.  **Clone Repository**
     ```powershell
-    git clone https://github.com/hkmodd/DarkCore-Manager.git
+    git clone [https://github.com/hkmodd/DarkCore-Manager.git](https://github.com/hkmodd/DarkCore-Manager.git)
     cd DarkCore-Manager
     ```
 
 2.  **Asset Injection (Optional)**
-    *   **Logo**: Automatically embedded (`baked-in`) at compile time.
-    *   **Icon**: Place your `icon.ico` in the `manager/` directory.
+    * **Logo**: Automatically embedded (`baked-in`) at compile time.
+    * **Icon**: Place your `icon.ico` in the `manager/` directory.
 
 3.  **Compile System**
     ```powershell
     cargo build --release
     ```
     *This command compiles the entire workspace:*
-    *   **Manager**: `target/release/darkcore-manager.exe` (The UI Application)
-    *   **Titan Hook**: `target/release/titan_hook.dll` (The Stealth Layer)
+    * **Manager**: `target/release/darkcore-manager.exe` (The UI Application)
+    * **Titan Hook**: `target/release/titan_hook.dll` (The Compatibility Layer)
 
     > [!TIP]
     > Ensure both files are in the same directory for deployment to work correctly.
@@ -165,22 +157,21 @@ We believe in transparency. Build it yourself.
 ### 1. Environment Mapping (Initialization)
 Upon first boot, the core system requires mapping to your local ecosystem. Navigate to the **SETTINGS** tab to initialize the environment:
 
-*   **Steam Root**: The directory housing `Steam.exe` (e.g., `C:\Program Files (x86)\Steam`).
-*   **GreenLuma Artifact**: The folder containing the *GreenLuma 2025* binary (`GreenLuma_2025_x64.dll`).
-*   **Steamless Binary**: Path to `Steamless.CLI.exe`.
-*   **Morrenus API Key**: (Optional) Input your private API key.
-    *   *Note: As I wrote before, Without this key, the system defaults to **Fallback Mode** (Public Steam Store API), limiting capabilities to Library Management only.*
+* **Steam Root**: The directory housing the client executable.
+* **Compatibility Artifact**: The folder containing the *GreenLuma* binary (`GreenLuma_2025_x64.dll`).
+* **Preprocessor Binary**: Path to `Steamless.CLI.exe`.
+* **API Key**: (Optional) Input your private API key for metadata retrieval.
 
 ### 2. The Execution Cycle
 DarkCore streamlines the deployment process into a deterministic linear workflow:
 
 1.  **Query**: Navigate to **SEARCH**, input a specific AppID or Game Name.
-2.  **Engage**: Click **INSTALL** for Morrenus integration, Right-click for Family sharing mode only.
-3.  **Titan Activation (Post-Install)**: If you encounter Cloud/Save errors, return to DarkCore Library section and click **ACTIVATE TITAN** on the game card.
-    *   *Automation*: The system automatically **Terminates Steam**, deploys the Titan Hook, patches the Cloud Configuration, and **Auto-Restarts Steam** via the Injector. Zero manual intervention required.
+2.  **Engage**: Click **INSTALL** for metadata integration, Right-click for basic AppID listing.
+3.  **Titan Activation (Post-Install)**: If you require local save management, return to DarkCore Library section and click **ACTIVATE TITAN**.
+    * *Automation*: The system automatically manages the client process, deploys the Titan Hook, patches the local configuration, and restarts the environment.
 
 > [!TIP]
-> **Process Hygiene**: DarkCore now automatically handles Steam termination during critical operations (Injection & Titan Deployment) to prevent file locking. You do not need to manually close Steam.
+> **Process Hygiene**: DarkCore handles process termination during critical operations (Injection & Titan Deployment) to prevent file locking.
 
 ---
 
