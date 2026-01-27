@@ -3,7 +3,7 @@ name: Build and Release
 on:
   push:
     tags:
-      - 'v*' # Trigger on version tags like v1.4.0
+      - 'v*'
 
 permissions:
   contents: write
@@ -25,18 +25,10 @@ jobs:
     - name: Build Release
       run: cargo build --release --workspace --verbose
 
-    - name: Prepare Release Bundle
-      run: |
-        mkdir DarkCore-Release
-        copy target\release\darkcore-manager.exe DarkCore-Release\
-        7z a -tzip -mx=9 DarkCore-Manager-${{ github.ref_name }}.zip .\DarkCore-Release\*
-
     - name: Create Release
-      id: create_release
       uses: softprops/action-gh-release@v2
       with:
-        files: |
-          DarkCore-Manager-${{ github.ref_name }}.zip
+        files: target/release/darkcore-manager.exe
         name: Release ${{ github.ref_name }}
         draft: false
         prerelease: false
