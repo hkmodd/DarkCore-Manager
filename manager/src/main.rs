@@ -9,32 +9,51 @@ mod steamless;
 mod game_path;
 mod injector;
 mod ui;
+mod goldberg;
+mod manifest_downloader;
 mod vdf_injector;
 mod vault;
-// REMOVED: mod downloader (switched to SMD approach - Steam downloads files)
+mod watcher;
+mod updater; // NEW: OTA Update System
+
+// REMOVED: mod downloader (switched to SMD approach)
 // REMOVED: mod manifest_parser (unused native parser)
 
 use ui::DarkCoreApp;
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {
-    // Load Icon
-    let icon_data = if let Ok(img) = image::open("icon.ico") {
-        let img = img.to_rgba8();
-        Some(eframe::egui::IconData {
-            rgba: img.as_raw().to_vec(),
-            width: img.width(),
-            height: img.height(),
-        })
-    } else {
-        None
+    // Load Icon - Embedded at compile time for portability
+    let icon_data = {
+        let icon_bytes = include_bytes!("../icon.ico");
+        // Parse ICO file - extract the largest image
+        if let Ok(icon_dir) = ico::IconDir::read(std::io::Cursor::new(icon_bytes)) {
+            // Find the largest icon
+            if let Some(entry) = icon_dir.entries().iter().max_by_key(|e| e.width() * e.height()) {
+                if let Ok(image) = entry.decode() {
+                    Some(eframe::egui::IconData {
+                        rgba: image.rgba_data().to_vec(),
+                        width: image.width(),
+                        height: image.height(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     };
+
+    let version_str = format!("DarkCore Manager v{}", env!("CARGO_PKG_VERSION"));
 
     let viewport = eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 950.0]) // Optimized for 1080p+ and Sidebar content
             .with_min_inner_size([1100.0, 720.0])
             .with_resizable(true)
-            .with_title("DarkCore Manager v1.5.0");
+            .with_title(&version_str); // Dynamic Title
 
     let viewport = if let Some(icon) = icon_data {
         viewport.with_icon(icon)

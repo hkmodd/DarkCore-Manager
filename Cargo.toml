@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "manager",
-    "titan_hook",
 ]
 resolver = "2"
 
@@ -12,7 +11,7 @@ authors = ["Team DarkCore"]
 
 [profile.release]
 strip = true      # Automatically strip symbols from the binary.
-opt-level = "z"   # Optimize for size.
-lto = true        # Enable Link Time Optimization.
+opt-level = 3     # Optimize for SPEED (was "z" for size).
+lto = "fat"       # Enable Link Time Optimization (Maximum).
 codegen-units = 1 # Maximum optimization (slower build).
-# panic = "abort" # Commented out for debugging
+panic = "abort"   # Remove unwind tables for smaller/faster binary.

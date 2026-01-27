@@ -29,7 +29,6 @@ jobs:
       run: |
         mkdir DarkCore-Release
         copy target\release\darkcore-manager.exe DarkCore-Release\
-        copy target\release\titan_hook.dll DarkCore-Release\Titan_Hook.dll
         7z a -tzip -mx=9 DarkCore-Manager-${{ github.ref_name }}.zip .\DarkCore-Release\*
 
     - name: Create Release

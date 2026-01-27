@@ -1,3 +1,7 @@
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::vec_init_then_push)]
+#![allow(dead_code)] // Reserved: inject_localconfig_vdf, parse_lua_for_keys for alternative flows
+
 use crate::game_path::{GamePathFinder, VdfValue};
 use regex::Regex;
 use std::collections::HashMap;
@@ -120,23 +124,21 @@ pub fn inject_localconfig_vdf(
                                         VdfValue::Str(key.clone()),
                                     ));
                                     depots.insert_or_update(appid.clone(), VdfValue::Obj(new_obj));
-                                } else {
-                                    if let Some(app_node) = depots.get_mut(appid) {
-                                        if let VdfValue::Obj(fields) = app_node {
-                                            let mut found = false;
-                                            for (k, v) in fields.iter_mut() {
-                                                if k.eq_ignore_ascii_case("DecryptionKey") {
-                                                    *v = VdfValue::Str(key.clone());
-                                                    found = true;
-                                                    break;
-                                                }
+                                } else if let Some(app_node) = depots.get_mut(appid) {
+                                    if let VdfValue::Obj(fields) = app_node {
+                                        let mut found = false;
+                                        for (k, v) in fields.iter_mut() {
+                                            if k.eq_ignore_ascii_case("DecryptionKey") {
+                                                *v = VdfValue::Str(key.clone());
+                                                found = true;
+                                                break;
                                             }
-                                            if !found {
-                                                fields.push((
-                                                    "DecryptionKey".to_string(),
-                                                    VdfValue::Str(key.clone()),
-                                                ));
-                                            }
+                                        }
+                                        if !found {
+                                            fields.push((
+                                                "DecryptionKey".to_string(),
+                                                VdfValue::Str(key.clone()),
+                                            ));
                                         }
                                     }
                                 }
@@ -153,9 +155,20 @@ pub fn inject_localconfig_vdf(
     Ok(())
 }
 
+/// Parse LUA file for AppIDs and Depot Keys
+///
+/// Returns:
+/// - `applist_ids`: IDs that should go in GreenLuma AppList
+///   - All IDs WITHOUT keys (these are AppIDs for game/DLCs)
+///   - The FIRST ID WITH a key (essential base depot for download)
+/// - `keys`: ALL depot decryption keys (for config.vdf injection)
+///
+/// This dramatically reduces AppList entries:
+/// - Before: Beat Saber = 260+ entries (all IDs)
+/// - After:  Beat Saber = ~66 entries (AppID + DLCs + 1 base depot)
 pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, String>) {
-    let mut ids = Vec::new();
-    let mut keys = HashMap::new();
+    let mut applist_ids = Vec::new(); // IDs for GreenLuma AppList
+    let mut keys = HashMap::new(); // ALL keys for config.vdf
 
     // Primary Regex: addappid(depot_id, flag, "key") - 3 argument format (SMD Compatible)
     // Example: addappid(228989, 1, "ad69276eabc12345...")
@@ -165,8 +178,10 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
     // Fallback Regex: addappid(depot_id, "key") - 2 argument format (some older LUA files)
     let re_2arg = Regex::new(r#"addappid\s*\(\s*(\d+)\s*,\s*["']([a-fA-F0-9]{64})["']"#).unwrap();
 
-    // Simple ID-only Regex: addappid(depot_id) - just the ID, no key
-    let re_id_only = Regex::new(r#"addappid\s*\(\s*(\d+)"#).unwrap();
+    // Simple ID-only Regex: addappid(ID) - ONLY the ID with closing paren
+    // This MUST NOT match depot lines like: addappid(1048870, 1, "key")
+    // By requiring ) immediately after the number, we exclude lines with extra args
+    let re_id_only = Regex::new(r#"addappid\s*\(\s*(\d+)\s*\)"#).unwrap();
 
     // Process LINE BY LINE to respect Lua comments
     // Morrenus marks missing DLCs with "-- addappid(...)" - we must skip these!
@@ -178,44 +193,55 @@ pub fn parse_lua_for_keys(lua_content: &str) -> (Vec<String>, HashMap<String, St
             continue;
         }
 
-        // First: Try 3-arg match (most reliable - has decryption key)
+        // First: Try 3-arg match (has decryption key = depot)
         if let Some(cap) = re_3arg.captures(trimmed) {
             if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
                 let id = id_match.as_str().to_string();
-                if !ids.contains(&id) {
-                    ids.push(id.clone());
-                }
-                keys.insert(id, key_match.as_str().to_string());
-                continue; // Move to next line
-            }
-        }
+                let key = key_match.as_str().to_string();
 
-        // Second: Try 2-arg match (fallback)
-        if let Some(cap) = re_2arg.captures(trimmed) {
-            if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
-                let id = id_match.as_str().to_string();
-                if !keys.contains_key(&id) {
-                    if !ids.contains(&id) {
-                        ids.push(id.clone());
-                    }
-                    keys.insert(id, key_match.as_str().to_string());
+                // Add key to config.vdf (always)
+                keys.insert(id.clone(), key);
+
+                // Add ALL depots to AppList (User requested all depot IDs be present)
+                if !applist_ids.contains(&id) {
+                    applist_ids.push(id);
                 }
+
                 continue;
             }
         }
 
-        // Third: ID-only (for main app without key)
+        // Second: Try 2-arg match (fallback format with key)
+        if let Some(cap) = re_2arg.captures(trimmed) {
+            if let (Some(id_match), Some(key_match)) = (cap.get(1), cap.get(2)) {
+                let id = id_match.as_str().to_string();
+                let key = key_match.as_str().to_string();
+
+                if !keys.contains_key(&id) {
+                    keys.insert(id.clone(), key);
+                }
+
+                // Add ALL depots to AppList
+                if !applist_ids.contains(&id) {
+                    applist_ids.push(id);
+                }
+
+                continue;
+            }
+        }
+
+        // Third: ID-only = AppID or DLC (no key = ALWAYS add to AppList)
         if let Some(cap) = re_id_only.captures(trimmed) {
             if let Some(id_match) = cap.get(1) {
                 let id = id_match.as_str().to_string();
-                if !ids.contains(&id) {
-                    ids.push(id);
+                if !applist_ids.contains(&id) {
+                    applist_ids.push(id);
                 }
             }
         }
     }
 
-    (ids, keys)
+    (applist_ids, keys)
 }
 
 pub fn remove_vdf_keys(

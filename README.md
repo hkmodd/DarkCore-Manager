@@ -81,13 +81,6 @@ To achieve seamless interoperability, four components must work in unison. DarkC
 * **Function**: Facilitates the retrieval of public **Manifests** and configuration scripts necessary for client validation.
 * **DarkCore Integration**: Automates the alignment of Lua scripts and Manifests to ensure `config.vdf` and `depotcache` consistency.
 
-### 4. 🧠 TITAN Module - *NEW!*
-* **Role**: **Local API Proxy & State Virtualization**.
-* **Function**: A custom `dll` layer that intercepts `ISteamRemoteStorage` and `ISteamUserStats` calls to virtualize them locally.
-* **Capabilities**:
-    * **💾 Local Storage Sandbox**: Redirects save game I/O to a user-controlled local directory, decoupling it from cloud dependencies.
-    * **☁️ State Harmonization**: Manages `localconfig.vdf` and `remotecache.vdf` to ensure the Client UI reflects a consistent state, resolving synchronization conflicts.
-    * **🏆 Offline Statistics**: Persists unlocked statistics to a local database (`stats.txt`), preserving user progress in offline/sandboxed scenarios.
 
 ---
 
@@ -96,10 +89,10 @@ To achieve seamless interoperability, four components must work in unison. DarkC
 ### 🟢 Hybrid Operation Mode
 DarkCore adapts to your environment in real-time.
 
-| Mode | Status | Functionality |
-| :--- | :--- | :--- |
-| **Authenticated** | **FULL ACCESS** | Complete API integration. Precise AppID resolution. Manifest/Lua synchronization enabled. |
-| **Standard** | **LOCAL ONLY** | **Fallback to Public Store API**. Instant Search & DLC listings. Ideal for local Family Sharing management. |
+| Mode              | Status          | Functionality                                                                                               |
+| :---------------- | :-------------- | :---------------------------------------------------------------------------------------------------------- |
+| **Authenticated** | **FULL ACCESS** | Complete API integration. Precise AppID resolution. Manifest/Lua synchronization enabled.                   |
+| **Standard**      | **LOCAL ONLY**  | **Fallback to Public Store API**. Instant Search & DLC listings. Ideal for local Family Sharing management. |
 
 > [!NOTE]
 > **BYOL (Bring Your Own License)**: GreenLuma, Steamless, and API Keys are third-party resources. You must acquire and configure them independently.
@@ -113,7 +106,7 @@ When a valid API connection is established, DarkCore enforces **Strict Validatio
 * **Smart Discovery**: Algorithms scan library folders to auto-fill installation paths, minimizing manual configuration.
 * **Audio-Reactive**: Custom "Neon Wave" volume control with real-time spectrum visualization.
 * **Secure Input**: API Key fields feature a "Glitch" security visualization.
-* **Zero-Compromise Engineering**: The entire codebase (Manager + Titan) compiles with **0 Warnings**, adhering to strict Rust 2024 standards.
+* **Zero-Compromise Engineering**: The codebase compiles with **0 Warnings**, adhering to strict Rust 2024 standards.
 * **Native Process Injection**: Utilizes advanced `QueueUserAPC` calls for stable, thread-safe module loading. This ensures seamless integration without the instability of legacy injection methods.
 * **Profile Swapping**: Proprietary system allows for unlimited library configurations by hot-swapping `AppList` files.
 
@@ -143,12 +136,8 @@ We believe in transparency. Build it yourself.
     ```powershell
     cargo build --release
     ```
-    *This command compiles the entire workspace:*
+    *Output:*
     * **Manager**: `target/release/darkcore-manager.exe` (The UI Application)
-    * **Titan Hook**: `target/release/titan_hook.dll` (The Compatibility Layer)
-
-    > [!TIP]
-    > Ensure both files are in the same directory for deployment to work correctly.
 
 ---
 
@@ -167,11 +156,10 @@ DarkCore streamlines the deployment process into a deterministic linear workflow
 
 1.  **Query**: Navigate to **SEARCH**, input a specific AppID or Game Name.
 2.  **Engage**: Click **INSTALL** for metadata integration, Right-click for basic AppID listing.
-3.  **Titan Activation (Post-Install)**: If you require local save management, return to DarkCore Library section and click **ACTIVATE TITAN**.
-    * *Automation*: The system automatically manages the client process, deploys the Titan Hook, patches the local configuration, and restarts the environment.
+3.  **Steamless (Optional)**: For offline play, use the **STEAMLESS** button in the Library to patch DRM-protected executables.
 
 > [!TIP]
-> **Process Hygiene**: DarkCore handles process termination during critical operations (Injection & Titan Deployment) to prevent file locking.
+> **Process Hygiene**: DarkCore handles process termination during critical operations (Injection) to prevent file locking.
 
 ---
 

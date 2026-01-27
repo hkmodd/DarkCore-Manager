@@ -7,6 +7,10 @@ use windows::core::{PCSTR, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, FALSE, HANDLE};
 // SeDebugPrivilege imports removed (unused)
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
@@ -43,14 +47,16 @@ pub fn launch_injected(exe_path: &str, dll_path: &str, args: Option<&str>) -> Re
 
     // 2. Create Process Suspended
     unsafe {
-        let mut si = STARTUPINFOW::default();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
+        let si = STARTUPINFOW {
+            cb: size_of::<STARTUPINFOW>() as u32,
+            ..Default::default()
+        };
         let mut pi = PROCESS_INFORMATION::default();
 
         // Build Command Line: "ExePath" <Args>
         let mut cmd_str = format!("\"{}\"", exe_abs.to_string_lossy());
         if let Some(arg_str) = args {
-            cmd_str.push_str(" ");
+            cmd_str.push(' ');
             cmd_str.push_str(arg_str);
         }
 
@@ -66,12 +72,12 @@ pub fn launch_injected(exe_path: &str, dll_path: &str, args: Option<&str>) -> Re
             CREATE_SUSPENDED,
             None,
             PCWSTR(work_dir_wide.as_ptr()),
-            &mut si,
+            &si,
             &mut pi,
         );
 
         if success.is_err() {
-            return Err(format!("CreateProcessW failed."));
+            return Err("CreateProcessW failed.".to_string());
         }
 
         // 3. Inject DLL into the suspended process via APC
@@ -171,4 +177,124 @@ unsafe fn inject_dll_apc(
     // Success! We do NOT free memory here because LoadLibraryW needs it when thread resumes.
     // It's a small leak (path string) but standard for injection.
     Ok(())
+}
+
+/// Native check if GreenLuma is already injected into Steam
+/// uses CreateToolhelp32Snapshot for instantaneous <1ms check.
+pub fn is_greenluma_injected() -> bool {
+    let target_process = "steam.exe";
+
+    unsafe {
+        // 1. Find Steam Process ID
+        let h_snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        // Check invalid handle if needed (though Ok usually implies valid)
+        if h_snapshot.is_invalid() {
+            return false;
+        }
+
+        let mut pe = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(h_snapshot, &mut pe).is_ok() {
+            loop {
+                let name = String::from_utf16_lossy(&pe.szExeFile)
+                    .trim_matches('\0')
+                    .to_lowercase();
+
+                if name == target_process {
+                    // Found Steam! Now check Modules
+                    let pid = pe.th32ProcessID;
+
+                    // Snapshot Modules for this PID
+                    // Note: We need SNAPMODULE | SNAPMODULE32 to see everything
+                    let h_mod_snap = match CreateToolhelp32Snapshot(
+                        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                        pid,
+                    ) {
+                        Ok(h) => Some(h),
+                        Err(_) => None,
+                    };
+
+                    if let Some(h_mod) = h_mod_snap {
+                        let mut me = MODULEENTRY32W {
+                            dwSize: size_of::<MODULEENTRY32W>() as u32,
+                            ..Default::default()
+                        };
+
+                        if Module32FirstW(h_mod, &mut me).is_ok() {
+                            loop {
+                                let mod_name = String::from_utf16_lossy(&me.szModule)
+                                    .trim_matches('\0')
+                                    .to_lowercase();
+
+                                if mod_name.contains("greenluma") {
+                                    let _ = CloseHandle(h_mod);
+                                    let _ = CloseHandle(h_snapshot);
+                                    return true; // INJECTED!
+                                }
+
+                                if Module32NextW(h_mod, &mut me).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = CloseHandle(h_mod);
+                    }
+                    // If we found steam but didn't find module, return false immediately?
+                    // Or keep searching if multiple steam processes? (Unlikely)
+                    // Let's break and return false, assuming only one steam instance.
+                    let _ = CloseHandle(h_snapshot);
+                    return false;
+                }
+
+                if Process32NextW(h_snapshot, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(h_snapshot);
+    }
+
+    false
+}
+
+/// Simple native check if a process name is running
+pub fn is_process_running(exe_name: &str) -> bool {
+    unsafe {
+        let h_snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if h_snapshot.is_invalid() {
+            return false;
+        }
+
+        let mut pe = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        if Process32FirstW(h_snapshot, &mut pe).is_ok() {
+            loop {
+                let name = String::from_utf16_lossy(&pe.szExeFile)
+                    .trim_matches('\0')
+                    .to_lowercase();
+
+                if name == exe_name.to_lowercase() {
+                    let _ = CloseHandle(h_snapshot);
+                    return true;
+                }
+                if Process32NextW(h_snapshot, &mut pe).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(h_snapshot);
+    }
+    false
 }

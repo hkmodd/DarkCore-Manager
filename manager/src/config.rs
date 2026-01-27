@@ -18,6 +18,13 @@ pub struct AppConfig {
 
     #[serde(default = "default_true")]
     pub enable_stealth_mode: bool,
+
+    #[serde(default = "default_language")]
+    pub target_language: String,
+}
+
+fn default_language() -> String {
+    "italian".to_string()
 }
 
 fn default_profile() -> String {
@@ -42,6 +49,7 @@ impl Default for AppConfig {
             last_active_profile: "Default".to_string(),
             family_godmode_ids: Vec::new(),
             enable_stealth_mode: true,
+            target_language: "italian".to_string(),
         }
     }
 }
@@ -85,7 +93,7 @@ fn find_default_steam() -> Option<String> {
 
     for (key_path, value_name) in keys.iter() {
         if let Ok(hk_lm) = std::process::Command::new("reg")
-            .args(&["query", &format!("HKLM\\{}", key_path), "/v", value_name])
+            .args(["query", &format!("HKLM\\{}", key_path), "/v", value_name])
             .output()
         {
             let out = String::from_utf8_lossy(&hk_lm.stdout);

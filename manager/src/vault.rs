@@ -1,5 +1,4 @@
-use glob;
-use regex;
+#![allow(dead_code)] // Reserved for future Vault/Backup feature
 use std::fs;
 use std::path::{Path, PathBuf};
 

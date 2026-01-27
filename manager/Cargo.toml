@@ -1,9 +1,10 @@
 [package]
 name = "darkcore-manager"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 
 [dependencies]
+self_update = { version = "0.39", features = ["archive-zip", "compression-zip-deflate"] }
 eframe = "0.29.1"
 reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
@@ -25,6 +26,7 @@ rodio = "0.17"
 sysinfo = "0.30"
 chrono = "0.4"
 futures = "0.3"
+ico = "0.3"
 # REMOVED: Tactical Mk3 Dependencies (aes, cbc, ecb, cipher, lzma-rs, flate2, sha1, crc32fast)
 # These were used for chunk decryption/decompression - now using SMD approach (Steam downloads)
 windows = { version = "0.52", features = [
@@ -38,6 +40,7 @@ windows = { version = "0.52", features = [
     "Win32_Security_Authorization",
     "Win32_System_SystemServices",
 ] }
+libloading = "0.9.0"
 
 [build-dependencies]
 winres = "0.1"

@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_match)]
+
 use regex::Regex;
 use std::collections::VecDeque;
 use std::fs;
@@ -152,96 +154,6 @@ impl GamePathFinder {
         None
     }
 
-    pub fn is_titan_active(steam_path: &str, app_id: &str) -> bool {
-        if let Some(path) = Self::find_game_path(steam_path, app_id) {
-            return path.join("version.dll").exists();
-        }
-        false
-    }
-
-    pub fn deploy_titan_hook(steam_path: &str, app_id: &str) -> Result<PathBuf, String> {
-        let game_path = Self::find_game_path(steam_path, app_id)
-            .ok_or_else(|| "Game installation directory not found.".to_string())?;
-
-        let source_dll = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("titan_hook.dll")))
-            .unwrap_or_else(|| PathBuf::from("titan_hook.dll"));
-
-        if !source_dll.exists() {
-            return Err("Titan Hook DLL source not found. Please rebuild.".to_string());
-        }
-
-        let target_dll = game_path.join("version.dll");
-        std::fs::copy(&source_dll, &target_dll)
-            .map_err(|e| format!("Failed to copy DLL: {}", e))?;
-
-        let appid_txt = game_path.join("steam_appid.txt");
-        std::fs::write(&appid_txt, app_id)
-            .map_err(|e| format!("Failed to write steam_appid.txt: {}", e))?;
-
-        Ok(game_path)
-    }
-
-    pub fn suppress_cloud_sync(steam_path: &str, app_id: &str) -> Result<(), String> {
-        let userdata = PathBuf::from(steam_path).join("userdata");
-        if !userdata.exists() {
-            return Err("Userdata directory not found.".to_string());
-        }
-
-        if let Ok(entries) = fs::read_dir(userdata) {
-            for entry in entries.flatten() {
-                let user_path = entry.path();
-
-                // 1. Patch localconfig.vdf
-                let local_config = user_path.join("config").join("localconfig.vdf");
-                if local_config.exists() {
-                    match Self::patch_localconfig_vdf(&local_config, app_id) {
-                        Ok(_) => {
-                            println!("Patched localconfig for user {:?}", user_path.file_name())
-                        }
-                        Err(e) => println!("Failed to patch {:?}: {}", local_config, e),
-                    }
-                }
-
-                // 2. Delete remotecache.vdf (The "93KB" ghost file)
-                // Path: userdata/{User}/ {AppID} / remotecache.vdf
-                let app_remotecache = user_path.join(app_id).join("remotecache.vdf");
-                if app_remotecache.exists() {
-                    match fs::remove_file(&app_remotecache) {
-                        Ok(_) => println!("Deleted ghost remotecache: {:?}", app_remotecache),
-                        Err(e) => println!("Failed to delete {:?}: {}", app_remotecache, e),
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn patch_localconfig_vdf(path: &PathBuf, app_id: &str) -> Result<(), String> {
-        let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let content = String::from_utf8_lossy(&bytes).to_string();
-
-        let mut root = Self::parse_vdf(&content).ok_or("Failed to parse VDF")?;
-
-        let store = if root.has_key("UserLocalConfigStore") {
-            root.get_mut("UserLocalConfigStore").unwrap()
-        } else {
-            &mut root
-        };
-
-        if let Some(apps) = store.ensure_path(&["Software", "Valve", "Steam", "Apps", app_id]) {
-            apps.insert_or_update("Cloud".to_string(), VdfValue::Str("0".to_string()));
-        } else {
-            return Err("Could not navigate to Apps key".to_string());
-        }
-
-        let new_content = Self::serialize_vdf(&root);
-        fs::write(path, new_content).map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
     pub fn find_parent_for_depot(steam_path: &str, depot_id: &str) -> Option<String> {
         let config_path = PathBuf::from(steam_path).join("config").join("config.vdf");
         if let Ok(content) = fs::read_to_string(config_path) {
@@ -263,10 +175,8 @@ impl GamePathFinder {
                     for (app_id, data) in apps {
                         if let VdfValue::Obj(fields) = data {
                             for (k, v) in fields {
-                                if k.eq_ignore_ascii_case("depots") {
-                                    if v.has_key(depot_id) {
-                                        return Some(app_id.clone());
-                                    }
+                                if k.eq_ignore_ascii_case("depots") && v.has_key(depot_id) {
+                                    return Some(app_id.clone());
                                 }
                             }
                         }
@@ -285,7 +195,7 @@ impl GamePathFinder {
             if let Ok(paths) = fs::read_dir(apps_dir) {
                 for entry in paths.flatten() {
                     let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "acf") {
+                    if path.extension().is_some_and(|e| e == "acf") {
                         if let Ok(content) = fs::read_to_string(&path) {
                             if !content.contains(depot_id) {
                                 continue;
@@ -412,7 +322,7 @@ impl GamePathFinder {
                         buf.push_str(&format!("\t\t\"{}\"\n", s));
                     }
                     VdfValue::Obj(_) => {
-                        buf.push_str("\n");
+                        buf.push('\n');
                         buf.push_str(&format!("{}{{\n", indent));
                         Self::serialize_recursive(v, buf, depth + 1);
                         buf.push_str(&format!("{}}}\n", indent));

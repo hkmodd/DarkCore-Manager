@@ -6,18 +6,36 @@ use crate::cache::{load_game_cache, save_game_cache};
 use crate::config::{load_config, save_config, AppConfig};
 use crate::profiles::{Profile, ProfileManager};
 use crate::steamless;
-use crate::vdf_injector::{inject_vdf, parse_lua_for_keys};
+use crate::vdf_injector::inject_vdf;
 use crate::vault::VaultManager;
 use eframe::egui;
 use rodio::Source;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use zip::ZipArchive;
 
 use std::time::{Duration, Instant};
+
+/// Maximum number of IDs allowed in GreenLuma AppList.
+/// GreenLuma has a hard limit of ~145, we use 130 for safety margin.
+pub const APPLIST_LIMIT: usize = 130;
+
+/// Maximum number of log entries to keep in memory.
+/// Prevents unbounded memory growth during long sessions.
+const MAX_LOG_ENTRIES: usize = 100;
+
+/// Helper function to push a log entry with FIFO rotation.
+/// Use this instead of direct logs.push() to prevent memory leaks.
+fn push_log(logs: &mut Vec<String>, msg: String) {
+    logs.push(msg);
+    while logs.len() > MAX_LOG_ENTRIES {
+        logs.remove(0);
+    }
+}
+
+/// Type alias for cover queue items: (AppID, Width, Height, Pixels)
+type CoverQueueItem = (String, u32, u32, Vec<u8>);
 
 #[derive(Clone)]
 struct MatrixTrail {
@@ -56,8 +74,8 @@ pub struct DarkCoreApp {
 
     // Covers
     cover_cache: Arc<Mutex<std::collections::HashMap<String, Option<egui::TextureHandle>>>>,
-    // Queue for loaded images: (AppID, Width, Height, Pixels)
-    cover_queue: Arc<Mutex<Vec<(String, u32, u32, Vec<u8>)>>>,
+    // Queue for loaded images
+    cover_queue: Arc<Mutex<Vec<CoverQueueItem>>>,
 
     api_client: Option<ApiClient>,
 
@@ -86,14 +104,20 @@ pub struct DarkCoreApp {
     delete_candidate_name: Option<String>,
     delete_associated_dlcs: Vec<String>,
     is_scanning_dlcs: bool,
-    dlc_scan_result: Arc<Mutex<Option<Vec<String>>>>,
+    dlc_scan_result: Arc<Mutex<Option<(Vec<(String, String, bool)>, usize)>>>,
+    dlc_scan_result_zip: Arc<Mutex<Option<Vec<u8>>>>, // NEW: Transfer ZIP bytes from thread
+    delete_scan_result: Arc<Mutex<Option<Vec<String>>>>,
     
     // Install Modal
     install_modal_open: bool,
     install_candidate: Option<(String, String)>, // (AppID, Name)
+    install_candidate_is_free: bool, // NEW: Tracks F2P status
     detected_libraries: Vec<std::path::PathBuf>,
     selected_library_index: usize,
     install_dir_input: String, // NEW: Manual override for Folder Name
+    
+    // Filters
+    show_free_content: bool, // NEW: Toggle F2P visibility
 
     // New Profile Modal
     create_profile_modal_open: bool,
@@ -111,15 +135,49 @@ pub struct DarkCoreApp {
     audio_sink: Option<rodio::Sink>,
     volume: f32,
 
-    // Legacy: Steamless Context (DRM tab removed - now in Library)
-    #[allow(dead_code)]
-    steamless_app_id: String,
-    #[allow(dead_code)]
-    steamless_auto_titan: bool,
+
 
     user_stats: Arc<Mutex<Option<crate::api::UserStats>>>,
     api_last_error: Arc<Mutex<Option<String>>>,
     is_validating_api: Arc<Mutex<bool>>, // New
+
+    // DLC Picker Modal (for large DLC games like Beat Saber)
+    dlc_picker_open: bool,
+    dlc_picker_candidate: Option<(String, String)>, // (AppID, Name)
+    dlc_picker_items: Vec<(String, String, bool)>,  // (DLC ID, DLC Name, Selected)
+    dlc_picker_depot_count: usize,                  // Number of base depots (always included)
+    dlc_picker_search: String,                      // Search filter
+    dlc_picker_pending_library: Option<std::path::PathBuf>,
+    dlc_picker_pending_install_dir: Option<String>,
+    dlc_picker_cached_bytes: Option<Vec<u8>>,      // NEW: State to hold bytes for finalize_installation
+
+    // Update Detection
+    updates_downloading: Arc<Mutex<std::collections::HashSet<String>>>,
+
+    // Goldberg
+    goldberg: crate::goldberg::GoldbergGenerator,
+    goldberg_modal_open: bool,
+    goldberg_candidate_id: Option<String>,
+    goldberg_user_input: String,
+    goldberg_steamid_input: String,
+    goldberg_use_64bit: bool, // NEW: Architecture selection
+
+    // Watcher: Pending Updates (AppID -> (Name, OldBuild, NewBuild))
+    watcher_pending_updates: Arc<Mutex<HashMap<String, (String, u64, u64)>>>,
+    watcher_updating: Arc<Mutex<HashSet<String>>>, // AppIDs currently being updated
+
+    // Manifestor (The New DLC Selector)
+    manifestor_open: bool,
+    manifestor_data: Arc<Mutex<Option<crate::api::GameHierarchy>>>,
+    manifestor_candidate_id: Option<String>,
+    manifestor_candidate_name: String, // Just for header display
+    manifestor_target_library: Option<std::path::PathBuf>,
+    manifestor_install_name: String,
+    manifestor_selections: Vec<String>, // IDs of selected DLCs
+
+    // OTA Update System
+    update_available: Arc<Mutex<Option<String>>>, // Contains new version string if available
+    is_updating: Arc<Mutex<bool>>, // True during update download
 }
 
 impl Default for DarkCoreApp {
@@ -154,14 +212,28 @@ impl Default for DarkCoreApp {
             delete_associated_dlcs: Vec::new(),
             is_scanning_dlcs: false,
             dlc_scan_result: Arc::new(Mutex::new(None)),
+            delete_scan_result: Arc::new(Mutex::new(None)),
+            dlc_scan_result_zip: Arc::new(Mutex::new(None)),
+            
+            // Manifestor Init
+            manifestor_open: false,
+            manifestor_data: Arc::new(Mutex::new(None)),
+            manifestor_candidate_id: None,
+            manifestor_candidate_name: String::new(),
+            manifestor_target_library: None,
+            manifestor_install_name: String::new(),
+            manifestor_selections: Vec::new(),
             
             // Install Modal
             install_modal_open: false,
             install_candidate: None,
+            install_candidate_is_free: false, // NEW
             detected_libraries: Vec::new(),
             selected_library_index: 0,
-            install_dir_input: String::new(),
+            install_dir_input: String::new(), // Init
             
+            show_free_content: false, // Default
+
             create_profile_modal_open: false,
             create_profile_save_default: true,
             
@@ -175,9 +247,7 @@ impl Default for DarkCoreApp {
             _audio_stream_handle: None,
             audio_sink: None,
             volume: 0.5,
-            
-            steamless_app_id: String::new(),
-            steamless_auto_titan: false,
+
 
             user_stats: Arc::new(Mutex::new(None)),
             api_last_error: Arc::new(Mutex::new(None)),
@@ -185,6 +255,33 @@ impl Default for DarkCoreApp {
             matrix_trails: Vec::new(),
             config_saved_at: None,
             api_refresh_timer: None,
+            
+            // DLC Picker
+            dlc_picker_open: false,
+            dlc_picker_candidate: None,
+            dlc_picker_items: Vec::new(),
+            dlc_picker_depot_count: 0,
+            dlc_picker_search: String::new(),
+            dlc_picker_pending_library: None,
+            dlc_picker_pending_install_dir: None,
+            dlc_picker_cached_bytes: None,
+
+            updates_downloading: Arc::new(Mutex::new(std::collections::HashSet::new())),
+
+            goldberg: crate::goldberg::GoldbergGenerator::new(std::path::Path::new(".")),
+            goldberg_modal_open: false,
+            goldberg_candidate_id: None,
+            goldberg_user_input: String::new(),
+            goldberg_steamid_input: String::new(),
+            goldberg_use_64bit: true,
+
+            // Watcher
+            watcher_pending_updates: Arc::new(Mutex::new(HashMap::new())),
+            watcher_updating: Arc::new(Mutex::new(HashSet::new())),
+
+            // OTA Update System
+            update_available: Arc::new(Mutex::new(None)),
+            is_updating: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -204,7 +301,7 @@ impl DarkCoreApp {
         let system_log = Arc::new(Mutex::new(Vec::new()));
         // Initial log
         if let Ok(mut logs) = system_log.lock() {
-            logs.push("System Ready. Darkcore Rust Initialized.".to_string());
+            push_log(&mut logs, "System Ready. Darkcore Rust Initialized.".to_string());
         }
 
         let initial_profile = config.last_active_profile.clone();
@@ -237,13 +334,26 @@ impl DarkCoreApp {
             delete_associated_dlcs: Vec::new(),
             is_scanning_dlcs: false,
             dlc_scan_result: Arc::new(Mutex::new(None)),
+            delete_scan_result: Arc::new(Mutex::new(None)),
+            dlc_scan_result_zip: Arc::new(Mutex::new(None)),
             
-            // Install Modal
+            // Manifestor Init
+            manifestor_open: false,
+            manifestor_data: Arc::new(Mutex::new(None)),
+            manifestor_candidate_id: None,
+            manifestor_candidate_name: String::new(),
+            manifestor_target_library: None,
+            manifestor_install_name: String::new(),
+            manifestor_selections: Vec::new(),
+            
             install_modal_open: false,
             install_candidate: None,
+            install_candidate_is_free: false, // NEW
             detected_libraries: Vec::new(),
             selected_library_index: 0,
             install_dir_input: String::new(), // Init
+            
+            show_free_content: false, // Default: Hide F2P
             
             create_profile_modal_open: false,
             create_profile_save_default: true,
@@ -274,8 +384,6 @@ impl DarkCoreApp {
             audio_sink: None,
             volume: 0.02, // Ultra-Quiet Background (Whisper Level)
 
-            steamless_app_id: String::new(),
-            steamless_auto_titan: true,
 
             status_update_queue: Arc::new(Mutex::new(None)),
             
@@ -287,6 +395,33 @@ impl DarkCoreApp {
             api_key_glitch_update: Instant::now(),
             config_saved_at: None,
             api_refresh_timer: if !initial_api_key.is_empty() { Some(Instant::now() + std::time::Duration::from_millis(500)) } else { None }, // Auto-Start
+            
+            // DLC Picker
+            dlc_picker_open: false,
+            dlc_picker_candidate: None,
+            dlc_picker_items: Vec::new(),
+            dlc_picker_depot_count: 0,
+            dlc_picker_search: String::new(),
+            dlc_picker_pending_library: None,
+            dlc_picker_pending_install_dir: None,
+            dlc_picker_cached_bytes: None,
+
+            updates_downloading: Arc::new(Mutex::new(std::collections::HashSet::new())),
+
+            goldberg: crate::goldberg::GoldbergGenerator::new(std::path::Path::new(".")),
+            goldberg_modal_open: false,
+            goldberg_candidate_id: None,
+            goldberg_user_input: "DarkCore User".to_string(),
+            goldberg_steamid_input: "76561197960287930".to_string(),
+            goldberg_use_64bit: true,
+
+            // Watcher
+            watcher_pending_updates: Arc::new(Mutex::new(HashMap::new())),
+            watcher_updating: Arc::new(Mutex::new(HashSet::new())),
+
+            // OTA Update System
+            update_available: Arc::new(Mutex::new(None)),
+            is_updating: Arc::new(Mutex::new(false)),
         };
 
 
@@ -311,15 +446,96 @@ impl DarkCoreApp {
 
         app.configure_visuals(&_cc.egui_ctx);
 
+        // --- STARTUP TASK: WUDRM UPDATE SCANNER ---
+        let steam_path_clone = app.config.steam_path.clone();
+        std::thread::spawn(move || {
+            // Give UI time to load / settle
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            
+            let all_libs = crate::game_path::GamePathFinder::get_library_folders(&steam_path_clone);
+            for lib in all_libs {
+                let steamapps = lib.join("steamapps");
+                if let Ok(entries) = std::fs::read_dir(steamapps) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                            if fname.starts_with("appmanifest_") && fname.ends_with(".acf") {
+                                // Parse AppID and StateFlags
+                                if let Ok(content) = std::fs::read_to_string(&path) {
+                                    let mut appid = String::new();
+                                    let mut state_flags = 0u32;
+                                    
+                                    // Quick dirty parse
+                                    for line in content.lines() {
+                                        if line.contains("\"appid\"") {
+                                            if let Some(start) = line.rfind("\"") {
+                                                if let Some(prev) = line[..start].rfind("\"") {
+                                                    appid = line[prev+1..start].to_string();
+                                                }
+                                            }
+                                        }
+                                        if line.contains("\"StateFlags\"") {
+                                            if let Some(start) = line.rfind("\"") {
+                                                if let Some(prev) = line[..start].rfind("\"") {
+                                                    if let Ok(flags) = line[prev+1..start].parse::<u32>() {
+                                                        state_flags = flags;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Check "Update Required" (256)
+                                    // If Steam flags it, we download manifests to fix it/start download
+                                    if !appid.is_empty() && (state_flags & 256 != 0) {
+                                        println!("[WUDRM] Detected Update Required for AppID {}. Triggering Recovery...", appid);
+                                        // Trigger Download
+                                        let _ = download_manifests_wudrm(&appid, &steam_path_clone, &|s| println!("[WUDRM] {}", s));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Install image loaders
         egui_extras::install_image_loaders(&_cc.egui_ctx);
 
         app.refresh_library();
         app.resolve_unknown_games();
+        
+        // AUTO-START WATCHER: Check for updates on startup
+        app.start_watcher_check();
+
+        // OTA UPDATE CHECK: Spawn background thread to check for new releases
+        {
+            let update_arc = app.update_available.clone();
+            std::thread::spawn(move || {
+                // Give app time to start
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                match crate::updater::check_for_updates() {
+                    Ok(Some(release)) => {
+                        if let Ok(mut lock) = update_arc.lock() {
+                            *lock = Some(release.version);
+                        }
+                    }
+                    Ok(None) => {} // Already up-to-date
+                    Err(e) => {
+                        eprintln!("[OTA] Update check failed: {}", e);
+                    }
+                }
+            });
+        }
+        
         app
     }
 
     fn configure_visuals(&self, ctx: &egui::Context) {
+        // FORCE DARK MODE - Override system theme completely
+        ctx.set_visuals(egui::Visuals::dark());
+        
         let mut style = (*ctx.style()).clone();
         
         // FONT SIZES
@@ -331,50 +547,61 @@ impl DarkCoreApp {
             (egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional)),
         ].into();
         
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(15.0, 8.0);
         style.spacing.item_spacing = egui::vec2(12.0, 12.0);
         style.spacing.button_padding = egui::vec2(20.0, 10.0);
         style.visuals.window_rounding = egui::Rounding::same(12.0);
-        // style.visuals.popup_shadow = egui::epaint::Shadow::big_dark(); // removed to avoid error
         
         ctx.set_style(style);
 
+        // CYBERPUNK PALETTE - Apply dark theme with custom colors
         let mut visuals = egui::Visuals::dark();
-
-        // CYBERPUNK PALETTE
+        
         let bg_app = egui::Color32::from_rgb(11, 12, 16); // Obsidian
         let bg_surface = egui::Color32::from_rgb(24, 26, 33); // Gunmetal
         let accent_cyan = egui::Color32::from_rgb(0, 243, 255); // Neon Cyan
         let accent_pink = egui::Color32::from_rgb(255, 0, 110); // Cyber Pink
-        //let accent_green = egui::Color32::from_rgb(0, 255, 136); // Toxic Green
         let text_bright = egui::Color32::from_rgb(245, 245, 250); 
         let text_dim = egui::Color32::from_rgb(160, 160, 180);
 
+        // FORCE ALL BACKGROUNDS DARK
         visuals.window_fill = bg_app;
         visuals.panel_fill = bg_app;
+        visuals.faint_bg_color = bg_app;
+        visuals.extreme_bg_color = bg_app; // This fixes some light areas
+        visuals.code_bg_color = bg_surface;
+        
+        // Force dark text on dark background
+        visuals.override_text_color = Some(text_bright);
         
         // Non Interactive
         visuals.widgets.noninteractive.bg_fill = bg_app;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_bright); // Changed from text_main to text_bright
+        visuals.widgets.noninteractive.weak_bg_fill = bg_app;
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_bright);
 
         // Buttons (Idle) - "Glassy" look
         visuals.widgets.inactive.bg_fill = bg_surface;
+        visuals.widgets.inactive.weak_bg_fill = bg_surface;
         visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
         visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_dim);
-        visuals.widgets.inactive.weak_bg_fill = bg_surface;
 
         // Buttons (Hover) - "Glow"
         visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(35, 38, 50);
+        visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(35, 38, 50);
         visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, accent_cyan);
         visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
         visuals.widgets.hovered.expansion = 2.0; 
 
         // Buttons (Active)
         visuals.widgets.active.bg_fill = accent_cyan.linear_multiply(0.15);
+        visuals.widgets.active.weak_bg_fill = accent_cyan.linear_multiply(0.15);
         visuals.widgets.active.fg_stroke = egui::Stroke::new(2.0, accent_cyan);
         visuals.widgets.active.rounding = egui::Rounding::same(8.0);
         visuals.widgets.active.expansion = 1.0;
+
+        // Open (menus, popups)
+        visuals.widgets.open.bg_fill = bg_surface;
+        visuals.widgets.open.weak_bg_fill = bg_surface;
+        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, accent_cyan);
 
         // Selection
         visuals.selection.bg_fill = accent_pink.linear_multiply(0.3);
@@ -386,8 +613,7 @@ impl DarkCoreApp {
     fn log<S: Into<String>>(&self, msg: S) {
         let msg = msg.into();
         if let Ok(mut logs) = self.system_log.lock() {
-            logs.push(msg);
-            if logs.len() > 50 { logs.remove(0); }
+            push_log(&mut logs, msg);
         }
     }
 
@@ -416,6 +642,115 @@ impl DarkCoreApp {
         self.check_updates_for_ids(ids);
     }
 
+    /// Start background update check for all installed games
+    fn start_watcher_check(&self) {
+        let api_key = self.config.api_key.clone();
+        let gl_path = self.config.gl_path.clone();
+        let steam_path = self.config.steam_path.clone();
+        let pending_arc = self.watcher_pending_updates.clone();
+        let game_cache = self.game_cache.clone();
+        let relationships = self.relationships.clone();
+        let log_arc = self.system_log.clone();
+        
+        if api_key.is_empty() {
+            self.log("[Watcher] Skipped: No API key configured.");
+            return;
+        }
+        
+        self.log("[Watcher] Starting update check...");
+        
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            
+            // Get active games
+            let (cache_snapshot, rels_snapshot) = {
+                let cache = game_cache.lock().unwrap();
+                let rels = relationships.lock().unwrap();
+                (cache.clone(), rels.clone())
+            };
+            
+            let games = crate::app_list::refresh_active_games_list(
+                &gl_path,
+                &steam_path,
+                &cache_snapshot,
+                &rels_snapshot,
+            );
+            
+            if games.is_empty() {
+                if let Ok(mut logs) = log_arc.lock() {
+                    logs.push("[Watcher] No games to check.".to_string());
+                }
+                return;
+            }
+            
+            let client = crate::api::ApiClient::new(api_key);
+            let mut found_updates = 0;
+            
+            // Check each game
+            rt.block_on(async {
+                for game in &games {
+                    // Skip depots
+                    if game.name.starts_with("Depot (") || game.name.contains("(Content)") {
+                        continue;
+                    }
+                    
+                    // Get remote build info
+                    if let Ok(info) = client.get_app_info(&game.app_id).await {
+                        if let Some(remote_build) = info.buildid {
+                            // For now, we don't have local build stored, so check ACF
+                            let acf_path = std::path::Path::new(&steam_path)
+                                .join("steamapps")
+                                .join(format!("appmanifest_{}.acf", game.app_id));
+                            
+                            let mut local_build: u64 = 0;
+                            if acf_path.exists() {
+                                if let Ok(content) = std::fs::read_to_string(&acf_path) {
+                                    // Parse buildid from ACF
+                                    for line in content.lines() {
+                                        if line.contains("\"buildid\"") {
+                                            if let Some(start) = line.rfind('"') {
+                                                if let Some(prev) = line[..start].rfind('"') {
+                                                    if let Ok(b) = line[prev+1..start].parse::<u64>() {
+                                                        local_build = b;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // Compare: if remote > local, update available
+                            if remote_build > local_build && local_build > 0 {
+                                found_updates += 1;
+                                if let Ok(mut p) = pending_arc.lock() {
+                                    p.insert(
+                                        game.app_id.clone(),
+                                        (game.name.clone(), local_build, remote_build)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Rate limit
+                    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                }
+            });
+            
+            if let Ok(mut logs) = log_arc.lock() {
+                if found_updates > 0 {
+                    logs.push(format!("[Watcher] Found {} games with updates available!", found_updates));
+                } else {
+                    logs.push("[Watcher] All games are up to date.".to_string());
+                }
+            }
+        });
+    }
+
 
     fn perform_search(&self) {
         if let Some(_client) = &self.api_client {
@@ -435,7 +770,7 @@ impl DarkCoreApp {
             let log_arc = self.system_log.clone();
             let user_stats_arc = self.user_stats.clone(); // Capture Stats Arc
 
-            self.log(&format!("Searching for: {}", query));
+            self.log(format!("Searching for: {}", query));
             if let Ok(mut res) = results_arc.lock() {
                 res.clear();
             }
@@ -582,47 +917,45 @@ impl DarkCoreApp {
                                           let aid = appid.clone();
                                           
                                           handles.push(tokio::spawn(async move {
-                                               // 1. Get Local
+                                               // 1. Get Local StateFlags
                                                let acf = std::path::Path::new(&sp).join("steamapps").join(format!("appmanifest_{}.acf", aid));
-                                               let mut local_ts = 0u64;
+                                               let mut state_flags = 0u32;
+                                               
                                                if acf.exists() {
                                                    if let Ok(c) = std::fs::read_to_string(&acf) {
-                                                       if let Some(pos) = c.find("\"LastUpdated\"") {
-                                                            let rem = &c[pos..];
-                                                            if let Some(sq) = rem.find("\"") {
-                                                                if let Some(el) = rem[sq+1..].find("\"") {
-                                                                     let val_p = &rem[sq+1+el+1..];
-                                                                     if let Some(qs) = val_p.find("\"") {
-                                                                         if let Some(qe) = val_p[qs+1..].find("\"") {
-                                                                             let s = &val_p[qs+1..qs+1+qe];
-                                                                             local_ts = s.parse().unwrap_or(0);
-                                                                         }
-                                                                     }
+                                                       // Parse StateFlags
+                                                       if let Some(pos) = c.find("\"StateFlags\"") {
+                                                            let key_len = "\"StateFlags\"".len();
+                                                            let remainder = &c[pos + key_len..];
+                                                            if let Some(qs) = remainder.find("\"") {
+                                                                if let Some(qe) = remainder[qs+1..].find("\"") {
+                                                                    let val = &remainder[qs+1 .. qs+1+qe];
+                                                                    state_flags = val.parse().unwrap_or(0);
                                                                 }
                                                             }
                                                        }
                                                    }
                                                }
                                                
-                                               // 2. Get Remote
-                                               match client.get_status(&aid).await {
-                                                   Ok(st) => {
-                                                        let mut needs = st.needs_update.unwrap_or(false);
-                                                        if !needs && local_ts > 0 {
-                                                            if let Some(ts_str) = st.timestamp {
-                                                                use chrono::DateTime;
-                                                                if let Ok(dt) = DateTime::parse_from_rfc3339(&ts_str) {
-                                                                    if dt.timestamp() as u64 > local_ts {
-                                                                        needs = true;
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        if let Ok(mut c) = cache.lock() {
-                                                            c.insert(aid, needs);
-                                                        }
-                                                   },
-                                                   Err(_) => {}
+                                               // 2. Optimization: Skip API if installed
+                                               if (state_flags & 4) != 0 {
+                                                   if let Ok(mut c) = cache.lock() { c.insert(aid, false); }
+                                                   return;
+                                               }
+
+                                               // 3. Get Remote
+                                               if let Ok(st) = client.get_status(&aid).await {
+                                                    let mut needs = st.needs_update.unwrap_or(false);
+                                                    
+                                                    // OVERRIDE: Aggressive Trust
+                                                    // If installed (4), we force PLAY, even if update required (2).
+                                                    if (state_flags & 4) != 0 {
+                                                        needs = false;
+                                                    }
+                                                    
+                                                    if let Ok(mut c) = cache.lock() {
+                                                        c.insert(aid, needs);
+                                                    }
                                                }
                                           }));
                                      }
@@ -637,18 +970,15 @@ impl DarkCoreApp {
 
 
                         // AUTO-UPDATE STATS (Fix usage counter)
-                        match rt.block_on(client.get_user_stats()) {
-                            Ok(stats) => {
-                                if let Ok(mut s) = user_stats_arc.lock() {
-                                    *s = Some(stats);
-                                }
+                        if let Ok(stats) = rt.block_on(client.get_user_stats()) {
+                            if let Ok(mut s) = user_stats_arc.lock() {
+                                *s = Some(stats);
                             }
-                            Err(_) => {} 
                         }
                     }
                     Err(e) => {
                         if let Ok(mut logs) = log_arc.lock() {
-                            logs.push(format!("Search API Error: {}", e));
+                            push_log(&mut logs, format!("Search API Error: {}", e));
                         }
                     }
                 }
@@ -869,10 +1199,11 @@ impl DarkCoreApp {
         let client_opt = self.api_client.clone();
         let cache_arc = self.update_cache.clone();
         let steam_path = self.config.steam_path.clone();
+        let log_arc = self.system_log.clone();
+        let updates_dl = self.updates_downloading.clone();
 
         std::thread::spawn(move || {
             let client = if let Some(c) = client_opt { c } else { return; };
-            // Safe Runtime
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -888,29 +1219,44 @@ impl DarkCoreApp {
                 let client = client.clone();
                 let cache = cache_arc.clone();
                 let sp = steam_path.clone();
+                let log_clone = log_arc.clone();
+                let updates_clone = updates_dl.clone();
                 
-                handles.push(tokio::spawn(async move {
-                    // 1. Get Local LastUpdated
+                handles.push(rt.spawn(async move {
+                    // 1. Get Local BuildID & StateFlags
                     let acf_path = std::path::Path::new(&sp).join("steamapps")
                         .join(format!("appmanifest_{}.acf", appid));
                     
-                    let mut local_ts = 0u64;
+                    let mut local_buildid = 0u64;
+                    let mut state_flags = 0u32;
+
                     if acf_path.exists() {
                         if let Ok(content) = std::fs::read_to_string(&acf_path) {
-                            // Simple Regex/Find for "LastUpdated"
-                            // Format: "LastUpdated" "1234567890"
-                            if let Some(pos) = content.find("\"LastUpdated\"") {
+                            // Parse StateFlags
+                            if let Some(pos) = content.find("\"StateFlags\"") {
+                                 let remainder = &content[pos..];
+                                 if let Some(start_quote) = remainder.find("\"") {
+                                     if let Some(end_label) = remainder[start_quote+1..].find("\"") {
+                                          let val_part = &remainder[start_quote+1+end_label+1..];
+                                          if let Some(v_start) = val_part.find("\"") {
+                                              if let Some(v_end) = val_part[v_start+1..].find("\"") {
+                                                  let num_str = &val_part[v_start+1 .. v_start+1+v_end];
+                                                  state_flags = num_str.parse().unwrap_or(0);
+                                              }
+                                          }
+                                     }
+                                 }
+                            }
+                            // Parse buildid
+                            if let Some(pos) = content.find("\"buildid\"") {
                                 let remainder = &content[pos..];
-                                // Skip label and search for value
                                 if let Some(start_quote) = remainder.find("\"") {
-                                    // Skip first quote of label, find second
                                     if let Some(end_label) = remainder[start_quote+1..].find("\"") {
                                          let val_part = &remainder[start_quote+1+end_label+1..];
-                                         // Find value quotes
                                          if let Some(v_start) = val_part.find("\"") {
                                              if let Some(v_end) = val_part[v_start+1..].find("\"") {
                                                  let num_str = &val_part[v_start+1 .. v_start+1+v_end];
-                                                 local_ts = num_str.parse().unwrap_or(0);
+                                                 local_buildid = num_str.parse().unwrap_or(0);
                                              }
                                          }
                                     }
@@ -919,37 +1265,50 @@ impl DarkCoreApp {
                         }
                     }
 
-                    // 2. Get Remote Status
-                    match client.get_status(&appid).await {
-                        Ok(status) => {
-                             let mut needs_update = false;
-                             
-                             // A. Explicit Flag
-                             if let Some(true) = status.needs_update {
-                                 needs_update = true;
-                             }
-                             
-                             // B. Timestamp comparison
-                             if !needs_update && local_ts > 0 {
-                                 if let Some(ts_str) = status.timestamp {
-                                     // Try parsing ISO or Unix?
-                                     // Solus uses DateTime. Assuming ISO 8601.
-                                     use chrono::DateTime;
-                                     if let Ok(dt) = DateTime::parse_from_rfc3339(&ts_str) {
-                                         let remote_ts = dt.timestamp() as u64;
-                                         if remote_ts > local_ts {
-                                             needs_update = true;
-                                         }
-                                     }
-                                 }
-                             }
-                             
-                             if let Ok(mut c) = cache.lock() {
-                                 c.insert(appid, needs_update);
-                             }
-                        },
-                        Err(_) => {
-                            // If API fails, assume False (Play) or keep previous
+                    // 2. Always set UI cache to false (PLAY button, never UPDATE)
+                    if let Ok(mut c) = cache.lock() {
+                        c.insert(appid.clone(), false);
+                    }
+
+                    // 3. If installed, check for buildid mismatch and trigger WUDRM
+                    let is_installed = (state_flags & 4) != 0;
+                    if is_installed && local_buildid > 0 {
+                        // Get remote buildid from SteamCMD (FREE)
+                        if let Ok(info) = client.get_app_info(&appid).await {
+                            if let Some(remote_bid) = info.buildid {
+                                if remote_bid > local_buildid {
+                                    // Update available!
+                                    if let Ok(mut logs) = log_clone.lock() {
+                                        push_log(&mut logs, format!("🔄 Update detected for AppID {}. Refreshing manifests...", appid));
+                                    }
+                                    
+                                    // Mark as downloading
+                                    if let Ok(mut dl) = updates_clone.lock() {
+                                        dl.insert(appid.clone());
+                                    }
+                                    
+                                    // Trigger WUDRM (synchronous call in blocking context)
+                                    let sp_ref = sp.clone();
+                                    let aid = appid.clone();
+                                    let log_ref = log_clone.clone();
+                                    let updates_ref = updates_clone.clone();
+                                    
+                                    // Spawn blocking task for WUDRM
+                                    tokio::task::spawn_blocking(move || {
+                                        let log_fn = |msg: String| {
+                                            if let Ok(mut logs) = log_ref.lock() {
+                                                push_log(&mut logs, msg);
+                                            }
+                                        };
+                                        let _ = download_manifests_wudrm(&aid, &sp_ref, &log_fn);
+                                        
+                                        // Remove from downloading set
+                                        if let Ok(mut dl) = updates_ref.lock() {
+                                            dl.remove(&aid);
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                 }));
@@ -961,17 +1320,357 @@ impl DarkCoreApp {
         });
     }
 
-    pub fn install_game(&self, appid: String, name: String, target_library: Option<std::path::PathBuf>, install_dir_name: Option<String>) {
+     fn open_manifestor(&mut self, appid: String, name: String) {
+        self.manifestor_open = true;
+        self.manifestor_candidate_id = Some(appid.clone());
+        self.manifestor_candidate_name = name.clone();
+        
+        // Detect Libraries if not already
+        if self.detected_libraries.is_empty() {
+            self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+        }
+        // Default target library
+        self.manifestor_target_library = self.detected_libraries.get(0).cloned();
+        
+        // Reset data
+        if let Ok(mut data) = self.manifestor_data.lock() {
+            *data = None;
+        }
+        
+        // Check API Client
+        if let Some(client) = &self.api_client {
+            let client = client.clone();
+            let data_target = self.manifestor_data.clone();
+            let appid_target = appid.clone();
+            
+            // Spawn Fetch Task
+            tokio::spawn(async move {
+                // Fetch English hierarchy by default
+                if let Ok(hierarchy) = client.fetch_full_hierarchy(&appid_target, "english").await {
+                    if let Ok(mut target) = data_target.lock() {
+                        *target = Some(hierarchy);
+                    }
+                }
+            });
+        }
+    }
+
+    fn show_manifestor_modal(&mut self, ctx: &egui::Context) {
+        if !self.manifestor_open { return; }
+        
+        let mut close_modal = false;
+        let mut launch_params: Option<(String, String, Vec<String>)> = None;
+        
+        // Scope for Mutex Lock
+        {
+            let mut open = true;
+            let mut should_close_ui = false;
+            let mut hierarchy_guard = self.manifestor_data.lock().unwrap();
+            let _target_lib = self.manifestor_target_library.clone(); // Unused here now
+            let _detected_libs = self.detected_libraries.clone();
+    
+            egui::Window::new(egui::RichText::new(format!("📦 INSTALL: {}", self.manifestor_candidate_name)).strong())
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size(egui::vec2(500.0, 600.0))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical(|ui| {
+                        if hierarchy_guard.is_none() {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(50.0);
+                                ui.spinner();
+                                ui.label("Fetching Game Hierarchy & DLCs...");
+                                ui.label(egui::RichText::new("Querying SteamCMD...").size(10.0).color(egui::Color32::GRAY));
+                            });
+                            return;
+                        }
+                        
+                        let hierarchy = hierarchy_guard.as_mut().unwrap();
+                        let dlc_count = hierarchy.dlcs.len();
+                        // Calculate TRUE Slot Usage (AppList Lines)
+                        // GreenLuma Limit applies to TOTAL entries (AppIDs + Depots)
+                        let mut simulated_ids = Vec::with_capacity(200);
+                        simulated_ids.push(hierarchy.root_id.clone());
+                        for depot in &hierarchy.base_depots { simulated_ids.push(depot.depot_id.clone()); }
+                        
+                        for dlc in &hierarchy.dlcs {
+                            if dlc.selected {
+                                simulated_ids.push(dlc.app_id.clone());
+                                for depot in &dlc.depots { simulated_ids.push(depot.depot_id.clone()); }
+                            }
+                        }
+                        simulated_ids.sort();
+                        simulated_ids.dedup();
+                        
+                        let selected_count = simulated_ids.len();
+                        let limit_max = 130;
+                        let is_over_limit = selected_count > limit_max;
+                        
+                        ui.add_space(10.0);
+                        ui.heading(&hierarchy.root_name);
+                        ui.label(egui::RichText::new(format!("AppID: {}", hierarchy.root_id)).monospace().color(egui::Color32::GRAY));
+                        ui.separator();
+                        
+                        if is_over_limit {
+                            ui.label(
+                                egui::RichText::new(format!("⚠️ CRITICAL: SYSTEM LIMIT EXCEEDED ({}/{})", selected_count, limit_max))
+                                .color(egui::Color32::RED).strong().size(16.0)
+                            );
+                            ui.label("DarkCore/GreenLuma will CRASH if you proceed. Please deselect items.");
+                            ui.separator();
+                        } else {
+                            ui.label(egui::RichText::new(format!("Slots Used: {} / {} (Safe)", selected_count, limit_max)).color(egui::Color32::GREEN));
+                        }
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Select All").clicked() {
+                                for dlc in &mut hierarchy.dlcs { dlc.selected = true; }
+                            }
+                            if ui.button("Deselect All").clicked() {
+                                for dlc in &mut hierarchy.dlcs { dlc.selected = false; }
+                            }
+                            if ui.button(egui::RichText::new("✨ Essential Content Only").color(egui::Color32::GOLD)).on_hover_text("Selects only Story/Level DLCs.").clicked() {
+                                for dlc in &mut hierarchy.dlcs {
+                                    let n = dlc.name.to_lowercase();
+                                    if n.contains("soundtrack") || n.contains(" ost") || n.contains("artbook") || n.contains("wallpaper") || n.contains("skin") || n.contains("costume") {
+                                        dlc.selected = false;
+                                    } else {
+                                        dlc.selected = true;
+                                    }
+                                }
+                            }
+                        });
+                        ui.separator();
+
+                        egui::ScrollArea::vertical().max_height(350.0).show(ui, |ui| {
+                             let mut base_checked = true;
+                             ui.add_enabled(false, egui::Checkbox::new(&mut base_checked, egui::RichText::new("Base Game (Core)").strong()));
+                             
+                             if hierarchy.dlcs.is_empty() {
+                                 ui.label("No DLCs found.");
+                             } else {
+                                 for dlc in &mut hierarchy.dlcs {
+                                     ui.horizontal(|ui| {
+                                         ui.checkbox(&mut dlc.selected, &dlc.name);
+                                         ui.label(egui::RichText::new(format!("({})", dlc.app_id)).size(9.0).color(egui::Color32::GRAY));
+                                     });
+                                 }
+                             }
+                        });
+                        
+                        ui.separator();
+                        
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                should_close_ui = true;
+                            }
+                            
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let btn_text = if is_over_limit { "⛔ LIMIT EXCEEDED" } else { "CONFIRM & PROCEED" };
+                                let btn = egui::Button::new(egui::RichText::new(btn_text).strong().color(if is_over_limit { egui::Color32::DARK_RED } else { egui::Color32::BLACK }))
+                                    .fill(if is_over_limit { egui::Color32::BLACK } else { egui::Color32::GREEN })
+                                    .min_size(egui::vec2(150.0, 30.0));
+                                    
+                                let resp = ui.add_enabled(!is_over_limit, btn);
+                                
+                                if resp.clicked() {
+                                    // SAVE SELECTIONS AND CHAIN TO LIBRARY MODAL
+                                    let selections: Vec<String> = hierarchy.dlcs.iter().filter(|d| d.selected).map(|d| d.app_id.clone()).collect();
+                                    launch_params = Some((hierarchy.root_id.clone(), hierarchy.root_name.clone(), selections));
+                                    should_close_ui = true;
+                                }
+                            });
+                        });
+                    });
+                });
+                
+            if !open || should_close_ui {
+                close_modal = true;
+            }
+        }
+        
+        // EXECUTE CHAIN (Lock Dropped)
+        if let Some((app_id, name, selections)) = launch_params {
+            self.manifestor_selections = selections;
+            self.manifestor_open = false; // Close Manifestor
+            
+            // Open Library Selection Modal (Next Step)
+            self.install_candidate = Some((app_id, name));
+            self.install_modal_open = true;
+        } else if close_modal {
+            self.manifestor_open = false;
+        }
+    }    
+    pub fn install_game(&mut self, appid: String, name: String, target_library: Option<std::path::PathBuf>, install_dir_name: Option<String>) {
+        
+        // NEW: Check if Manifestor populated selections. If so, bypass scan.
+        // Also check if we should default to AUTO/ALL if manifestor wasn't used?
+        // Actually, if self.manifestor_selections is empty BUT the user passed through manifestor, it means "Base Game Only".
+        // Use a flag for "UsingManifestor" or check if selections were cleared? 
+        // We can just check `!self.manifestor_open` (it's closed now) and assume if we have selections or if we came from that flow...
+        // Better: We force use `finalize_installation` directly from the UI for Manifestor path, OR
+        // we make `install_game` smarter.
+        // Let's make `install_game` smart.
+
+        // If this is a Manifestor install, `manifestor_selections` will be set (even if empty, likely handled by UI clear).
+        // Problem: `manifestor_selections` persists. We should clear it after use.
+        // Let's assume if it is NOT user initiated scan, we use it.
+        // Actually, `manifestor_selections` can be passed to verify.
+        
+        // Wait, if I chain the UI, `show_install_modal` calls `install_game`.
+        // So `install_game` MUST handle the bypassing.
+        
+        // BYPASS LOGIC
+        // We need a reliable way to know "This install uses Manifestor selections".
+        // We can check if `self.manifestor_selections` was recently updated?
+        // Simplest: If `self.manifestor_selections` isn't empty OR if we assume all flow goes through Manifestor now (which it does for "Install" button).
+        // But what about updates?
+        
+        // Let's rely on `finalize_installation` accepting the selections.
+        // If `install_game` is called, we check `self.manifestor_selections`.
+        // If we want to support "Default Install" (no manifestor), `manifestor_selections` would be empty?
+        // But "Base Game Only" is also empty.
+        
+        // Solution: `open_manifestor` clears `manifestor_selections`.
+        // `show_manifestor_modal` sets them (even empty Vec).
+        // We need a flag `manifestor_active_session`?
+        // Let's just use `finalize_installation` directly here if we trust the context.
+        
+        // For now, let's assume if we are calling `install_game`, we want to proceed.
+        // If `manifestor_selections` is set (we can change it to Option<Vec> to differentiate "None/Unset" vs "Empty/BaseOnly").
+        // But it is Vec<String>.
+        
+        // HOTFIX: Passing selections directly to finalize if appropriate, skipping scan.
+        // Since we enforced Manifestor for ALL installs in Grid, we can trust `manifestor_selections` represents the user's intent.
+        // CAUTION: If user cancels manifestor, we don't call this.
+        // So:
+        
+        // Check if we have Manifestor data available to pass
+        let hierarchy = if let Ok(data) = self.manifestor_data.lock() {
+            data.clone()
+        } else {
+            None
+        };
+
+        self.finalize_installation(appid, name, target_library, install_dir_name, self.manifestor_selections.clone(), None, hierarchy);
+        
+        // Clear selections after handing off? No, finalize is async thread spawn. Clone is fine.
+        // But we should reset them for next time? 
+        // `open_manifestor` resets them. Correct.
+        return; 
+        
+        /* SCANNNER BYPASSED
+        let client_opt = self.api_client.clone(); 
+        ... */
+    }
+
+    #[allow(dead_code)]
+    fn legacy_install_game(&mut self, appid: String, name: String, target_library: Option<std::path::PathBuf>, install_dir_name: Option<String>) {
+        // Renamed old install_game to logic below if needed
+        let client_opt = self.api_client.clone();
+        let _log_arc = self.system_log.clone();
+        
+        // CAPTURE CONTEXT FOR ASYNC
+        let appid_c = appid.clone();
+        
+        // Prepare Scanner State
+        let scan_res = self.dlc_scan_result.clone();
+        
+        // RESET ZIP CACHE
+        if let Ok(mut zip) = self.dlc_scan_result_zip.lock() {
+            *zip = None;
+        }
+
+        // [Scanner State Reset]
+        let scan_zip_res = self.dlc_scan_result_zip.clone(); // NEW
+        *scan_res.lock().unwrap() = None;
+        *scan_zip_res.lock().unwrap() = None; // NEW
+        self.is_scanning_dlcs = true;
+        
+        // Store candidate info for the UI to pick up after scan
+        self.dlc_picker_candidate = Some((appid.clone(), name.clone()));
+        self.dlc_picker_pending_library = target_library.clone();
+        self.dlc_picker_pending_install_dir = install_dir_name.clone();
+        
+        // Log
+        let log_arc = self.system_log.clone();
+        if let Ok(mut l) = log_arc.lock() {
+            l.push(format!("Checking DLCs for {}...", name));
+        }
+
+        std::thread::spawn(move || {
+            if let Some(client) = client_opt {
+                 if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                      // Fetch .lua from Morrenus
+                      match rt.block_on(client.download_manifest(&appid_c)) {
+                          Ok(lua_bytes) => {
+                              // NEW: Cache bytes
+                              *scan_zip_res.lock().unwrap() = Some(lua_bytes.to_vec());
+
+                              let lua_content = String::from_utf8_lossy(&lua_bytes).to_string();
+                              
+                              // Parse LUA for DLCs (IDs without keys = AppIDs/DLCs)
+                              let (applist_ids, keys) = crate::vdf_injector::parse_lua_for_keys(&lua_content);
+                              let depot_count = keys.len(); // Depots have keys
+                              
+                              // Filter: DLCs are IDs in applist_ids that are NOT the base game
+                              let dlc_items: Vec<(String, String, bool)> = applist_ids.iter()
+                                  .filter(|id| *id != &appid_c)
+                                  .map(|id| {
+                                      // Try to extract name from LUA comments
+                                      let name = extract_dlc_name_from_lua(&lua_content, id)
+                                          .unwrap_or_else(|| format!("DLC {}", id));
+                                      (id.clone(), name, true)
+                                  })
+                                  .collect();
+                              
+                              if !dlc_items.is_empty() {
+                                  if let Ok(mut l) = log_arc.lock() {
+                                      l.push(format!("Morrenus: Found {} DLCs for picker.", dlc_items.len()));
+                                  }
+                                  *scan_res.lock().unwrap() = Some((dlc_items, depot_count));
+                              } else {
+                                  *scan_res.lock().unwrap() = Some((Vec::new(), depot_count));
+                              }
+                          },
+                          Err(e) => {
+                               if let Ok(mut l) = log_arc.lock() {
+                                   l.push(format!("Morrenus Error: {}. Proceeding without DLC picker.", e));
+                               }
+                               *scan_res.lock().unwrap() = Some((Vec::new(), 0));
+                          }
+                      }
+                 }
+            } else {
+                // No Client
+                *scan_res.lock().unwrap() = Some((Vec::new(), 0));
+            }
+        });
+    }
+
+    pub fn finalize_installation(
+        &self, 
+        appid: String, 
+        name: String, 
+        target_library: Option<std::path::PathBuf>, 
+        install_dir_name: Option<String>,
+        selected_dlcs: Vec<String>,
+        cached_zip: Option<Vec<u8>>, // NEW
+        hierarchy: Option<crate::api::GameHierarchy>, // NEW: For precise dependency resolution
+    ) {
         // UNIFIED PROTOCOL: Works both Online (Manifests) and Offline (FamSharing/Public) through Fallbacks.
         let log_arc = self.system_log.clone();
         // let api_client_clone = self.api_client.clone(); // Not needed if we re-init
         let steam_path = self.config.steam_path.clone(); // Still need main path for other things
         let gl_path = self.config.gl_path.clone();
-        let include_dlcs = self.include_dlcs;
+        let _include_dlcs = self.include_dlcs;
         let game_cache = self.game_cache.clone(); // Keep this for cache updates
         let api_key = self.config.api_key.clone(); // Keep this for API client creation inside thread
         let relationships_arc = self.relationships.clone(); // New: Capture relationships map for thread
         let enable_stealth = self.config.enable_stealth_mode;
+        let is_free = self.install_candidate_is_free; // Capture F2P State
         let user_stats_arc = self.user_stats.clone(); // For refreshing token count after download
         
         // Use Arc/Mutex for status updates
@@ -988,12 +1687,25 @@ impl DarkCoreApp {
                 if let Ok(mut logs) = log_arc.lock() {
                     // Print first (borrow), then push (move)
                     println!("[LOG] {}", msg);
-                    logs.push(msg);
+                    push_log(&mut logs, msg);
                 }
             };
             
-            // Re-initialize client inside thread for manifest download
+            // Re-initialize client inside thread
             let client = ApiClient::new(api_key.clone());
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            
+            // FETCH DEPOT INFO via SteamCMD (reserved for future update checks)
+            let mut _steamcmd_info = None;
+            match runtime.block_on(client.get_app_info(&appid)) {
+                Ok(info) => {
+                    log(format!("SteamCMD: Fetched info. Found {} depots.", info.depots.len()));
+                    _steamcmd_info = Some(info);
+                },
+                Err(e) => {
+                    log(format!("Warning: Could not fetch SteamCMD info: {}", e));
+                }
+            }
 
             log(format!("START: Protocol for {}", name));
             update_status(format!("Installing {}", name));
@@ -1002,18 +1714,16 @@ impl DarkCoreApp {
             // Ensure .bin files exist
             if let Err(e) = setup_greenluma_config(&gl_path, enable_stealth) {
                  log(format!("Warning: Could not setup GreenLuma config: {}", e));
+            } else if enable_stealth {
+                log("GreenLuma configured (Stealth Mode: ON).".to_string());
             } else {
-                 if enable_stealth {
-                     log("GreenLuma configured (Stealth Mode: ON).".to_string());
-                 } else {
-                     log("GreenLuma configured (Stealth Mode: OFF).".to_string());
-                 }
+                log("GreenLuma configured (Stealth Mode: OFF).".to_string());
             }
 
 
             // STEP 1: Kill Steam
             log("STEP 1: Killing Steam Process...".to_string());
-            let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
+            let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "steam.exe"]).output();
             std::thread::sleep(std::time::Duration::from_millis(2000));
 
             // PATH DEFINITIONS
@@ -1057,14 +1767,18 @@ impl DarkCoreApp {
             // VAULT RESTORE CHECK
             let vault = VaultManager::new(".");
             let mut skip_ghost = false;
+            let mut skip_morrenus = false;  // Skip Morrenus download if Vault has manifests
             
             // HOISTED: Calculate Install Dir Name (Available for both Ghost ACF and Tactical Bypass)
             // Use potentially overridden install dir name, or default to display name
-            let final_install_dir = install_dir_name.as_ref().map(|s| s.clone()).unwrap_or(name.clone());
+            let final_install_dir = install_dir_name.clone().unwrap_or(name.clone());
 
             // Use library_path for restore check/logic
             if let Ok((restored_acf, count)) = vault.restore_manifests(&library_path, &appid) {
-                if count > 0 { log(format!("Vault: Restored {} local depot manifests.", count)); }
+                if count > 0 { 
+                    log(format!("Vault: Restored {} local depot manifests. SKIPPING MORRENUS (Token Saved). 🛡️", count)); 
+                    skip_morrenus = true;  // Don't waste token!
+                }
                 if restored_acf {
                     log("Vault: Restored AppManifest.acf. Skipping Ghost Generation. 🛡️".to_string());
                     skip_ghost = true;
@@ -1072,6 +1786,12 @@ impl DarkCoreApp {
             }
 
             if !skip_ghost {
+                // CRITICAL: Delete existing ACF first to ensure Steam sees fresh state
+                if acf_path.exists() {
+                    log(format!("Removing old ACF: {:?}", acf_path));
+                    let _ = std::fs::remove_file(&acf_path);
+                }
+
                 log(format!("Generating Ghost ACF (SMD-Style) at: {:?}", acf_path));
 
                 // Use SMD-style minimal ACF (5 fields only)
@@ -1086,240 +1806,174 @@ impl DarkCoreApp {
             }
 
 
-
-            // STEP 2: TRY MANIFEST (Priority + Vault)
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-            let mut manifest_success = false;
-            let mut lua_content = String::new();
-            let vault = VaultManager::new(".");
-
-            // Helper to process ZIP bytes - ENHANCED LOGGING
-            let process_zip = |bytes: Vec<u8>, log_fn: &dyn Fn(String)| -> (bool, String, Vec<std::path::PathBuf>) {
-                let reader = Cursor::new(bytes);
-                let mut manifest_paths = Vec::new();
-                if let Ok(mut zip) = ZipArchive::new(reader) {
-                    log_fn(format!("📦 ZIP contains {} files:", zip.len()));
-                    
-                    let depot_dir = Path::new(&steam_path).join("depotcache");
-                    if !depot_dir.exists() {
-                         let _ = std::fs::create_dir_all(&depot_dir);
-                    }
-                    log_fn(format!("   Depot cache dir: {:?}", depot_dir));
-                    
-                    let mut extracted_lua = String::new();
-                    for i in 0..zip.len() {
-                        if let Ok(mut file) = zip.by_index(i) {
-                            let raw_path = file.name().to_string();
-                            log_fn(format!("   [{}] {}", i, raw_path));
-                            
-                            if raw_path.ends_with(".manifest") {
-                                 if let Some(fname) = Path::new(&raw_path).file_name() {
-                                     let out_path = depot_dir.join(fname);
-                                     if let Ok(mut outfile) = std::fs::File::create(&out_path) {
-                                          let bytes_copied = std::io::copy(&mut file, &mut outfile).unwrap_or(0);
-                                          log_fn(format!("      ✅ Extracted manifest: {:?} ({} bytes)", out_path, bytes_copied));
-                                          manifest_paths.push(out_path);
-                                     } else {
-                                         log_fn(format!("      ❌ Failed to create file: {:?}", out_path));
-                                     }
-                                 }
-                            } else if raw_path.ends_with(".lua") {
-                                 use std::io::Read;
-                                 let _ = file.read_to_string(&mut extracted_lua);
-                                 log_fn(format!("      ✅ Extracted LUA ({} chars)", extracted_lua.len()));
-                            }
-                        }
-                    }
-                    return (true, extracted_lua, manifest_paths);
-                } else {
-                    log_fn("❌ Failed to open as ZIP archive".to_string());
-                }
-                (false, String::new(), Vec::new())
-            };
-
-            // VAULT CHECK
-            let mut bytes_opt = None;
-            if vault.exists(&appid) {
-                log(format!("DarkVault: Found cached manifest for {}. Loading local... 🛡️", appid));
-                if let Ok(b) = vault.get(&appid) {
-                     bytes_opt = Some(b);
-                }
-            }
-
-            if bytes_opt.is_none() && !api_key.is_empty() {
-                log(format!("STEP 2: Downloading Manifest for ID {} (Online)...", appid));
-                match runtime.block_on(client.download_manifest(&appid)) {
-                     Ok(bytes) => {
-                         // Save to Vault
-                         if let Err(e) = vault.save(&appid, &bytes) {
-                             log(format!("Vault Save Error: {}", e));
-                         } else {
-                             log("Download successful. Saved to Vault.".to_string());
-                             // EXTRA: Backup Depots
-                             if let Ok(c) = vault.backup_manifests(&steam_path, &appid) {
-                                  if c > 0 { log(format!("Vault: Secured {} local depot manifests.", c)); }
-                             }
-                             
-                             // AUTO-REFRESH TOKEN COUNTER (so user sees updated count immediately)
-                             if let Ok(new_stats) = runtime.block_on(client.get_user_stats()) {
-                                 if let Ok(mut stats) = user_stats_arc.lock() {
-                                     *stats = Some(new_stats);
-                                 }
-                             }
-                         }
-                         bytes_opt = Some(bytes.to_vec());
-                     },
-                     Err(_) => {
-                         log("Manifest download failed (Invalid Key or Server Error). Skipping to Fallback...".to_string());
-                     }
-                }
-            } else if bytes_opt.is_none() {
-                 log("OFFLINE MODE: No Key & No Cache. Skipping Manifest.".to_string());
-            }
-
-            if let Some(bytes) = bytes_opt {
-                let (ok, content, paths) = process_zip(bytes, &log);
-                manifest_success = ok;
-                lua_content = content;
-                
-                if !paths.is_empty() {
-                    log(format!("✅ Extracted {} manifests. Backing up to Vault...", paths.len()));
-                    let mut saved_count = 0;
-                    for p in paths {
-                        if vault.store_manifest(&appid, &p).is_ok() {
-                            saved_count += 1;
-                        }
-                    }
-                    if saved_count > 0 {
-                         log(format!("✅ Vault: Secured {}/{} manifests.", saved_count, saved_count));
-                    }
-                } else if ok {
-                    log("Warning: No manifests found in zip bundle.".to_string());
-                }
-            }
-
-            // STEP 3: PREPARE IDs (Hybrid)
-            let mut final_ids = Vec::new();
-
-            // 3A. If Manifest/Lua success -> Use Lua IDs (Best)
-            if manifest_success && !lua_content.is_empty() {
-                let (all_ids, keys) = parse_lua_for_keys(&lua_content);
-                log(format!("🔑 LUA Analysis: Found {} AppIDs and {} Depot Keys.", all_ids.len(), keys.len()));
-
-                // Debug: Log the keys we found (Masked)
-                for (d_id, d_key) in &keys {
-                    let mask = if d_key.len() > 8 { &d_key[0..8] } else { "???" };
-                    log(format!("   - Key for Depot {}: {}...", d_id, mask));
-                }
-
-                if keys.is_empty() {
-                    log("⚠️ WARNING: No Depot Keys found in LUA! Steam download will likely fail with 'Content Encrypted'.".to_string());
-                }
+            // STEP 2: MORRENUS MANIFEST DOWNLOAD (Or use Vault if available)
+            let mut applist_ids = Vec::new();
+            let mut keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
+            if !depot_cache.exists() { let _ = std::fs::create_dir_all(&depot_cache); }
             
-            // VDF Injection (Steam Native)
-            let vdf_file = std::path::Path::new(&steam_root).join("config").join("config.vdf");
-            if !vdf_file.exists() {
-                log(format!("⚠️ CRITICAL WARNING: config.vdf NOT FOUND at {:?}.", vdf_file));
-            }
-
-            if let Err(e) = inject_vdf(&steam_root, &keys) {
-                log(format!("Steam VDF Error: {}", e));
+            if skip_morrenus {
+                // Vault already restored manifests, skip Morrenus download
+                log("STEP 2: SKIPPED - Using Vault manifests (0 API Tokens Used). 🛡️".to_string());
+                applist_ids.push(appid.clone());
+                // Keys should already be in config.vdf from previous installation
             } else {
-                log(format!("✅ Depot Keys Injected. Verifying persistence in {:?}...", vdf_file));
+                log("STEP 2: Fetching game data from Morrenus...".to_string());
+                update_status(format!("Downloading manifests for {}", name));
                 
-                // VERIFICATION: Read back to confirm
-                if let Ok(written_content) = std::fs::read_to_string(&vdf_file) {
-                    let mut all_found = true;
-                    for (d_id, d_key) in &keys {
-                         if !written_content.contains(d_key) {
-                             log(format!("❌ CRITICAL: Key for Depot {} NOT FOUND in config.vdf after write!", d_id));
-                             all_found = false;
-                         }
-                    }
-                    if all_found {
-                        log("✨ SUCCESS: All Depot Keys verified physically present in config.vdf.".to_string());
-                    } else {
-                        log("⚠️ WARNING: Some keys failed to persist. Check permissions or file locks.".to_string());
-                    }
+                let mut manifests_from_zip = 0usize;
+                
+                // Fetch ZIP (or raw .lua) from Morrenus API
+                // CACHE / VAULT / DOWNLOAD PROTOCOL
+                let download_result = if let Some(bytes) = cached_zip {
+                     log("📦 Using CACHED data from DLC scan (Saved 1 API Token).".to_string());
+                     // Save to Vault
+                     let v = crate::vault::VaultManager::new(".");
+                     let _ = v.save(&appid, &bytes);
+                     Ok(bytes)
                 } else {
-                    log("❌ Error reading config.vdf for verification.".to_string());
-                }
-            }
+                     // Check Vault
+                     let v = crate::vault::VaultManager::new(".");
+                     if let Ok(bytes) = v.get(&appid) {
+                          log("📦 Using VAULT data (Saved 1 API Token). 🛡️".to_string());
+                          Ok(bytes)
+                     } else {
+                          // Download
+                          match runtime.block_on(client.download_manifest(&appid)) {
+                              Ok(bytes) => {
+                                  log("📦 Saved Morrenus data to Vault.".to_string());
+                                  let vec = bytes.to_vec();
+                                  let _ = v.save(&appid, &vec);
+                                  Ok(vec)
+                              },
+                              Err(e) => Err(e)
+                          }
+                     }
+                };
 
-            // VDF Injection (User Local Config) - New Fix
-            if let Err(e) = crate::vdf_injector::inject_localconfig_vdf(&steam_root, &keys) {
-                 log(format!("LocalConfig VDF Error: {}", e));
-            } else {
-                 log("✅ Depot Keys Injected into UserData localconfig.vdf.".to_string());
-            }
-
-// --- TACTICAL BYPASS: DepotDownloader ---
-// --- TACTICAL BYPASS: NATIVE DOWNLOADER (Mk3) ---
-            log("⚔️ TACTICAL PROTOCOL: Engaging Native Downloader Bypass (Mk3)...".to_string());
-
-            let full_install_path = std::path::Path::new(&library_path).join("steamapps").join("common").join(&final_install_dir);
-            let _install_dir_str = full_install_path.to_string_lossy().to_string();
-
-            // Stats Collection for ACF
-            let _installed_depots_data: Vec<(String, u64, String)> = Vec::new(); // (DepotID, Size, ManifestID)
-            let _total_bytes_downloaded: u64 = 0;
-
-            for (d_id, _d_key) in &keys {
-                log(format!("⬇️ Processing Depot {}...", d_id));
-
-                // 1. Locate Manifest (check multiple locations)
-                let mut manifest_path = String::new();
-                
-                // 1a. Check Steam depotcache first (primary location)
-                let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
-                if let Ok(entries) = std::fs::read_dir(&depot_cache) {
-                    for entry in entries.flatten() {
-                       let fname = entry.file_name().to_string_lossy().to_string();
-                       // Pattern: {depot_id}_{manifest_id}.manifest
-                       if fname.starts_with(d_id) && fname.ends_with(".manifest") {
-                            manifest_path = entry.path().to_string_lossy().to_string();
-                            log(format!("   - Found Manifest (depotcache): {}", fname));
-                            break;
-                       }
-                    }
-                }
-                
-                // 1b. Check Vault folder (cached from previous API downloads)
-                if manifest_path.is_empty() {
-                    let vault_dir = std::path::Path::new("Vault").join(&appid);
-                    if vault_dir.exists() {
-                        if let Ok(entries) = std::fs::read_dir(&vault_dir) {
-                            for entry in entries.flatten() {
-                               let fname = entry.file_name().to_string_lossy().to_string();
-                               if fname.starts_with(d_id) && fname.ends_with(".manifest") {
-                                    manifest_path = entry.path().to_string_lossy().to_string();
-                                    log(format!("   - Found Manifest (Vault): {}", fname));
-                                    break;
-                               }
+                match download_result {
+                    Ok(zip_bytes) => {
+                        log(format!("Morrenus: Received {} bytes.", zip_bytes.len()));
+                        
+                        // Try to extract as ZIP first
+                        let lua_content = if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes[..])) {
+                                log(format!("Morrenus ZIP contains {} files.", archive.len()));
+                                let mut lua_data = String::new();
+                                
+                                for i in 0..archive.len() {
+                                    if let Ok(mut file) = archive.by_index(i) {
+                                        let fname = file.name().to_string();
+                                        
+                                        if fname.ends_with(".lua") {
+                                            // Extract .lua content
+                                            use std::io::Read;
+                                            file.read_to_string(&mut lua_data).ok();
+                                            log(format!("  ✓ Extracted LUA: {}", fname));
+                                        } else if fname.ends_with(".manifest") {
+                                            // Extract .manifest to depotcache AND Vault
+                                            use std::io::Read;
+                                            let mut manifest_bytes = Vec::new();
+                                            if file.read_to_end(&mut manifest_bytes).is_ok() {
+                                                let manifest_name = std::path::Path::new(&fname).file_name()
+                                                    .map(|n| n.to_string_lossy().to_string())
+                                                    .unwrap_or(fname.clone());
+                                                let dest = depot_cache.join(&manifest_name);
+                                                if std::fs::write(&dest, &manifest_bytes).is_ok() {
+                                                    log(format!("  ✓ Extracted Manifest: {}", manifest_name));
+                                                    manifests_from_zip += 1;
+                                                    
+                                                    // Also save to Vault for future reinstalls
+                                                    let vault_dir = std::path::Path::new("Vault").join(&appid);
+                                                    let _ = std::fs::create_dir_all(&vault_dir);
+                                                    let _ = std::fs::write(vault_dir.join(&manifest_name), &manifest_bytes);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if lua_data.is_empty() {
+                                    // No .lua in ZIP, treat whole response as raw text
+                                    String::from_utf8_lossy(&zip_bytes).to_string()
+                                } else {
+                                    lua_data
+                                }
+                            } else {
+                                // Not a valid ZIP, treat as raw .lua text
+                                String::from_utf8_lossy(&zip_bytes).to_string()
+                            };
+                        
+                        // Parse LUA for AppIDs and Keys
+                        let (parsed_ids, parsed_keys) = crate::vdf_injector::parse_lua_for_keys(&lua_content);
+                        log(format!("Parsed: {} AppList entries, {} depot keys.", parsed_ids.len(), parsed_keys.len()));
+                        
+                        applist_ids = parsed_ids;
+                        keys = parsed_keys;
+                        
+                        // Save .lua for reference
+                        let lua_path = depot_cache.join(format!("{}.lua", appid));
+                        let _ = std::fs::write(&lua_path, &lua_content);
+                        
+                        // Download MISSING manifests via Wudrm CDN (only if ZIP didn't have them)
+                        if manifests_from_zip == 0 {
+                            log("No manifests in ZIP. Downloading via Wudrm CDN...".to_string());
+                            match download_manifests_wudrm(&appid, &steam_root, &log) {
+                                Ok(count) => {
+                                    log(format!("✨ Downloaded {} depot manifests via Wudrm.", count));
+                                },
+                                Err(e) => {
+                                    log(format!("Warning: Wudrm download issue: {}", e));
+                                }
                             }
+                        } else {
+                            log(format!("✨ Got {} manifests from Morrenus ZIP. Skipping Wudrm.", manifests_from_zip));
                         }
+                    },
+                    Err(e) => {
+                        log(format!("Morrenus Error: {}. Falling back to Wudrm-only mode.", e));
+                        applist_ids.push(appid.clone());
+                        let _ = download_manifests_wudrm(&appid, &steam_root, &log);
                     }
                 }
-
-                // NOTE: Per-depot API download REMOVED.
-                // The API at /api/v1/manifest/ expects APP_ID, not DEPOT_ID.
-                // Calling it with depot_id wastes tokens and returns wrong data.
-                // All manifests should be included in the main app bundle.
-                // If a manifest is missing here, it means:
-                // 1. The app bundle from API doesn't include this depot
-                // 2. Steam will need to fetch it during the download phase
-
-
-                // SMD APPROACH: We do NOT download chunks ourselves.
-                // Manifests are already in depotcache, keys are in config.vdf.
-                // Steam will handle the actual download when the user clicks "Update" in library.
-                if !manifest_path.is_empty() {
-                    log(format!("📦 Manifest prepared for Depot {}: {}", d_id, manifest_path));
+            }
+            
+            // STEP 3: Filter AppList based on DLC Selection
+            let mut final_ids = Vec::new();
+            
+            if let Some(h) = &hierarchy {
+                log("Using GameHierarchy for Mandatory Depot Resolution...".to_string());
+                final_ids = resolve_mandatory_depots(h, &selected_dlcs);
+                log(format!("Resolved {} mandatory IDs (Base + DLCs + Depots).", final_ids.len()));
+            } else {
+                // Fallback: Use simple AppID + Selected DLCs logic (Legacy)
+                // This might miss separate Depot IDs if Morrenus LUA doesn't group them clearly,
+                // but usually works for simple setups.
+                final_ids.push(appid.clone()); // CRITICAL FIX: Always include base game
+                
+                if !selected_dlcs.is_empty() {
+                     log(format!("Using {} user-selected DLCs (Fallback Mode).", selected_dlcs.len()));
+                     for id in &selected_dlcs {
+                         if !final_ids.contains(id) {
+                             final_ids.push(id.clone());
+                         }
+                     }
                 } else {
-                    log(format!("⚠️ No manifest found for Depot {}. Steam may need to fetch it.", d_id));
+                    log("No DLCs selected (Base Game Only).".to_string());
                 }
             }
-            log("✅ SMD-Style Preparation Complete. Manifests + Keys Ready.".to_string());
+            
+            // STEP 4: Inject ALL depot keys into config.vdf
+            if !keys.is_empty() {
+                log(format!("Injecting {} depot decryption keys into config.vdf...", keys.len()));
+                if let Err(e) = crate::vdf_injector::inject_vdf(&steam_root, &keys) {
+                    log(format!("Warning: Key injection failed: {}", e));
+                } else {
+                    log("✅ Keys injected successfully.".to_string());
+                }
+            }
+            
+            log(format!("AppList will contain {} entries.", final_ids.len()));
+            log("✅ Morrenus Protocol Complete. Manifests + Keys Ready.".to_string());
             log("   → Steam will download the game files when you click 'Update' in the Library.".to_string());
 
             // SMD APPROACH: We do NOT regenerate the ACF here.
@@ -1327,14 +1981,15 @@ impl DarkCoreApp {
             // Steam will update it automatically during the download process.
             
             // NUKE SQUAD: Preemptively remove installscript.vdf if it exists in the game folder
+            let full_install_path = std::path::Path::new(&library_path).join("steamapps").join("common").join(&final_install_dir);
+            // This prevents Steam from triggering the "SteamService" install phase which often fails.
             // This prevents Steam from triggering the "SteamService" install phase which often fails.
             {
                 let script_path = full_install_path.join("installscript.vdf");
-                if script_path.exists() {
-                     if std::fs::remove_file(&script_path).is_ok() {
+                if script_path.exists()
+                     && std::fs::remove_file(&script_path).is_ok() {
                          log("☢️ NUKE: installscript.vdf deleted to bypass SteamService error.".to_string());
                      }
-                }
             }
 
             // VDF Injection (GreenLuma Override)
@@ -1345,63 +2000,7 @@ impl DarkCoreApp {
                  log("✅ Depot Keys Injected into GreenLuma config.".to_string());
             }
 
-            // Filter IDs - SMART: Only add IDs we have manifests/keys for
-                // Adding IDs without corresponding manifests causes 'Data Encrypted' errors!
-                let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
-                let mut skipped_count = 0;
-                
-                for id in all_ids.iter() {
-                    // Always include main AppID
-                    if *id == appid {
-                        final_ids.push(id.clone());
-                        continue;
-                    }
-                    
-                    // Check if we have a key for this ID
-                    let has_key = keys.contains_key(id);
-                    
-                    // Check if manifest exists in depotcache
-                    let has_manifest = if depot_cache.exists() {
-                        // Look for any manifest file starting with this ID
-                        glob::glob(&depot_cache.join(format!("{}_*.manifest", id)).to_string_lossy())
-                            .map(|paths| paths.filter_map(|p| p.ok()).next().is_some())
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    };
-                    
-                    if has_key || has_manifest {
-                        final_ids.push(id.clone());
-                    } else {
-                        skipped_count += 1;
-                        log(format!("⚠️ Skipping ID {} (no manifest/key available)", id));
-                    }
-                }
-                
-                if skipped_count > 0 {
-                    log(format!("📋 Filtered: {} IDs skipped (no manifest). {} IDs will be injected.", skipped_count, final_ids.len()));
-                }
-                 log(format!("Lua Intelligence: Found {} IDs (Game + Depots + DLCs).", final_ids.len()));
-            } 
-            // 3B. If Failed/Offline -> Use Public Store API (Smart Fallback)
-            else {
-                 log("Using Public Steam Store API for DLC detection...".to_string());
-                 final_ids.push(appid.clone()); // Always add main game
-                 
-                 if include_dlcs {
-                     match runtime.block_on(client.get_dlc_list(&appid)) {
-                         Ok(dlcs) => {
-                             if !dlcs.is_empty() {
-                                 log(format!("Found {} DLCs from Steam Store.", dlcs.len()));
-                                 final_ids.extend(dlcs);
-                             } else {
-                                 log("No DLCs found publicly.".to_string());
-                             }
-                         },
-                         Err(_) => log("Could not fetch DLC list (Connection Error).".to_string())
-                     }
-                 }
-            }
+
 
             // STEP 3.5: LINK DLCs (Intelligent Linking)
             {
@@ -1421,11 +2020,15 @@ impl DarkCoreApp {
             }
 
             // STEP 4: UPDATE APPLIST
-            log(format!("STEP 3: Injecting {} IDs to AppList...", final_ids.len()));
-            if let Err(e) = add_games_to_list(&gl_path, final_ids) {
-                 log(format!("AppList Error: {}", e));
+            if !is_free {
+                 log(format!("STEP 3: Injecting {} IDs to AppList...", final_ids.len()));
+                 if let Err(e) = add_games_to_list(&gl_path, final_ids) {
+                      log(format!("AppList Error: {}", e));
+                 } else {
+                      log("AppList updated successfully.".to_string());
+                 }
             } else {
-                 log("AppList updated successfully.".to_string());
+                 log("ℹ️ F2P Title Detected: Skipping GreenLuma AppList injection.".to_string());
             }
 
              // Update Cache
@@ -1433,6 +2036,19 @@ impl DarkCoreApp {
                 if let Ok(mut cache) = game_cache.lock() {
                     cache.insert(appid.clone(), name.clone());
                     let _ = save_game_cache(&cache);
+                }
+            }
+
+            // STEP 4.5: BACKUP MANIFESTS TO VAULT (For future reinstalls)
+            // This ensures that even if user uninstalls, they can reinstall without using API tokens
+            if !skip_morrenus {
+                // Only backup if we actually downloaded something new
+                let backup_vault = crate::vault::VaultManager::new(".");
+                match backup_vault.backup_manifests(&library_path, &appid) {
+                    Ok(count) if count > 0 => {
+                        log(format!("🛡️ Vault: Saved {} manifests for future reinstalls.", count));
+                    },
+                    _ => {}
                 }
             }
 
@@ -1462,24 +2078,9 @@ impl DarkCoreApp {
                              Some("-inhibitbootstrap")
                          ) {
                              Ok(_) => {
-                                 log("✅ INJECTION SUCCESSFUL. Steam starting...".to_string());
-                                 
-                                 // PHASE 2: Wait for GreenLuma Initialization
-                                 log("Waiting 5s for GreenLuma to unlock AppID...".to_string());
-                                 std::thread::sleep(std::time::Duration::from_secs(5));
-    
-                                 // PHASE 3: Trigger Install Trigger
-                                 // v1.3 Logic Restoration + v1.4 Refinement (StateFlags 4)
-                                 // We use -applaunch because it's the native Steam method and v1.3 used it successfully.
-                                 // The key is StateFlags=4 which prevents the "Unknown Error" loop.
-                                 
-                                 log("Triggering via -applaunch (v1.3 Style)...".to_string());
-                                 let _ = std::process::Command::new(steam_exe)
-                                     .arg("-applaunch")
-                                     .arg(&appid)
-                                     .spawn();
-
-                                 log("✅ LAUNCH COMMAND SENT.".to_string());
+                                 log("✅ INJECTION SUCCESSFUL. Steam starting with GreenLuma...".to_string());
+                                 log("Steam will open in a few seconds. The game should appear ready to 'Update'.".to_string());
+                                 log("✅ INSTALLATION COMPLETE.".to_string());
                              },
                              Err(e) => log(format!("❌ LAUNCH FAILED: {}", e)),
                          }
@@ -1491,6 +2092,14 @@ impl DarkCoreApp {
                  }
             } else {
                 log("❌ Error: steam.exe not found.".to_string());
+            }
+
+            // Refresh Stats
+            let client = crate::api::ApiClient::new(api_key.clone());
+            if let Ok(new_stats) = runtime.block_on(client.get_user_stats()) {
+                if let Ok(mut stats_lock) = user_stats_arc.lock() {
+                    *stats_lock = Some(new_stats);
+                }
             }
 
             // Remove legacy open::that call - logic handled by args now
@@ -1507,6 +2116,68 @@ impl eframe::App for DarkCoreApp {
             if let Some(msg) = guard.take() {
                 self.status_msg = msg;
             }
+        }
+
+        // Poll DLC Scanner (for DLC Picker during install)
+        if self.is_scanning_dlcs && !self.delete_modal_open {
+             let mut scan_done = false;
+             if let Ok(res) = self.dlc_scan_result.lock() {
+                  if res.is_some() {
+                      scan_done = true;
+                  }
+             }
+             
+             if scan_done {
+                 self.is_scanning_dlcs = false;
+                 
+                 // NEW: Read cached ZIP
+                 if let Ok(mut zip_lock) = self.dlc_scan_result_zip.lock() {
+                     if let Some(bytes) = zip_lock.take() {
+                         self.dlc_picker_cached_bytes = Some(bytes);
+                     }
+                 }
+
+                 if let Ok(mut res_lock) = self.dlc_scan_result.lock() {
+                     if let Some((items, depot_count)) = res_lock.take() {
+                         if !items.is_empty() {
+                              self.dlc_picker_items = items;
+                              // Select first 130 DLCs
+                              self.dlc_picker_depot_count = depot_count;
+                              self.dlc_picker_open = true;
+                         } else {
+                              // Auto Proceed (No DLCs found)
+                              if let (Some(target), Some(dir)) = (self.dlc_picker_pending_library.take(), self.dlc_picker_pending_install_dir.take()) {
+                                  if let Some((appid, name)) = self.dlc_picker_candidate.take() {
+                                       // Pass cached bytes (if any)
+                                       let cached = self.dlc_picker_cached_bytes.take();
+                                       self.finalize_installation(appid, name, Some(target), Some(dir), Vec::new(), cached, None);
+                                  }
+                              }
+                         }
+                     }
+                 }
+             }
+             ctx.request_repaint(); // Animation/Polling
+        }
+        
+        // Poll Delete Scanner (for delete modal DLC association)
+        if self.is_scanning_dlcs && self.delete_modal_open {
+            let mut scan_done = false;
+            if let Ok(res) = self.delete_scan_result.lock() {
+                if res.is_some() {
+                    scan_done = true;
+                }
+            }
+            
+            if scan_done {
+                self.is_scanning_dlcs = false;
+                if let Ok(mut res_lock) = self.delete_scan_result.lock() {
+                    if let Some(associated) = res_lock.take() {
+                        self.delete_associated_dlcs = associated;
+                    }
+                }
+            }
+            ctx.request_repaint();
         }
 
         // Custom Colors for this specific layout override
@@ -1580,14 +2251,144 @@ impl eframe::App for DarkCoreApp {
                 
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        egui::RichText::new("MANAGER v1.5.0")
+                        egui::RichText::new(format!("MANAGER v{}", env!("CARGO_PKG_VERSION")))
                             .size(10.0)
                             .color(accent_pink)
                             .extra_letter_spacing(2.0),
                     );
                 });
                 
-                ui.add_space(30.0);
+                ui.add_space(20.0);
+
+                // --- COMMAND STRIP (TACTICAL HEADER) ---
+                // "Cyber-Minimalism": Two buttons, 50% width, Ghost Style
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    let available_w = ui.available_width();
+                    let btn_w = (available_w - 4.0) / 2.0;
+                    
+                    // 1. GL STEALTH [GHOST GREEN]
+                    let btn_stealth = egui::Button::new(
+                        egui::RichText::new("👻 GL STEALTH")
+                            .size(11.0)
+                            .color(egui::Color32::GREEN)
+                            .strong()
+                    )
+                    .min_size(egui::vec2(btn_w, 28.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 150, 50))) // Subtle Green Border
+                    .fill(egui::Color32::from_black_alpha(50)) // Transparent/Dark
+                    .rounding(2.0);
+
+                    if ui.add(btn_stealth).on_hover_text("Launch GreenLuma Stealth Mode (Safe Injection)").clicked() {
+                         // Trigger Logic - Identical to previous implementation
+                         let steam_path = self.config.steam_path.clone();
+                         let gl_path = self.config.gl_path.clone();
+                         let log_arc = self.system_log.clone();
+                         let enable_stealth = self.config.enable_stealth_mode;
+    
+                         std::thread::spawn(move || {
+                             let log = move |msg: String| {
+                                 if let Ok(mut logs) = log_arc.lock() {
+                                     push_log(&mut logs, msg);
+                                 }
+                             };
+                             log("🚀 Manual Launch: Initiating Stealth Sequence (x64)...".to_string());
+                             
+                             let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                             let dll_name = "GreenLuma_2025_x64.dll";
+                             let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+    
+                             if steam_exe.exists() {
+                                if dll_path.exists() {
+                                     let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "steam.exe"]).output();
+                                     std::thread::sleep(std::time::Duration::from_millis(1500));
+                                     let _ = crate::ui::setup_greenluma_config(&gl_path, enable_stealth);
+                                     match crate::injector::launch_injected(
+                                         steam_exe.to_str().unwrap_or(""),
+                                         dll_path.to_str().unwrap_or(""), 
+                                         Some("-inhibitbootstrap")
+                                     ) {
+                                         Ok(_) => log("✅ Steam Launched with GreenLuma.".to_string()),
+                                         Err(e) => log(format!("❌ Launch Failed: {}", e)),
+                                     }
+                                } else {
+                                    log(format!("❌ Missing: {}", dll_name));
+                                }
+                             } else {
+                                log("❌ steam.exe not found.".to_string());
+                             }
+                         });
+                    }
+
+                    // 2. RESET STEAM [GHOST RED]
+                    let btn_reset = egui::Button::new(
+                        egui::RichText::new("💀 RESET")
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(255, 100, 100)) // Light Red
+                            .strong()
+                    )
+                    .min_size(egui::vec2(btn_w, 28.0))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(150, 50, 50))) // Subtle Red Border
+                    .fill(egui::Color32::from_black_alpha(50))
+                    .rounding(2.0);
+
+                    if ui.add(btn_reset).on_hover_text("Force Kill Steam & Relaunch Normally (Emergency)").clicked() {
+                        self.relaunch_steam_protocol();
+                    }
+                });
+
+                // UPDATE AVAILABLE BUTTON
+                if let Ok(update_lock) = self.update_available.lock() {
+                    if let Some(new_ver) = update_lock.clone() {
+                        drop(update_lock); // Release lock before UI
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let btn_text = format!("⬇ UPDATE AVAILABLE: v{}", new_ver);
+                            let update_btn = egui::Button::new(
+                                egui::RichText::new(btn_text)
+                                    .color(egui::Color32::BLACK)
+                                    .strong()
+                            )
+                            .fill(egui::Color32::from_rgb(0, 255, 128)) // FLUO GREEN
+                            .min_size(egui::vec2(ui.available_width(), 32.0))
+                            .rounding(4.0);
+
+                            if ui.add(update_btn).clicked() {
+                                // Trigger update in background
+                                let log_arc = self.system_log.clone();
+                                let updating_arc = self.is_updating.clone();
+                                std::thread::spawn(move || {
+                                    if let Ok(mut updating) = updating_arc.lock() {
+                                        *updating = true;
+                                    }
+                                    let log = move |msg: String| {
+                                        if let Ok(mut logs) = log_arc.lock() {
+                                            push_log(&mut logs, msg);
+                                        }
+                                    };
+                                    log("🔄 Starting OTA Update...".to_string());
+                                    match crate::updater::perform_update() {
+                                        Ok(_) => {
+                                            log("✅ Update downloaded successfully!".to_string());
+                                            log("🔄 Restarting application...".to_string());
+                                            crate::updater::restart_application();
+                                        }
+                                        Err(e) => {
+                                            log(format!("❌ Update failed: {}", e));
+                                        }
+                                    }
+                                    if let Ok(mut updating) = updating_arc.lock() {
+                                        *updating = false;
+                                    }
+                                });
+                            }
+                        });
+                    }
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
 
                 // NAV BUTTONS HELPER
                 let mut nav_btn = |label: &str, icon: &str, tab_idx: usize| {
@@ -1609,15 +2410,14 @@ impl eframe::App for DarkCoreApp {
                    let response = ui.add(btn);
                    
                    // HOVER / CLICK NAVIGATION
-                if response.clicked() || response.hovered() {
-                       if self.active_tab != tab_idx {
+                if (response.clicked() || response.hovered())
+                       && self.active_tab != tab_idx {
                             self.active_tab = tab_idx;
                             self.tab_changed_at = Instant::now(); // Trigger Fade
                             if tab_idx == 2 {
                                 self.refresh_library();
                             }
                        }
-                   }
                    
                    // Ensure smooth animation when interacting
                    if response.hovered() {
@@ -1843,30 +2643,47 @@ impl eframe::App for DarkCoreApp {
                         });
                     
                     ui.add_space(15.0);
-                    ui.ctx().request_repaint(); // Keep animating
+                    // Only request continuous repaint for animated tabs (Info tab with Matrix Rain)
+                    // Other tabs use on-demand repaint to save GPU
+                    if self.active_tab == 5 {
+                        ui.ctx().request_repaint();
+                    }
                 }
 
-                // CONTENT
-                match self.active_tab {
-                    0 => self.ui_installation(ui),
-                    // 1 was DRM INTEL - now integrated into Library per-game
-                    2 => self.ui_library(ui),
-                    // 3 was Profiles
-                    4 => self.ui_settings(ui),
-                    5 => self.ui_info(ui),
-                    _ => self.ui_installation(ui),
+                // GLOBAL HUD (Persistent Console)
+                // Bottom Panel inside Central Panel
+                if self.active_tab != 5 { // Hide on About/Info tab for full immersion
+                    egui::TopBottomPanel::bottom("global_hud_console")
+                        .resizable(true)
+                        .default_height(140.0)
+                        .show_inside(ui, |ui| {
+                            self.render_global_logs(ui);
+                        });
                 }
+
+                // CONTENT AREA (Remaining Space)
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    match self.active_tab {
+                        0 => self.ui_installation(ui),
+                        // 1 was DRM INTEL - now integrated into Library per-game
+                        2 => self.ui_library(ui),
+                        // 3 was Profiles
+                        4 => self.ui_settings(ui),
+                        5 => self.ui_info(ui),
+                        _ => self.ui_installation(ui),
+                    }
+                });
                 
                 // Global Footer Removed (Logs are now per-tab or sidebar)
                 ui.add_space(5.0);
             });
 
-        // POLL SCAN RESULT
-        if self.is_scanning_dlcs {
-            let mut res = self.dlc_scan_result.lock().unwrap();
+        // POLL DELETE SCAN RESULT
+        {
+            let mut res = self.delete_scan_result.lock().unwrap();
             if let Some(data) = res.take() {
                 self.delete_associated_dlcs = data;
-                self.is_scanning_dlcs = false;
+                // Don't set is_scanning_dlcs=false here, that's for DLC picker
             }
         }
 
@@ -1894,19 +2711,17 @@ impl eframe::App for DarkCoreApp {
                             ui.spinner();
                             ui.label("Scanning for associated DLCs...");
                         });
+                    } else if !self.delete_associated_dlcs.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚠ Found {} associated DLCs/Depots installed.",
+                                self.delete_associated_dlcs.len()
+                            ))
+                            .color(egui::Color32::YELLOW),
+                        );
+                        ui.label("They will be deleted automatically.");
                     } else {
-                        if !self.delete_associated_dlcs.is_empty() {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "⚠ Found {} associated DLCs/Depots installed.",
-                                    self.delete_associated_dlcs.len()
-                                ))
-                                .color(egui::Color32::YELLOW),
-                            );
-                            ui.label("They will be deleted automatically.");
-                        } else {
-                            ui.label("No associated DLCs found in library.");
-                        }
+                        ui.label("No associated DLCs found in library.");
                     }
 
                     ui.add_space(20.0);
@@ -1953,13 +2768,101 @@ impl eframe::App for DarkCoreApp {
                         }
                     });
                 });
-        }
+        } // Close if self.delete_modal_open
         
+        // MODALS
         self.show_install_modal(ctx);
+        self.show_dlc_picker_modal(ctx);
+        self.show_manifestor_modal(ctx);
     }
 }
 
 impl DarkCoreApp {
+    fn relaunch_steam_protocol(&self) {
+        let steam_path = self.config.steam_path.clone();
+        let log_arc = self.system_log.clone();
+        
+        std::thread::spawn(move || {
+            let log = move |msg: String| {
+                if let Ok(mut logs) = log_arc.lock() {
+                    push_log(&mut logs, msg);
+                }
+            };
+            
+            log("⚠ STEAM PURGE PROTOCOL INITIATED...".to_string());
+            
+            // 1. Kill Steam
+            let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "steam.exe"]).output();
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            
+            // 2. Launch Steam Normal
+            let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+            if steam_exe.exists() {
+                log("🔄 Relaunching Steam (Normal Mode)...".to_string());
+                match open::that(steam_exe) {
+                    Ok(_) => log("✅ Steam Relaunched.".to_string()),
+                    Err(e) => log(format!("❌ Launch Failed: {}", e)),
+                }
+            } else {
+                log("❌ steam.exe not found.".to_string());
+            }
+        });
+    }
+
+    fn render_global_logs(&self, ui: &mut egui::Ui) {
+         // 1. HEADER BAR "HUD STYLE"
+         ui.horizontal(|ui| {
+             ui.label(egui::RichText::new("📟 SYSTEM TERMINAL").size(10.0).font(egui::FontId::monospace(10.0)).color(egui::Color32::from_gray(100)));
+             
+             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                 // COPY RAW BUTTON
+                 if ui.button(egui::RichText::new("📋 COPY RAW").size(10.0)).clicked() {
+                     if let Ok(logs) = self.system_log.lock() {
+                         let full_log = logs.join("\n");
+                         ui.ctx().output_mut(|o| o.copied_text = full_log);
+                     }
+                 }
+             });
+         });
+         
+         ui.separator();
+         
+         // 2. SCROLLABLE LOG AREA
+         egui::ScrollArea::vertical()
+             .stick_to_bottom(true)
+             .auto_shrink([false, false])
+             .show(ui, |ui| {
+                 // Dark background for terminal effect
+                 ui.painter().rect_filled(
+                     ui.available_rect_before_wrap(),
+                     0.0,
+                     egui::Color32::from_rgb(10, 10, 12) // Very dark gray/black
+                 );
+
+                 if let Ok(logs) = self.system_log.lock() {
+                     for entry in logs.iter() {
+                         // Colorize based on content
+                         let color = if entry.contains("❌") || entry.contains("Error") || entry.contains("Failed") {
+                             egui::Color32::from_rgb(255, 80, 80)
+                         } else if entry.contains("✅") || entry.contains("Success") {
+                             egui::Color32::from_rgb(80, 255, 80)
+                         } else if entry.contains("⚠") || entry.contains("Warning") {
+                             egui::Color32::from_rgb(255, 200, 50)
+                         } else if entry.contains("🚀") {
+                             egui::Color32::from_rgb(0, 255, 255) // Cyan
+                         } else {
+                             egui::Color32::from_gray(180)
+                         };
+                         
+                         ui.label(egui::RichText::new(entry)
+                             .font(egui::FontId::monospace(11.0)) // Slightly larger monospace
+                             .color(color)
+                         );
+                     }
+                 }
+             });
+    }
+
     fn process_cover_queue(&mut self, ctx: &egui::Context) {
         let mut queue_guard = self.cover_queue.lock().unwrap();
         if queue_guard.is_empty() {
@@ -1978,7 +2881,7 @@ impl DarkCoreApp {
                 let texture = ctx.load_texture(
                     format!("cover_{}", appid),
                     image,
-                    egui::TextureOptions::default(),
+                    egui::TextureOptions::LINEAR, // High-res 1440p+ rendering
                 );
                 cache.insert(appid, Some(texture));
             }
@@ -2034,82 +2937,7 @@ impl DarkCoreApp {
             }
 
             ui.add_space(20.0);
-            
-            // MAJESTIC LAUNCH BUTTON
-            let time = ui.input(|i| i.time);
-            let pulse = (time * 3.0).sin().abs() as f32; // 0.0 to 1.0 rapid pulse
-            
-            // Animated Gold/Green Gradient logic (Approximated via pulsing fill)
-            let fill_col = egui::Color32::from_rgba_premultiplied(
-                0, 
-                ((pulse * 30.0) + 40.0) as u8, 
-                ((pulse * 10.0) + 20.0) as u8, 
-                255
-            );
-            let text_col = egui::Color32::from_rgb(
-                255, 
-                ((pulse * 55.0) + 200.0) as u8, 
-                ((pulse * 55.0) + 100.0) as u8
-            ); 
-            
-            let btn_launch = egui::Button::new(
-                egui::RichText::new("✨ LAUNCH GREENLUMA STEALTH")
-                    .size(15.0) // Slightly larger
-                    .color(text_col)
-                    .strong()
-            )
-            .fill(fill_col)
-            .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 255, 100))) // Neon Green Border
-            .rounding(6.0);
-            
-            // Force animation
-            ui.ctx().request_repaint(); 
-
-            if ui.add(btn_launch).on_hover_text("Initialize Stealth Injection Procedure (GreenLuma 2025)").clicked() {
-                 let steam_path = self.config.steam_path.clone();
-                 let gl_path = self.config.gl_path.clone();
-                 let log_arc = self.system_log.clone();
-                 let enable_stealth = self.config.enable_stealth_mode;
-
-                 std::thread::spawn(move || {
-                     let log = move |msg: String| {
-                         if let Ok(mut logs) = log_arc.lock() {
-                             logs.push(msg);
-                         }
-                     };
-                     log("Manual Launch: Initiating Stealth Sequence (x64)...".to_string());
-                     
-     let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
-                     let dll_name = "GreenLuma_2025_x64.dll";
-                     let dll_path = std::path::Path::new(&gl_path).join(dll_name);
-
-                     if steam_exe.exists() {
-                        if dll_path.exists() {
-                             // FORCE KILL STEAM FIRST
-                             let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
-                             std::thread::sleep(std::time::Duration::from_millis(1000));
-                             
-                             // SETUP CONFIG (Create .bin files in GL folder)
-                             // Helper function is now public
-                             let _ = crate::ui::setup_greenluma_config(&gl_path, enable_stealth);
-
-                             // DIRECT INJECTION (No copying to Steam folder)
-                             match crate::injector::launch_injected(
-                                 steam_exe.to_str().unwrap_or(""),
-                                 dll_path.to_str().unwrap_or(""), // Use DLL in GL folder
-                                 Some("-inhibitbootstrap")
-                             ) {
-                                 Ok(_) => log("✅ Steam Launched with GreenLuma.".to_string()),
-                                 Err(e) => log(format!("❌ Launch Failed: {}", e)),
-                             }
-                        } else {
-                            log(format!("❌ Missing: {}", dll_name));
-                        }
-                     } else {
-                        log("❌ steam.exe not found.".to_string());
-                     }
-                 });
-            }
+            // Launch Button moved to Sidebar Command Center
         });
 
         ui.add_space(5.0);
@@ -2118,14 +2946,21 @@ impl DarkCoreApp {
             egui::RichText::new("Include DLCs/Depots Automatically")
                 .color(egui::Color32::LIGHT_GRAY),
         );
+        ui.add_space(5.0);
+        // NOISE FILTER CHECKBOX
+        ui.checkbox(
+            &mut self.show_free_content, 
+            egui::RichText::new("Show Free/Demo Content").color(egui::Color32::from_gray(140))
+        )
+        .on_hover_text("If unchecked, hides Free-to-Play games to reduce noise.\nChecking this allows installing free games without GreenLuma injection.");
         ui.add_space(10.0);
 
         let search_results = self.search_results.clone();
         let results = search_results.lock().unwrap();
 
         let available = ui.available_height();
-        let log_height = 200.0;
-        let results_h = (available - log_height - 20.0).max(100.0);
+        // Logs are now in a dedicated panel, so use full available height.
+        let results_h = available.max(100.0);
 
         // Cache installed IDs for O(1) lookup
         let installed_ids: std::collections::HashSet<String> = {
@@ -2137,293 +2972,354 @@ impl DarkCoreApp {
         };
 
         egui::ScrollArea::vertical().id_salt("results_scroll").max_height(results_h).show(ui, |ui| {
-            for res in results.iter() {
-                use crate::api::val_to_string;
-                let name = res.game_name.as_deref().or(res.name.as_deref()).unwrap_or("Unknown");
-                let id1 = val_to_string(&res.game_id);
-                let id2 = val_to_string(&res.app_id);
-                let id = if !id1.is_empty() { id1 } else { id2 };
-                let display_id = if id.is_empty() { "0".to_string() } else { id.clone() };
-                let is_installed = installed_ids.contains(&display_id);
+            let avail_width = ui.available_width();
+            
+            // RESPONSIVE GRID CALCULATION
+            // Target: Dense, immersive layout for 1440p+
+            let min_card_width = 180.0_f32;  // Minimum card width
+            let spacing = 6.0_f32;           // Tight spacing between cards
+            
+            // Calculate optimal columns that fill the width
+            let cols = ((avail_width + spacing) / (min_card_width + spacing)).floor().max(1.0) as usize;
+            
+            // Dynamic card width: fills available space exactly
+            let card_w = (avail_width - (spacing * (cols as f32 - 1.0))) / cols as f32;
+            
+            // Aspect ratio 2:3 (Steam Vertical Capsule standard)
+            let cover_h = card_w * 1.5;  // 2:3 ratio
+            let info_h = 75.0;           // Expanded footer: title (2 lines) + ID + robust button
+            let card_h = cover_h + info_h;
 
-                // Animated Card Hover
-                let card_id = ui.make_persistent_id(&display_id);
-                let _is_hovered = ui.ctx().animate_bool(card_id, 
-                     ui.input(|i| i.pointer.hover_pos().map_or(false, |_pos| {
-                         false 
-                     }))
-                ); 
-
-                ui.push_id(display_id.clone(), |ui| {
-                    let frame_style = egui::Frame::group(ui.style())
-                        .fill(egui::Color32::from_rgb(30,30,40))
-                        .inner_margin(8.0)
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60,60,70)));
+            egui::Grid::new("results_grid_manual")
+                .spacing(egui::vec2(spacing, spacing))
+                .min_col_width(card_w)
+                .show(ui, |ui| {
+                    for (i, res) in results.iter().enumerate() {
+                        // NOISE FILTER LOGIC
+                        if !self.show_free_content && res.is_free {
+                            continue;
+                        }
                         
-                    // Draw Frame
-                    let response = frame_style.show(ui, |ui| {
-                             ui.horizontal(|ui| {
-                                 // CALC DYNAMIC SIZE
-                                 let avail_width = ui.ctx().screen_rect().width().max(800.0);
-                                 let scale = (avail_width / 1200.0).max(1.0).min(3.0);
-                                 let cover_w = 70.0 * scale;
-                                 let cover_h = 100.0 * scale;
+                        use crate::api::val_to_string;
+                        let name = res.game_name.as_deref().or(res.name.as_deref()).unwrap_or("Unknown");
+                        let id1 = val_to_string(&res.game_id);
+                        let id2 = val_to_string(&res.app_id);
+                        let id = if !id1.is_empty() { id1 } else { id2 };
+                        let display_id = if id.is_empty() { "0".to_string() } else { id.clone() };
+                        let is_installed = installed_ids.contains(&display_id);
 
-                                 // COVER IMAGE
-                                 if !display_id.is_empty() && display_id != "0" {
-                                     let cache = self.cover_cache.lock().unwrap();
-                                     if let Some(Some(texture)) = cache.get(&display_id) {
-                                         ui.add(egui::Image::new(texture).rounding(5.0 * scale).max_height(cover_h).max_width(cover_w));
-                                     } else {
-                                         ui.add(egui::Label::new("..."));
-                                     }
-                                 }
+                        let card_id = ui.make_persistent_id(format!("card_{}_{}", i, display_id));
+                        let _ = ui.ctx().animate_bool(card_id, false);
 
-                             ui.vertical(|ui| {
-                                 ui.label(egui::RichText::new("MANAGER v1.4").size(10.0).color(egui::Color32::from_rgb(100, 100, 120)));
-                                 ui.label(egui::RichText::new(name).size(16.0).color(egui::Color32::WHITE).strong());
-                                 ui.label(egui::RichText::new(format!("ID: {}", display_id)).size(10.0).color(egui::Color32::GRAY));
-                                 ui.add_space(5.0);
-                                 
-                                 // PULSING BUTTON
-                                 let mut needs_update = false;
-
-                                 let mut is_dlc_linked = false;
-                                 let mut parent_game_id = String::new();
-                                 
-                                 if is_installed {
-                                     // Check Update Status
-                                     if let Ok(cache) = self.update_cache.lock() {
-                                         if let Some(upd) = cache.get(&display_id) {
-                                             if *upd { needs_update = true; }
-
-                                         }
-                                     }
-                                     // Check DLC Link
-                                     if let Ok(rel) = self.relationships.lock() {
-                                         if let Some(pid) = rel.get(&display_id) {
-                                             is_dlc_linked = true;
-                                             parent_game_id = pid.clone();
-                                         }
-                                     }
-                                 }
-
-                                 let text = if is_installed { 
-                                     if is_dlc_linked { "🔗 DLC LINKED" }
-                                     else if needs_update { "♻ UPDATE" }
-                                     else { "▶ PLAY" } // Default to PLAY immediately, check in background
-                                 } else { "🚀 INSTALL" };
-
-                                 let time = ui.input(|i| i.time);
-                                 let alpha = (time * 3.0).sin().abs() as f32 * 0.5 + 0.5; // 0.5 to 1.0
-                                 
-                                 let bg_color = if is_installed {
-                                     if is_dlc_linked {
-                                         // Passive Blue-Gray
-                                         egui::Color32::from_rgb(50, 60, 75)
-                                     } else if needs_update {
-                                         // Orange/Yellow for Update
-                                         egui::Color32::from_rgba_premultiplied(
-                                             (255.0 * alpha) as u8, (140.0 * alpha) as u8, 0, 255
-                                         )
-                                     } else {
-                                         // Green for Play (Solid)
-                                         egui::Color32::from_rgb(0, 200, 100)
-                                     }
-                                 } else {
-                                     // Green/Cyan for Install
-                                     egui::Color32::from_rgba_premultiplied(
-                                         0, (255.0 * alpha) as u8, (100.0 * alpha) as u8, 255
-                                     )
-                                 };
-                                 
-                                 let text_color = egui::Color32::BLACK;
-                                 
-                                 let limit_reached = self.active_games.lock().unwrap().len() >= 134;
-
-                                 if limit_reached && !is_installed {
-                                      ui.add(egui::Button::new(egui::RichText::new("⛔ LIMIT (134)").strong())
-                                          .fill(egui::Color32::DARK_GRAY)
-                                          .rounding(4.0))
-                                          .on_hover_text("Max AppList limit reached. Create a Profile to install more.");
-                                 } else {
-                                      let btn = egui::Button::new(egui::RichText::new(text).color(text_color).strong())
-                                         .fill(bg_color)
-                                         .rounding(4.0);
-                                      
-                                      let mut btn_resp = ui.add(btn);
-                                      if is_installed {
-                                           if is_dlc_linked {
-                                               btn_resp = btn_resp.on_hover_text(format!("Linked to Parent ID: {}. Launch the main game to play.", parent_game_id));
-                                           } else {
-                                               btn_resp = btn_resp.on_hover_text("Game is already installed. Right-click to Repair.");
-                                           }
-                                      }
-                                      
-                                      // Right-Click Context Menu
-                                      btn_resp.context_menu(|ui| {
-                                          let is_godmode_active = self.config.family_godmode_ids.contains(&display_id);
-
-                                          if is_godmode_active {
-                                              // GODMODE ACTIVE STATE
-                                              ui.label(egui::RichText::new("⚡ FAMILY GODMODE ACTIVE").color(egui::Color32::GREEN).size(10.0));
-                                              if ui.button(egui::RichText::new("💀 Disable Steam Family Godmode").color(egui::Color32::from_rgb(255, 100, 100))).clicked() {
-                                                  ui.close_menu();
-                                                  self.disable_family_godmode(display_id.clone());
-                                              }
-                                              // Hide "Force Repair" as requested
-                                          } else {
-                                              // STANDARD STATE
-                                              if is_installed {
-                                                  if ui.button("🛠 Force Repair (Regenerate ACF)").clicked() {
-                                                      ui.close_menu();
-                                                      // FORCE MODAL: User explicitly wants to repair
-                                                      self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
-                                                      self.selected_library_index = 0;
-                                                      self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                                      self.install_dir_input = name.to_string(); // Pre-fill
-                                                      self.install_modal_open = true;
-                                                  }
-                                                  
-                                                  // Offer Godmode Enable for installed games too (e.g. converting a family share title)
-                                                  // Valid if API Key is present (if missing, Install button handles uninstalled, but installed ones need this)
-                                                  // Actually godmode works without API Key using fallback fetch, so we should allow it always?
-                                                  // User requirement: "launcher deve capire che il gioco selezionato è stato messo con Family Share mode"
-                                                  // Implies we can PUT it there.
-                                                  if ui.button(egui::RichText::new("👨‍👩‍👧 Enable Family Godmode (Unlock DLCs)").color(egui::Color32::from_rgb(100, 255, 255))).on_hover_text("Adds AppID + DLCs to GreenLuma.\nUseful for Family Shared games to unlock full content.").clicked() {
-                                                       ui.close_menu();
-                                                       self.install_game_family_godmode(display_id.clone());
-                                                  }
-                                              } else {
-                                                  // UNINSTALLED
-                                                  // Provide option explicitly
-                                                  if ui.button(egui::RichText::new("👨‍👩‍👧 Install (Family Shared Godmode)").color(egui::Color32::from_rgb(100, 255, 255))).on_hover_text("Adds AppID + DLCs only. Skips file download.").clicked() {
-                                                       ui.close_menu();
-                                                       self.install_game_family_godmode(display_id.clone());
-                                                  }
-                                              }
-                                          }
-                                      });
-                                      
-                                      if btn_resp.clicked() {
-                                            if is_dlc_linked {
-                                                // Prevent action
-                                                self.log(format!("DLC Content (Linked to {}). Please launch the base game.", parent_game_id));
-                                            } else if !is_installed || needs_update {
-                                                // Check if manifest exists (Automatic Resume)
-                                               if let Some(path) = crate::game_path::GamePathFinder::find_manifest_path(&self.config.steam_path, &display_id) {
-                                                   // Found it -> Resume/Update in place
-                                                   self.install_game(display_id.clone(), name.to_string(), Some(path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&self.config.steam_path)).to_path_buf()), None);
-                                               } else {
-                                                   // 2. AUTO-DETECT FOLDER (Smart Scan)
-                                                   // If we can find the folder, we skip the modal entirely.
-                                                   let libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
-                                                   let (found_dir, found_lib, confidence) = self.detect_auto_install_path(&name, &libraries);
-
-                                                   if let Some(dir_name) = found_dir {
-                                                       self.log(format!("Auto-Detected Install Dir: '{}' (Confidence: {:?})", dir_name, confidence));
-                                                       // High confidence or exact match -> One-Click Install
-                                                       self.install_game(display_id.clone(), name.to_string(), Some(found_lib.unwrap_or(std::path::Path::new(&self.config.steam_path).to_path_buf())), Some(dir_name));
-                                                   } else {
-                                                       // 3. FALLBACK -> MODAL (Fresh Install / No Trace Found)
-                                                       // Pre-fill with sanitized name for user convenience
-                                                       let sanitized = name.chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect::<String>().trim().to_string();
-                                                       
-                                                       if self.config.api_key.is_empty() {
-                                                           // NO API KEY -> Family Godmode Warning/Offer? No, proceed to manual Install.
-                                                            self.detected_libraries = libraries;
-                                                            self.selected_library_index = 0;
-                                                            self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                                            self.install_dir_input = sanitized; 
-                                                            self.install_modal_open = true;
-                                                       } else {
-                                                           // STANDARD MODE -> Modal
-                                                           self.detected_libraries = libraries;
-                                                           self.selected_library_index = 0;
-                                                           self.install_candidate = Some((display_id.clone(), name.to_string()));
-                                                           self.install_dir_input = sanitized; 
-                                                           self.install_modal_open = true;
-                                                       }
-                                                   }
-                                               }
+                        ui.push_id(card_id, |ui| {
+                            // CINEMATIC CARD: Zero-gap, borderless, full-bleed artwork
+                            // Container has NO stroke, only subtle rounding at bottom
+                            let frame_style = egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(20, 20, 24))
+                                .inner_margin(0.0)
+                                .outer_margin(0.0)
+                                .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 4.0, se: 4.0 })
+                                .stroke(egui::Stroke::NONE); // NO BORDER
+                                
+                            let response = frame_style.show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(card_w, card_h));
+                                ui.set_max_size(egui::vec2(card_w, card_h));
+                                ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0); // Zero internal spacing
+                                
+                                ui.vertical(|ui| {
+                                    // COVER IMAGE - ABSOLUTE FULL BLEED
+                                    // No inner frame, image IS the container
+                                    ui.allocate_ui(egui::vec2(card_w, cover_h), |ui| {
+                                        if !display_id.is_empty() && display_id != "0" {
+                                            let cache = self.cover_cache.lock().unwrap();
+                                            if let Some(Some(texture)) = cache.get(&display_id) {
+                                                // Aspect Ratio Check
+                                                let w = texture.size()[0] as f32;
+                                                let h = texture.size()[1] as f32;
+                                                let ratio = w / h.max(1.0);
+                                                
+                                                if ratio > 1.2 {
+                                                    // LANDSCAPE / HEADER (Letterbox) - "Box Diverso"
+                                                    egui::Frame::none()
+                                                        .fill(egui::Color32::from_rgb(10, 10, 12)) // Letterbox Bars
+                                                        .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
+                                                        .show(ui, |ui| {
+                                                            ui.set_min_size(egui::vec2(card_w, cover_h));
+                                                            ui.centered_and_justified(|ui| {
+                                                                ui.add(egui::Image::new(texture)
+                                                                    .fit_to_exact_size(egui::vec2(card_w, cover_h)) // This sets bounds
+                                                                    .maintain_aspect_ratio(true) // This prevents stretching
+                                                                );
+                                                            });
+                                                        });
+                                                } else {
+                                                    // PORTRAIT / POSTER (Full Bleed)
+                                                    ui.add(egui::Image::new(texture)
+                                                        .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
+                                                        .fit_to_exact_size(egui::vec2(card_w, cover_h))
+                                                        .maintain_aspect_ratio(false)
+                                                    );
+                                                }
                                             } else {
-                                               // SMART LAUNCH SYSTEM
-                                               let steam_path = self.config.steam_path.clone();
-                                               let gl_path = self.config.gl_path.clone();
-                                               let app_id_run = display_id.clone();
-                                               
-                                               std::thread::spawn(move || {
-                                                   let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
-                                                   
-                                                   // 1. Check if Steam is running
-                                                   let status_out = std::process::Command::new("tasklist")
-                                                       .args(&["/FI", "IMAGENAME eq steam.exe", "/M", "GreenLuma_2025_x64.dll"])
-                                                       .output();
-                                                       
-                                                   let mut is_running = false;
-                                                   let mut is_injected = false;
-                                                   
-                                                   // Check generic running first
-                                                   let run_check = std::process::Command::new("tasklist")
-                                                        .args(&["/FI", "IMAGENAME eq steam.exe"])
-                                                        .output();
-                                                   if let Ok(o) = run_check {
-                                                       let s = String::from_utf8_lossy(&o.stdout);
-                                                       if s.contains("steam.exe") { is_running = true; }
-                                                   }
-                                                   
-                                                   // Check injection
-                                                   if let Ok(o) = status_out {
-                                                       let s = String::from_utf8_lossy(&o.stdout);
-                                                       if s.contains("steam.exe") { is_injected = true; }
-                                                   }
-                                                   
-                                                   if is_running {
-                                                       if is_injected {
-                                                           // CASE A: Steam Running + GreenLuma -> Direct Launch
-                                                           let _ = std::process::Command::new(steam_exe)
-                                                               .arg("-applaunch")
-                                                               .arg(&app_id_run)
-                                                               .spawn();
-                                                       } else {
-                                                           // CASE B: Steam Running w/o GreenLuma -> RESTART REQUIRED (Automatic)
-                                                           // Kill Steam
-                                                           let _ = std::process::Command::new("taskkill").args(&["/F", "/IM", "steam.exe"]).output();
-                                                           std::thread::sleep(std::time::Duration::from_millis(2000));
-                                                           
-                                                           // Launch Injected
-                                                           let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
-                                                           let _ = crate::injector::launch_injected(
-                                                               steam_exe.to_str().unwrap_or(""),
-                                                               dll_path.to_str().unwrap_or(""),
-                                                               Some(&format!("-applaunch {}", app_id_run))
-                                                           );
-                                                       }
-                                                   } else {
-                                                       // CASE C: Steam Closed -> Launch Injected
-                                                       let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
-                                                       let _ = crate::injector::launch_injected(
-                                                           steam_exe.to_str().unwrap_or(""),
-                                                           dll_path.to_str().unwrap_or(""),
-                                                           Some(&format!("-applaunch {}", app_id_run))
-                                                       );
-                                                   }
-                                               });
+                                                // Loading placeholder - minimal, dark
+                                                egui::Frame::none()
+                                                    .fill(egui::Color32::from_rgb(15, 15, 18))
+                                                    .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_size(egui::vec2(card_w, cover_h));
+                                                        ui.centered_and_justified(|ui| {
+                                                            ui.spinner();
+                                                        });
+                                                    });
                                             }
-                                      }
-                                 }
-                                 // Request repaint for animation
-                                 ui.ctx().request_repaint();
-                             });
-                         });
-                    });
-                    
-                    if response.response.hovered() {
-                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        } else {
+                                            // No ID placeholder
+                                            egui::Frame::none()
+                                                .fill(egui::Color32::from_rgb(12, 12, 14))
+                                                .rounding(egui::Rounding { nw: 4.0, ne: 4.0, sw: 0.0, se: 0.0 })
+                                                .show(ui, |ui| {
+                                                    ui.set_min_size(egui::vec2(card_w, cover_h));
+                                                });
+                                        }
+                                    });
+                                    
+                                    // COMPACT INFO FOOTER - Tight, elegant
+                                    ui.add_space(4.0);
+                                    
+                                    // TITLE - Label with truncation
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(name)
+                                                    .size(11.0)
+                                                    .color(egui::Color32::from_rgb(220, 220, 225))
+                                                    .strong()
+                                            )
+                                            .truncate()
+                                        );
+                                    });
+
+                                    // APP ID - Subtitle
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new(&display_id)
+                                                .size(9.0)
+                                                .color(egui::Color32::from_gray(100))
+                                                .monospace()
+                                        );
+                                    });
+                                    
+                                    ui.add_space(4.0);
+
+                                    // BUTTON STATE CALCULATION
+                                    let mut is_dlc_linked = false;
+                                    let mut parent_game_id = String::new();
+                                    
+                                    if is_installed {
+                                         if let Ok(rel) = self.relationships.lock() {
+                                             if let Some(pid) = rel.get(&display_id) {
+                                                 is_dlc_linked = true;
+                                                 parent_game_id = pid.clone();
+                                             }
+                                         }
+                                    }
+
+                                    let text = if is_installed { 
+                                         if is_dlc_linked { "🔗 LINKED" }
+                                         else { "▶ PLAY" }
+                                    } else { "🚀 INSTALL" };
+
+                                    let bg_color = if is_installed {
+                                         if is_dlc_linked { egui::Color32::from_rgb(50, 60, 75) } 
+                                         else { egui::Color32::from_rgb(0, 200, 100) }
+                                    } else {
+                                        let time = ui.input(|i| i.time);
+                                        let alpha = (time * 3.0).sin().abs() as f32 * 0.3 + 0.7; 
+                                        egui::Color32::from_rgba_premultiplied(0, (255.0 * alpha) as u8, (140.0 * alpha) as u8, 255)
+                                    };
+                                    
+                                    let limit_reached = self.active_games.lock().unwrap().len() >= 134;
+
+                                    // ROBUST BUTTON - Readable, clickable
+                                    let btn_resp = ui.horizontal(|ui| {
+                                        ui.add_space(3.0);
+                                        let btn_width = card_w - 6.0;
+                                        
+                                        if limit_reached && !is_installed {
+                                             ui.add(egui::Button::new(egui::RichText::new("⛔ LIMIT REACHED").size(10.0))
+                                                .fill(egui::Color32::from_rgb(45, 45, 50))
+                                                .min_size(egui::vec2(btn_width, 24.0))
+                                                .rounding(4.0))
+                                                .on_hover_text("Max AppList limit (134) reached.")
+                                        } else {
+                                             let btn_txt_size = 11.0; 
+                                             let btn_resp = ui.add(egui::Button::new(egui::RichText::new(text).size(btn_txt_size).color(egui::Color32::BLACK).strong())
+                                                .fill(bg_color)
+                                                .min_size(egui::vec2(btn_width, 24.0))
+                                                .rounding(4.0));
+                                                
+                         if btn_resp.clicked() {
+                             if is_installed {
+                                 // PLAY / LAUNCH
+                                 // existing launch logic...
+                                 let _ = std::process::Command::new("explorer")
+                                    .arg(format!("steam://rungameid/{}", display_id))
+                                    .spawn();
+                             } else {
+                                 // INSTALL -> MANIFESTOR
+                                 self.install_candidate_is_free = res.is_free;
+                                 self.open_manifestor(display_id.clone(), name.to_string());
+                             }
+                         }
+                         btn_resp
+                                        }
+                                    }).inner;
+                                    
+                                    ui.add_space(2.0);
+
+                                    // CONTEXT MENU
+                                    btn_resp.context_menu(|ui: &mut egui::Ui| {
+                                        let is_godmode = self.config.family_godmode_ids.contains(&display_id);
+                                        if is_godmode {
+                                            ui.label(egui::RichText::new("⚡ GODMODE ACTIVE").color(egui::Color32::GREEN).size(10.0));
+                                            if ui.button("💀 Disable Godmode").clicked() {
+                                                ui.close_menu();
+                                                self.disable_family_godmode(display_id.clone());
+                                            }
+                                        } else {
+                                            if is_installed {
+                                                if ui.button("🛠 Force Repair").clicked() {
+                                                    ui.close_menu();
+                                                    self.detected_libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                    self.selected_library_index = 0;
+                                                    self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                    self.install_dir_input = name.to_string(); 
+                                                    self.install_modal_open = true;
+                                                }
+                                                // RESTORED STEAMLESS BUTTON
+                                                if ui.button("🔨 Unpack Game (Steamless)").clicked() {
+                                                    ui.close_menu();
+                                                    let appid_run = display_id.clone();
+                                                    let steam_path = self.config.steam_path.clone();
+                                                    let steamless_path = self.config.steamless_path.clone();
+                                                    let log_arc = self.system_log.clone();
+                                                    
+                                                    std::thread::spawn(move || {
+                                                        let log = move |msg: String| {
+                                                            if let Ok(mut logs) = log_arc.lock() { push_log(&mut logs, msg); }
+                                                        };
+                                                        
+                                                        log(format!("Steamless: Locating folder for {}...", appid_run));
+                                                        // 1. Find Game Path using the correct method
+                                                        if let Some(game_folder) = crate::game_path::GamePathFinder::find_game_path(&steam_path, &appid_run) {
+                                                            log(format!("Target Folder: {}", game_folder.display()));
+                                                            
+                                                            // 2. Run Steamless on Folder
+                                                            log("Scanning for EXEs to unpack...".to_string());
+                                                            let (success, total, results) = crate::steamless::run_steamless_folder(&game_folder, &steamless_path, &appid_run);
+                                                            
+                                                            for res in results {
+                                                                if res.success {
+                                                                    log(format!("✅ {}: {}", res.exe_path, res.message));
+                                                                } else {
+                                                                    log(format!("⚠️ {}: {}", res.exe_path, res.message));
+                                                                }
+                                                            }
+                                                            
+                                                            log(format!("Steamless Complete. Unpacked {}/{} files.", success, total));
+                                                        } else {
+                                                            log("❌ Game folder not found. Is the game installed?".to_string());
+                                                        }
+                                                    });
+                                                }
+                                                if ui.button("👨‍👩‍👧 Enable Godmode").clicked() {
+                                                    ui.close_menu();
+                                                    self.install_game_family_godmode(display_id.clone());
+                                                }
+                                            } else {
+                                                if ui.button("👨‍👩‍👧 Install (Godmode Only)").clicked() {
+                                                    ui.close_menu();
+                                                    self.install_game_family_godmode(display_id.clone());
+                                                }
+                                            }
+                                        }
+                                    });
+
+                                    // CLICK HANDLER
+                                    if btn_resp.clicked() {
+                                        if is_dlc_linked {
+                                            self.log(format!("Linked to {}. Launch base game.", parent_game_id));
+                                        } else if !is_installed {
+                                             // INSTALL TRIGGER
+                                             if let Some(path) = crate::game_path::GamePathFinder::find_manifest_path(&self.config.steam_path, &display_id) {
+                                                 self.install_game(display_id.clone(), name.to_string(), Some(path.parent().and_then(|p| p.parent()).unwrap_or(std::path::Path::new(&self.config.steam_path)).to_path_buf()), None);
+                                             } else {
+                                                 let libraries = crate::game_path::GamePathFinder::get_library_folders(&self.config.steam_path);
+                                                 let (found_dir, found_lib, _) = self.detect_auto_install_path(name, &libraries);
+                                                 if let Some(dir_name) = found_dir {
+                                                     self.install_game(display_id.clone(), name.to_string(), Some(found_lib.unwrap_or(std::path::Path::new(&self.config.steam_path).to_path_buf())), Some(dir_name));
+                                                 } else {
+                                                     let sanitized = name.chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect::<String>().trim().to_string();
+                                                     self.detected_libraries = libraries;
+                                                     self.selected_library_index = 0;
+                                                     self.install_candidate = Some((display_id.clone(), name.to_string()));
+                                                     self.install_dir_input = sanitized; 
+                                                     self.install_modal_open = true;
+                                                 }
+                                             }
+                                        } else {
+                                            // PLAY TRIGGER
+                                            let steam_path = self.config.steam_path.clone();
+                                            let gl_path = self.config.gl_path.clone();
+                                            let app_id_run = display_id.clone();
+                                            let enable_stealth = self.config.enable_stealth_mode;
+                                            
+                                            std::thread::spawn(move || {
+                                                let _ = crate::ui::setup_greenluma_config(&gl_path, enable_stealth);
+                                                let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+                                                let is_injected = crate::injector::is_greenluma_injected();
+                                                let is_running = crate::injector::is_process_running("steam.exe");
+
+                                                if is_running {
+                                                    if is_injected {
+                                                        let _ = std::process::Command::new(steam_exe).arg("-applaunch").arg(&app_id_run).spawn();
+                                                    } else {
+                                                        let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "steam.exe"]).output();
+                                                        std::thread::sleep(std::time::Duration::from_millis(2000));
+                                                        let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
+                                                        let _ = crate::injector::launch_injected(
+                                                            steam_exe.to_str().unwrap_or(""),
+                                                            dll_path.to_str().unwrap_or(""),
+                                                            Some(&format!("-applaunch {}", app_id_run))
+                                                        );
+                                                    }
+                                                } else {
+                                                    let dll_path = std::path::Path::new(&gl_path).join("GreenLuma_2025_x64.dll");
+                                                    let _ = crate::injector::launch_injected(
+                                                        steam_exe.to_str().unwrap_or(""),
+                                                        dll_path.to_str().unwrap_or(""),
+                                                        Some(&format!("-applaunch {}", app_id_run))
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    }
+                                });
+                            });
+                            
+                            if response.response.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                        }); // push_id
+
+                        // Force new row after `cols` items
+                        if (i + 1) % cols == 0 {
+                            ui.end_row();
+                        }
                     }
                 });
-                ui.add_space(5.0);
-            }
         });
 
         ui.separator();
@@ -2460,7 +3356,7 @@ impl DarkCoreApp {
 
        std::thread::spawn(move || {
            let log = move |msg: String| {
-               if let Ok(mut logs) = log_arc.lock() { logs.push(msg); }
+               if let Ok(mut logs) = log_arc.lock() { push_log(&mut logs, msg); }
            };
            
            log(format!("Family Godmode: Initializing for {}...", appid));
@@ -2546,7 +3442,7 @@ impl DarkCoreApp {
 
         std::thread::spawn(move || {
             let log = move |msg: String| {
-                if let Ok(mut logs) = log_arc.lock() { logs.push(msg); }
+                if let Ok(mut logs) = log_arc.lock() { push_log(&mut logs, msg); }
             };
             
             log(format!("Disabling Family Godmode for {}...", appid));
@@ -2620,17 +3516,6 @@ impl DarkCoreApp {
             }
         });
         
-        ui.add_space(5.0);
-        
-        ui.label("Associated AppID (Optional, for Titan):");
-        ui.horizontal(|ui| {
-             ui.text_edit_singleline(&mut self.steamless_app_id); 
-             ui.label("❓").on_hover_text("Enter the Steam AppID of this game to automatically deploy Titan Hook after unpacking.");
-        });
-
-        ui.add_space(5.0);
-        ui.checkbox(&mut self.steamless_auto_titan, "Auto-Activate Titan (Hook + Cloud Patch)");
-
         ui.add_space(15.0);
 
         if ui.button(egui::RichText::new("UNPACK & PATCH").strong().size(16.0)).clicked() {
@@ -2642,14 +3527,6 @@ impl DarkCoreApp {
             match steamless::run_steamless(&self.target_exe, &self.config.steamless_path) {
                 Ok(msg) => {
                     self.log(msg);
-                    // AUTO TITAN TRIGGER
-                    if self.steamless_auto_titan && !self.steamless_app_id.is_empty() {
-                        // We must clone because deploy mutates self and we are in a mutable borrow??
-                        // Actually calling method on self inside match is fine if no conflict?
-                        // `steamless::run_steamless` does not borrow self.
-                        let appid = self.steamless_app_id.clone();
-                        self.deploy_titan_auto(&appid);
-                    }
                 },
                 Err(e) => self.log(format!("Steamless Error: {}", e)),
             }
@@ -2666,6 +3543,30 @@ impl DarkCoreApp {
                       if ui.button(egui::RichText::new("➕ CREATE NEW PROFILE").strong().color(egui::Color32::GREEN)).clicked() {
                           self.profile_name_input.clear(); // Reset input
                           self.create_profile_modal_open = true;
+                      }
+                      
+                      // CHECK UPDATES BUTTON
+                      let pending_count = self.watcher_pending_updates.lock()
+                          .map(|p| p.len())
+                          .unwrap_or(0);
+                      
+                      let btn_text = if pending_count > 0 {
+                          format!("🔄 CHECK UPDATES ({})", pending_count)
+                      } else {
+                          "🔄 CHECK UPDATES".to_string()
+                      };
+                      
+                      let btn_color = if pending_count > 0 {
+                          egui::Color32::from_rgb(255, 165, 0) // Orange
+                      } else {
+                          egui::Color32::from_rgb(100, 200, 255) // Cyan
+                      };
+                      
+                      if ui.button(egui::RichText::new(btn_text).strong().color(btn_color).size(11.0))
+                          .on_hover_text("Manually check for game updates")
+                          .clicked()
+                      {
+                          self.start_watcher_check();
                       }
                  });
             });
@@ -2690,7 +3591,7 @@ impl DarkCoreApp {
                                      // AUTO-LOAD LOGIC
                                      if ui.selectable_value(&mut self.active_profile_name, name.clone(), name).clicked() {
                                          // User clicked a new profile -> Auto Load
-                                         match self.profile_manager.load_profile(&name) {
+                                         match self.profile_manager.load_profile(name) {
                                              Ok(p) => {
                                                  if p.app_ids.len() > 133 {
                                                      self.status_msg = format!("⚠ LIMIT EXCEEDED ({} > 133). Steam may crash.", p.app_ids.len());
@@ -2744,12 +3645,10 @@ impl DarkCoreApp {
                          
                          if ui.add_enabled(!is_default, btn)
                              .on_hover_text(if is_default { "Cannot delete Default profile" } else { "Delete selected profile" })
-                             .clicked() 
-                         {
-                             if !self.active_profile_name.is_empty() {
+                             .clicked()
+                             && !self.active_profile_name.is_empty() {
                                  self.delete_profile_modal_open = true;
                              }
-                         }
                     });
                 });
         });
@@ -2800,8 +3699,8 @@ impl DarkCoreApp {
                               self.create_profile_modal_open = false;
                           }
                           
-                          if ui.button(egui::RichText::new("✅ CREATE & WIPE").strong().color(egui::Color32::RED)).clicked() {
-                              if !self.profile_name_input.is_empty() {
+                          if ui.button(egui::RichText::new("✅ CREATE & WIPE").strong().color(egui::Color32::RED)).clicked()
+                              && !self.profile_name_input.is_empty() {
                                   // 1. AUTO-SAVE CURRENT (Safety) - CONDITIONAL
                                   if !self.active_profile_name.is_empty() && self.create_profile_save_default {
                                       let games = self.active_games.lock().unwrap();
@@ -2842,7 +3741,6 @@ impl DarkCoreApp {
                                       }
                                   }
                               }
-                          }
                       });
                  });
         }
@@ -2976,6 +3874,27 @@ impl DarkCoreApp {
                             );
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new(&game.name).color(egui::Color32::WHITE));
+                            
+                            // Update Indicator - Check if update available from watcher
+                            let has_pending_update = self.watcher_pending_updates.lock()
+                                .map(|pu| pu.contains_key(&game.app_id))
+                                .unwrap_or(false);
+                            
+                            let is_updating = self.watcher_updating.lock()
+                                .map(|dl| dl.contains(&game.app_id))
+                                .unwrap_or(false);
+                            
+                            if is_updating {
+                                ui.label(
+                                    egui::RichText::new("⏳")
+                                        .color(egui::Color32::YELLOW)
+                                ).on_hover_text("Downloading new manifests...");
+                            } else if has_pending_update {
+                                ui.label(
+                                    egui::RichText::new("🔔")
+                                        .color(egui::Color32::from_rgb(255, 165, 0)) // Orange
+                                ).on_hover_text("Update available! Click AGGIORNA to download new manifest.");
+                            }
 
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -2987,107 +3906,96 @@ impl DarkCoreApp {
                                     {
                                         delete_req = Some((game.app_id.clone(), game.name.clone()));
                                     }
+                                    
+                                    // AGGIORNA MANIFEST BUTTON (only if update pending and not already updating)
+                                    if has_pending_update && !is_updating {
+                                        let update_btn = ui.button(
+                                            egui::RichText::new("⬇ AGGIORNA")
+                                                .color(egui::Color32::from_rgb(0, 255, 150))
+                                                .size(11.0)
+                                        ).on_hover_text("Download new manifest files for this game.\nWill use configured target language.");
+                                        
+                                        if update_btn.clicked() {
+                                            // Start update
+                                            let app_id = game.app_id.clone();
+                                            let api_key = self.config.api_key.clone();
+                                            let steam_path = self.config.steam_path.clone();
+                                            let target_language = self.config.target_language.clone();
+                                            let updating_arc = self.watcher_updating.clone();
+                                            let pending_arc = self.watcher_pending_updates.clone();
+                                            let log_arc = self.system_log.clone();
+                                            
+                                            // Mark as updating
+                                            if let Ok(mut u) = updating_arc.lock() {
+                                                u.insert(app_id.clone());
+                                            }
+                                            
+                                            // Spawn update thread
+                                            std::thread::spawn(move || {
+                                                let rt = match tokio::runtime::Runtime::new() {
+                                                    Ok(rt) => rt,
+                                                    Err(_) => {
+                                                        if let Ok(mut u) = updating_arc.lock() { u.remove(&app_id); }
+                                                        return;
+                                                    }
+                                                };
+                                                
+                                                if let Ok(mut logs) = log_arc.lock() {
+                                                    logs.push(format!("[Watcher] Starting manifest update for {}...", app_id));
+                                                }
+                                                
+                                                // Create downloader and trigger update
+                                                let downloader = crate::manifest_downloader::ManifestDownloader::new();
+                                                let steam_path = std::path::Path::new(&steam_path);
+                                                
+                                                let result = rt.block_on(async {
+                                                    crate::watcher::trigger_update_download(
+                                                        &api_key,
+                                                        &downloader,
+                                                        &app_id,
+                                                        steam_path,
+                                                        &target_language,
+                                                    ).await
+                                                });
+                                                
+                                                match result {
+                                                    Ok(count) => {
+                                                        if let Ok(mut logs) = log_arc.lock() {
+                                                            logs.push(format!("[Watcher] ✅ Updated {} depot manifests for {}", count, app_id));
+                                                        }
+                                                        // Remove from pending
+                                                        if let Ok(mut p) = pending_arc.lock() {
+                                                            p.remove(&app_id);
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        if let Ok(mut logs) = log_arc.lock() {
+                                                            logs.push(format!("[Watcher] ❌ Update failed for {}: {}", app_id, e));
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                // Remove from updating
+                                                if let Ok(mut u) = updating_arc.lock() {
+                                                    u.remove(&app_id);
+                                                }
+                                            });
+                                        }
+                                    }
 
-                                    // TITAN MODE CHECK
+                                    // STEAMLESS AUTOMATION BUTTON
                                     let steam_path = self.config.steam_path.clone();
                                     
-                                    // SKIP Steamless/Titan for Family Shared games
+                                    // SKIP Steamless for Family Shared games
                                     let is_family_shared = self.config.family_godmode_ids.contains(&game.app_id);
                                     
-                                    // Use helper methods from game_path.rs
+                                    // Show STEAMLESS button only if game path exists and not family shared
                                     if !is_family_shared && crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id).is_some() {
-                                        if crate::game_path::GamePathFinder::is_titan_active(&steam_path, &game.app_id) {
-                                            ui.label(
-                                                egui::RichText::new("✅ TITAN ACTIVE")
-                                                    .color(egui::Color32::GREEN)
-                                                    .size(10.0)
-                                            ).on_hover_text("Titan Hook (version.dll) is deployed.");
-                                        } else {
-                                            let btn = ui.button(
-                                                egui::RichText::new("⚔ ACTIVATE TITAN")
-                                                    .color(egui::Color32::YELLOW)
-                                                    .size(10.0)
-                                            ).on_hover_text("Deploy Titan Hook (version.dll) for Cloud Save & Achievements.");
-                                            
-                                            if btn.clicked() {
-                                                // KILL STEAM FIRST (Safety for VDF & File Locks)
-                                                let _ = std::process::Command::new("taskkill")
-                                                    .args(&["/F", "/IM", "steam.exe"])
-                                                    .output();
-                                                
-                                                // Wait a moment for process death
-                                                std::thread::sleep(std::time::Duration::from_millis(1000));
-
-                                                match crate::game_path::GamePathFinder::deploy_titan_hook(&steam_path, &game.app_id) {
-                                                    Ok(path) => {
-                                                        self.log(format!("Titan deployed to: {:?}", path));
-                                                        // Suppress Cloud Error (Safe now that Steam is dead)
-                                                        match crate::game_path::GamePathFinder::suppress_cloud_sync(&steam_path, &game.app_id) {
-                                                            Ok(_) => {
-                                                                self.log("Cloud Sync Suppressed (localconfig patched).".to_string());
-                                                                
-                                                                // AUTO-RESTART STEAM via GreenLuma Injector
-                                                                let steam_path = steam_path.clone(); // Capture from outer
-                                                                let gl_path = self.config.gl_path.clone();
-                                                                let log_arc = self.system_log.clone();
-
-                                                                std::thread::spawn(move || {
-                                                                    let log = move |msg: String| {
-                                                                        if let Ok(mut logs) = log_arc.lock() {
-                                                                            logs.push(msg);
-                                                                        }
-                                                                    };
-                                                                    log("Titan/Restart: Initiating Stealth Sequence (x64)...".to_string());
-                                                                    
-                                                                let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
-                                                                    let dll_name = "GreenLuma_2025_x64.dll";
-                                                                    let dll_path = std::path::Path::new(&gl_path).join(dll_name);
-                
-                                                                    if steam_exe.exists() && dll_path.exists() {
-                                                                        // SYNC
-                                                                        let target_dll = std::path::Path::new(&steam_path).join(dll_name);
-                                                                        let _ = std::fs::copy(&dll_path, &target_dll);
-                                                                        
-                                                                        let src_applist = std::path::Path::new(&gl_path).join("AppList");
-                                                                        let dst_applist = std::path::Path::new(&steam_path).join("AppList");
-                                                                        if src_applist.exists() {
-                                                                            let _ = std::fs::create_dir_all(&dst_applist);
-                                                                            if let Ok(entries) = std::fs::read_dir(src_applist) {
-                                                                               for entry in entries.flatten() {
-                                                                                   if let Ok(ft) = entry.file_type() {
-                                                                                       if ft.is_file() { let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name())); }
-                                                                                   }
-                                                                               }
-                                                                            }
-                                                                        }
-
-                                                                        match crate::injector::launch_injected(
-                                                                            steam_exe.to_str().unwrap_or(""),
-                                                                            target_dll.to_str().unwrap_or(""),
-                                                                            Some("-inhibitbootstrap")
-                                                                        ) {
-                                                                            Ok(_) => log("✅ Restarted with GreenLuma.".to_string()),
-                                                                            Err(e) => log(format!("❌ Restart Failed: {}", e)),
-                                                                        }
-                                                                    } else {
-                                                                        log("❌ Missing files for restart.".to_string());
-                                                                    }
-                                                                });
-                                                            },
-                                                            Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
-                                                        }
-                                                    },
-                                                    Err(e) => self.log(format!("Titan Error: {}", e)),
-                                                }
-                                            }
-                                        }
-                                        
-                                        // STEAMLESS AUTOMATION BUTTON
                                         let steamless_btn = ui.button(
                                             egui::RichText::new("⚡ STEAMLESS")
                                                 .color(egui::Color32::from_rgb(255, 150, 0))
                                                 .size(10.0)
-                                        ).on_hover_text("Auto-patch all DRM-protected EXEs in game folder.\nGenerates steam_appid.txt for Titan.");
+                                        ).on_hover_text("Auto-patch all DRM-protected EXEs in game folder.\nGenerates steam_appid.txt.");
                                         
                                         if steamless_btn.clicked() {
                                             if let Some(game_path) = crate::game_path::GamePathFinder::find_game_path(&steam_path, &game.app_id) {
@@ -3110,7 +4018,7 @@ impl DarkCoreApp {
                                                     std::thread::spawn(move || {
                                                         let log = move |msg: String| {
                                                             if let Ok(mut logs) = log_arc.lock() {
-                                                                logs.push(msg);
+                                                                push_log(&mut logs, msg);
                                                             }
                                                         };
                                                         
@@ -3135,6 +4043,15 @@ impl DarkCoreApp {
                                             } else {
                                                 self.log("❌ Game folder not found. Is it installed?".to_string());
                                             }
+                                        }
+                                        
+                                        // GOLDBERG BUTTON
+                                        if ui.button(egui::RichText::new("\u{1F6E1} GOLDBERG").color(egui::Color32::YELLOW).size(10.0))
+                                            .on_hover_text("Deploy Offline Fix (Goldberg Emulator).\nEnsures Saves and Achievements work offline.")
+                                            .clicked() 
+                                        {
+                                            self.goldberg_candidate_id = Some(game.app_id.clone());
+                                            self.goldberg_modal_open = true;
                                         }
                                     } else {
                                          // Not installed or check if DLC
@@ -3181,7 +4098,143 @@ impl DarkCoreApp {
                 drop(games); // Drop lock before mutating self
                 self.initiate_delete(aid, name);
             }
-        });
+        }); // End ScrollArea
+
+            // GOLDBERG MODAL
+            let cand_id = self.goldberg_candidate_id.clone();
+            if self.goldberg_modal_open {
+                if let Some(appid) = cand_id {
+                    let ctx = ui.ctx().clone();
+                    egui::Window::new(egui::RichText::new("\u{1F6E1} GOLDBERG EMULATOR SETUP").strong().color(egui::Color32::YELLOW))
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(&ctx, |ui| {
+                            ui.label("Configure Offline Wrapper Settings:");
+                            ui.add_space(10.0);
+                            
+                            ui.label("Username (Visible inside game):");
+                            ui.text_edit_singleline(&mut self.goldberg_user_input);
+                            
+                            ui.label("SteamID (64-bit ID):");
+                            ui.text_edit_singleline(&mut self.goldberg_steamid_input);
+                            ui.small("Default is recommended for compatibility.");
+
+                            ui.add_space(5.0);
+                            ui.checkbox(&mut self.goldberg_use_64bit, "Deploy 64-bit DLL (Standard)");
+                            
+                            ui.add_space(15.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("CANCEL").clicked() {
+                                    self.goldberg_modal_open = false;
+                                }
+                                
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.button(egui::RichText::new("🚀 DEPLOY FIX").strong().color(egui::Color32::GREEN)).clicked() {
+                                         // DEPLOYMENT LOGIC
+                                         let steam_path = self.config.steam_path.clone();
+                                         if let Some(game_path) = crate::game_path::GamePathFinder::find_game_path(&steam_path, &appid) {
+                                             let mut success = true;
+                                             
+                                             // 1. Core Files
+                                             let aid_u32 = appid.parse::<u32>().unwrap_or(0);
+                                             if let Err(e) = self.goldberg.deploy(&game_path, aid_u32, self.goldberg_use_64bit) { 
+                                                 self.log(format!("Goldberg Deploy Error: {}", e));
+                                                 success = false;
+                                             }
+                                             
+                                             // 2. Ticket Gen
+                                             if success {
+                                                 if let Err(e) = self.goldberg.generate_ticket(aid_u32, &game_path) {
+                                                     self.log(format!("Ticket Gen Error: {}", e));
+                                                     // Non-fatal, but warn
+                                                 } else {
+                                                     self.log("✅ Encrypted AppTicket generated successfully.".to_string());
+                                                 }
+                                             }
+                                             
+                                             // 3. User Config (Username/ID)
+                                             if success {
+                                                 let settings_dir = game_path.join("steam_settings");
+                                                 let _ = std::fs::create_dir_all(&settings_dir);
+                                                 
+                                                 // force_account_name.txt
+                                                 if !self.goldberg_user_input.is_empty() {
+                                                     let _ = std::fs::write(settings_dir.join("force_account_name.txt"), &self.goldberg_user_input);
+                                                 }
+                                                 
+                                                 // force_steamid.txt (optional, usually user_steam_id.txt)
+                                                 // Goldberg uses user_steam_id.txt usually containing just the ID
+                                                  if !self.goldberg_steamid_input.is_empty() && self.goldberg_steamid_input.chars().all(char::is_numeric) {
+                                                     let _ = std::fs::write(settings_dir.join("user_steam_id.txt"), &self.goldberg_steamid_input);
+                                                 }
+                                                 
+                                                 
+                                                 // 4. Achievement Downloader (Async Background)
+                                                 let client_opt = self.api_client.clone();
+                                                 let g_gen = self.goldberg.clone();
+                                                 let appid_c = appid.clone();
+                                                 let gp_c = game_path.clone();
+                                                 let log_arc = self.system_log.clone();
+
+                                                 std::thread::spawn(move || {
+                                                     if let Some(client) = client_opt {
+                                                         if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                                                             .enable_all()
+                                                             .build() 
+                                                         {
+                                                             // Log start
+                                                             if let Ok(mut logs) = log_arc.lock() {
+                                                                  push_log(&mut logs, format!("🏆 Fetching Achievements for {}...", appid_c));
+                                                             }
+
+                                                             match rt.block_on(g_gen.download_achievements(&appid_c, &client, &gp_c)) {
+                                                                 Ok(msg) => {
+                                                                      if let Ok(mut logs) = log_arc.lock() {
+                                                                          push_log(&mut logs, format!("✅ Achievements: {}", msg));
+                                                                      }
+                                                                 },
+                                                                 Err(e) => {
+                                                                      if let Ok(mut logs) = log_arc.lock() {
+                                                                          push_log(&mut logs, format!("⚠️ Achievement Download Error: {}", e));
+                                                                      }
+                                                                 }
+                                                             }
+
+                                                             // 5. DLC Unlocker (Async) - DISABLED per user request (redundant with GreenLuma/Picker)
+                                                             /*
+                                                             match rt.block_on(g_gen.generate_dlc_config(&appid_c, &client, &gp_c)) {
+                                                                Ok(msg) => {
+                                                                      if let Ok(mut logs) = log_arc.lock() {
+                                                                          push_log(&mut logs, format!("✅ DLC Config: {}", msg));
+                                                                      }
+                                                                 },
+                                                                 Err(e) => {
+                                                                     // Not critical
+                                                                     if let Ok(mut logs) = log_arc.lock() {
+                                                                          push_log(&mut logs, format!("ℹ️ DLC Config: {}", e));
+                                                                     }
+                                                                 }
+                                                             }
+                                                             */
+                                                         }
+                                                     }
+                                                 });
+
+                                                 self.log(format!("🛡️ Goldberg Emulator applied to AppID {}. Achievements & DLCs processing in background.", appid));
+                                             }
+                                         } else {
+                                             self.log("Error: Game path not found.".to_string());
+                                         }
+                                         
+                                         self.goldberg_modal_open = false;
+                                    }
+                                });
+                            });
+                        });
+                }
+            }
+
     }
 
     fn ui_settings(&mut self, ui: &mut egui::Ui) {
@@ -3222,14 +4275,12 @@ impl DarkCoreApp {
                                 let p_str = path.to_string_lossy().to_string();
                                 *txt = p_str.replace(r"\\?\", "");
                             }
-                        } else {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("exe", &["exe"])
-                                .pick_file()
-                            {
-                                let p_str = path.to_string_lossy().to_string();
-                                *txt = p_str.replace(r"\\?\", "");
-                            }
+                        } else if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("exe", &["exe"])
+                            .pick_file()
+                        {
+                            let p_str = path.to_string_lossy().to_string();
+                            *txt = p_str.replace(r"\\?\", "");
                         }
                     }
                     if let Some(h) = hint {
@@ -3833,6 +4884,155 @@ impl DarkCoreApp {
         }
     }
 
+
+
+    /// Renders the DLC Picker Modal for games with many DLCs
+    fn show_dlc_picker_modal(&mut self, ctx: &egui::Context) {
+        if !self.dlc_picker_open {
+            return;
+        }
+        
+        // Ensure modal stays open
+        let mut open = true;
+        
+        let candidate = self.dlc_picker_candidate.clone();
+        
+        if let Some((app_id, name)) = candidate {
+            
+            // Count current AppList entries
+            let current_count = {
+                let games = self.active_games.lock().unwrap();
+                games.len()
+            };
+            let available_slots = APPLIST_LIMIT.saturating_sub(current_count);
+            // Rough estimation
+            let base_slots = self.dlc_picker_depot_count + 1; 
+            let dlc_slots = available_slots.saturating_sub(base_slots);
+            
+            egui::Window::new(egui::RichText::new("🎮 DLC Picker").strong())
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(true)
+                .default_size(egui::vec2(600.0, 500.0))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(5.0);
+                        ui.label(egui::RichText::new(format!("Installing: {}", name)).size(16.0).strong());
+                        ui.add_space(5.0);
+                        
+                        // Stats bar
+                        ui.horizontal(|ui| {
+                            ui.label(format!("📊 AppList: {}/{}", current_count, APPLIST_LIMIT));
+                            ui.separator();
+                            ui.label(format!("📦 Base Depots: {}", base_slots));
+                            ui.separator();
+                            let selected = self.dlc_picker_items.iter().filter(|(_, _, s)| *s).count();
+                            let color = if selected > dlc_slots {
+                                egui::Color32::RED
+                            } else {
+                                egui::Color32::GREEN
+                            };
+                            ui.label(egui::RichText::new(format!("✅ Selected: {}/{} DLCs", selected, dlc_slots)).color(color));
+                        });
+                        
+                        ui.add_space(5.0);
+                        
+                        // Warning if over limit
+                        let selected = self.dlc_picker_items.iter().filter(|(_, _, s)| *s).count();
+                        if selected > dlc_slots {
+                            ui.label(egui::RichText::new(format!(
+                                "⚠️ You've selected {} DLCs but only have {} slots available!",
+                                selected, dlc_slots
+                            )).color(egui::Color32::RED).strong());
+                        }
+                        
+                        ui.add_space(5.0);
+                        
+                        // Search bar
+                        ui.horizontal(|ui| {
+                            ui.label("🔍 Filter:");
+                            ui.text_edit_singleline(&mut self.dlc_picker_search);
+                            
+                            if ui.button("Select All").clicked() {
+                                for (_, _, selected) in &mut self.dlc_picker_items {
+                                    *selected = true;
+                                }
+                            }
+                            if ui.button("Deselect All").clicked() {
+                                for (_, _, selected) in &mut self.dlc_picker_items {
+                                    *selected = false;
+                                }
+                            }
+                            if ui.button(format!("Select First {}", dlc_slots)).clicked() {
+                                for (i, (_, _, selected)) in self.dlc_picker_items.iter_mut().enumerate() {
+                                    *selected = i < dlc_slots;
+                                }
+                            }
+                        });
+                        
+                        ui.separator();
+                        
+                        // List
+                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            let filter = self.dlc_picker_search.to_lowercase();
+                             // Use index for mutation
+                             // We need to iterate mutable items
+                             // But we also want to filter. 
+                             // Egui pattern:
+                             for (_id, name, selected) in &mut self.dlc_picker_items {
+                                 if filter.is_empty() || name.to_lowercase().contains(&filter) {
+                                     ui.checkbox(selected, name.as_str());
+                                 }
+                             }
+                        });
+
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                             if ui.button("Cancel").clicked() {
+                                 self.dlc_picker_open = false;
+                                 self.dlc_picker_pending_library = None; 
+                             }
+
+                             let selected_count = self.dlc_picker_items.iter().filter(|(_, _, s)| *s).count();
+                             let enabled = selected_count <= dlc_slots;
+                             
+                             if ui.add_enabled(enabled, egui::Button::new(egui::RichText::new("🚀 INSTALL SELECTED").strong().color(egui::Color32::GREEN))).clicked() {
+                                 // FINALIZE
+                                 let selected_dlc_ids: Vec<String> = self.dlc_picker_items.iter()
+                                    .filter(|(_, _, s)| *s)
+                                    .map(|(id, _, _)| id.clone())
+                                    .collect();
+
+                                     if let (Some(tpl_lib), Some(tpl_dir)) = (self.dlc_picker_pending_library.clone(), self.dlc_picker_pending_install_dir.clone()) {
+                                         let cached = self.dlc_picker_cached_bytes.take(); // Take first (consume)
+                                         // Pass None for hierarchy since DLC picker uses scraped LUA data
+                                         self.finalize_installation(
+                                             app_id.clone(), 
+                                             name.clone(), 
+                                             Some(tpl_lib), 
+                                             Some(tpl_dir), 
+                                             selected_dlc_ids,
+                                             cached,
+                                             None // No Hierarchy in Legacy Flow
+                                         );
+                                     }
+                                     self.dlc_picker_open = false;
+                                     self.dlc_picker_pending_library = None;
+                                     self.dlc_picker_pending_install_dir = None;
+                             }
+                        });
+                    });
+                });
+
+        if !open {
+            self.dlc_picker_open = false;
+        }
+        } // Close if let Some((app_id, name))
+    }
+
+
     fn initiate_delete(&mut self, app_id: String, name: String) {
         self.delete_modal_open = true;
         self.delete_candidate_id = Some(app_id.clone());
@@ -3862,11 +5062,10 @@ impl DarkCoreApp {
                      
                      if candidate_clean.starts_with(&target_clean) {
                          // Additional content check
-                         if self.is_probable_dlc(&game.name) || candidate_clean.contains("pack") || candidate_clean.contains("content") || candidate_clean.contains("season") {
-                            if !known_child_ids.contains(&game.app_id) {
+                         if (self.is_probable_dlc(&game.name) || candidate_clean.contains("pack") || candidate_clean.contains("content") || candidate_clean.contains("season"))
+                            && !known_child_ids.contains(&game.app_id) {
                                 known_child_ids.push(game.app_id.clone());
                             }
-                         }
                      }
                  }
              }
@@ -3875,16 +5074,13 @@ impl DarkCoreApp {
         // Spawn scan
         if let Some(client) = self.api_client.clone() {
             let app_id_clone = app_id.clone();
-            let result_arc = self.dlc_scan_result.clone();
+            let result_arc = self.delete_scan_result.clone();
             let active_games_arc = self.active_games.clone();
 
             std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 let found: Vec<String> = runtime.block_on(async {
-                    match client.get_dlc_list(&app_id_clone).await {
-                        Ok(dlcs) => dlcs,
-                        Err(_) => vec![],
-                    }
+                    client.get_dlc_list(&app_id_clone).await.unwrap_or_default()
                 });
 
                 // Filter: Keep only installed
@@ -3955,9 +5151,20 @@ impl DarkCoreApp {
             let vault = crate::vault::VaultManager::new("."); // Initialize Vault
 
             for id in &ids {
-                 // SAFETY FIRST: Backup Manifests before any deletion
-                 if let Ok(c) = vault.backup_manifests(&steam_path, id) {
-                     if c > 0 { self.log(format!("Vault: Secured {} manifests for {} before deletion.", c, id)); }
+                 // Scan ALL libraries for the game to backup
+                 let mut backed_up = false;
+                 for lib in &libraries {
+                      if let Ok(c) = vault.backup_manifests(&lib.to_string_lossy(), id) {
+                          if c > 0 { 
+                              self.log(format!("Vault: Secured {} manifests for {} from {:?}.", c, id, lib)); 
+                              backed_up = true;
+                              break; // Found and backed up
+                          }
+                      }
+                 }
+                 if !backed_up {
+                     // Try default steam path as fallback
+                     let _ = vault.backup_manifests(&steam_path, id);
                  }
 
                  // Define potential locations (Main + External Libs)
@@ -4038,80 +5245,6 @@ impl DarkCoreApp {
         false
     }
 
-    // Legacy: Called from old DRM INTEL tab
-    #[allow(dead_code)]
-    fn deploy_titan_auto(&mut self, app_id: &str) {
-        let steam_path = self.config.steam_path.clone();
-        
-        self.log(format!("Auto-Deploying Titan for AppID: {}...", app_id));
-
-        // 1. Kill Steam
-        let _ = std::process::Command::new("taskkill")
-            .args(&["/F", "/IM", "steam.exe"])
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(1500));
-
-        // 2. Deploy Hook (DLL + AppID txt)
-        match crate::game_path::GamePathFinder::deploy_titan_hook(&steam_path, app_id) {
-            Ok(path) => {
-                self.log(format!("Titan Hook deployed to: {:?}", path));
-
-                // 3. Suppress Cloud
-                match crate::game_path::GamePathFinder::suppress_cloud_sync(&steam_path, app_id) {
-                    Ok(_) => self.log("Cloud Sync Suppressed.".to_string()),
-                    Err(e) => self.log(format!("Cloud Suppression Warning: {}", e)),
-                }
-
-                // 4. Auto-Restart
-                let steam_path = steam_path.clone();
-                let gl_path = self.config.gl_path.clone();
-                let log_arc = self.system_log.clone();
-
-                std::thread::spawn(move || {
-                     let log = move |msg: String| {
-                         if let Ok(mut logs) = log_arc.lock() {
-                             logs.push(msg);
-                         }
-                     };
-                     log("Auto-Titan: Initiating Stealth Sequence (x64)...".to_string());
-                     
-                     let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
-                     let dll_name = "GreenLuma_2025_x64.dll";
-                     let dll_path = std::path::Path::new(&gl_path).join(dll_name);
-
-                     if steam_exe.exists() && dll_path.exists() {
-                        // SYNC
-                        let target_dll = std::path::Path::new(&steam_path).join(dll_name);
-                        let _ = std::fs::copy(&dll_path, &target_dll);
-
-                        let src_applist = std::path::Path::new(&gl_path).join("AppList");
-                        let dst_applist = std::path::Path::new(&steam_path).join("AppList");
-                        if src_applist.exists() {
-                            let _ = std::fs::create_dir_all(&dst_applist);
-                            if let Ok(entries) = std::fs::read_dir(src_applist) {
-                               for entry in entries.flatten() {
-                                   if let Ok(ft) = entry.file_type() {
-                                       if ft.is_file() { let _ = std::fs::copy(entry.path(), dst_applist.join(entry.file_name())); }
-                                   }
-                               }
-                            }
-                        }
-
-                        match crate::injector::launch_injected(
-                            steam_exe.to_str().unwrap_or(""),
-                            target_dll.to_str().unwrap_or(""),
-                            Some("-inhibitbootstrap")
-                        ) {
-                            Ok(_) => log("✅ Auto-Titan Injected.".to_string()),
-                            Err(e) => log(format!("❌ Auto-Titan Failed: {}", e)),
-                        }
-                     }
-                });
-            },
-            Err(e) => self.log(format!("Titan Deployment Failed: {}", e)),
-        }
-    }
-
     fn ui_info(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let time = ui.input(|i| i.time);
@@ -4167,7 +5300,7 @@ impl DarkCoreApp {
                  let x = rect.min.x + (rand_pseudo(seed + 2) % (rect.width() as usize)) as f32;
                  let speed_base = match layer { 0 => 1.0, 1 => 2.5, _ => 4.5 };
                  let speed = speed_base + (rand_pseudo(seed + 3) as f32 % 5.0) * 0.4;
-                 let len = 10 + (rand_pseudo(seed + 4) % 40) as usize;
+                 let len = 10 + (rand_pseudo(seed + 4) % 40);
                  
                  let mut chars = Vec::new();
                  for k in 0..len { chars.push(random_matrix_char(seed + k)); }
@@ -4461,7 +5594,7 @@ pub fn generate_acf(
         install_script_entry
     );
 
-    std::fs::write(&acf_path, content)?;
+    std::fs::write(acf_path, content)?;
     Ok(())
 }
 
@@ -4500,14 +5633,9 @@ pub fn generate_smd_style_acf(
         .trim()
         .to_string();
 
-    // Create the game directory in steamapps/common (Steam expects this to exist)
-    if let Some(parent) = acf_path.parent() {
-        let common_dir = parent.join("common");
-        let game_dir = common_dir.join(&install_dir_sanitized);
-        if !game_dir.exists() {
-            let _ = std::fs::create_dir_all(&game_dir);
-        }
-    }
+    // NOTE: We do NOT create the game directory here.
+    // SMD doesn't create it either. Steam will create it during download.
+    // Creating an empty folder causes Steam to think the game is "installed but corrupt".
 
     // MINIMAL ACF - Exactly 5 fields like SMD
     // StateFlags "4" = Fully Installed (tells Steam game is ready but needs update)
@@ -4525,7 +5653,7 @@ pub fn generate_smd_style_acf(
         install_dir_sanitized,
     );
 
-    std::fs::write(&acf_path, content)?;
+    std::fs::write(acf_path, content)?;
     Ok(())
 }
 
@@ -4551,10 +5679,8 @@ pub fn setup_greenluma_config(gl_path: &str, enable_stealth: bool) -> std::io::R
         if !stealth_bin.exists() {
             let _ = std::fs::write(&stealth_bin, "");
         }
-    } else {
-        if stealth_bin.exists() {
-             let _ = std::fs::remove_file(&stealth_bin);
-        }
+    } else if stealth_bin.exists() {
+         let _ = std::fs::remove_file(&stealth_bin);
     }
 
     // NOTE: Removed GreenLuma_2025_x64.ini creation
@@ -4563,4 +5689,109 @@ pub fn setup_greenluma_config(gl_path: &str, enable_stealth: bool) -> std::io::R
     // Our Rust APC injector does not need this file at all.
     
     Ok(())
+}
+
+// --- WUDRM HELPER ---
+pub fn download_manifests_wudrm(appid: &str, steam_root: &str, log: &dyn Fn(String)) -> Result<usize, Box<dyn std::error::Error>> {
+    use crate::api::ApiClient;
+    
+    // Check if module exists - assuming we imported it or use crate path
+    let runtime = tokio::runtime::Runtime::new()?;
+    // Anonymous client for public SteamCMD API
+    let client = ApiClient::new("".to_string()); 
+    let downloader = crate::manifest_downloader::ManifestDownloader::new();
+    let depot_cache_dir = std::path::Path::new(steam_root).join("depotcache");
+    
+    if !depot_cache_dir.exists() { std::fs::create_dir_all(&depot_cache_dir)?; }
+
+    log(format!("Wudrm: Connecting to SteamCMD for AppID {}...", appid));
+    
+    // We need 'get_app_info' to return public info with GIDs
+    let info = runtime.block_on(client.get_app_info(appid))?;
+    
+    let vault = crate::vault::VaultManager::new(".");
+
+    let mut valid_manifests = 0;
+    // Download manifest for EACH depot that has a GID
+    for (depot_id, depot_curr) in info.depots {
+        if let Some(gid) = depot_curr.gid {
+                let expected_name = format!("{}_{}.manifest", depot_id, gid);
+                let expected_path = depot_cache_dir.join(&expected_name);
+
+                // 1. Check if exists (Restored from Vault or previous run)
+                if expected_path.exists() {
+                     log(format!("   - Skipping Wudrm (Found local): {}", expected_name));
+                     valid_manifests += 1;
+                     // Ensure it is in Vault too (Sync)
+                     let _ = vault.store_manifest(appid, &expected_path);
+                     continue;
+                }
+
+                log(format!("   - Downloading Manifest: Depot {} | GID: {}", depot_id, gid));
+                match runtime.block_on(downloader.download_manifest(&depot_id, &gid, &depot_cache_dir)) {
+                    Ok(path) => {
+                        log(format!("      ✅ Success! Saved to {:?}", path));
+                        valid_manifests += 1;
+                        // 2. Save to Vault immediately
+                        let _ = vault.store_manifest(appid, &path);
+                    },
+                    Err(e) => {
+                        log(format!("      ❌ Failed to download {}: {}", depot_id, e));
+                    }
+                }
+        }
+    }
+    
+    Ok(valid_manifests)
+}
+
+/// Extract DLC name from LUA comments
+/// Morrenus LUA files often have comments like: addappid(123456) -- DLC Name Here
+fn extract_dlc_name_from_lua(lua_content: &str, dlc_id: &str) -> Option<String> {
+    for line in lua_content.lines() {
+        // Look for addappid(ID) on this line
+        if line.contains(&format!("addappid({})", dlc_id)) || 
+           line.contains(&format!("addappid({},", dlc_id)) {
+            // Check for comment after the call
+            if let Some(comment_start) = line.find("--") {
+                let comment = line[comment_start + 2..].trim();
+                if !comment.is_empty() {
+                    return Some(comment.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_mandatory_depots(
+    hierarchy: &crate::api::GameHierarchy,
+    selected_dlcs: &[String],
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    
+    // 1. Root AppID (The Game Itself)
+    ids.push(hierarchy.root_id.clone());
+    
+    // 2. Base Depots (Mandatory for the game to run)
+    for depot in &hierarchy.base_depots {
+        ids.push(depot.depot_id.clone());
+    }
+    
+    // 3. Selected DLCs and THEIR Depots
+    for dlc in &hierarchy.dlcs {
+        if selected_dlcs.contains(&dlc.app_id) {
+            ids.push(dlc.app_id.clone());
+            // Include Depots for this DLC
+            for depot in &dlc.depots {
+                ids.push(depot.depot_id.clone());
+            }
+        }
+    }
+    
+    // Dedup just in case
+    ids.sort();
+    ids.dedup();
+    
+    ids
 }

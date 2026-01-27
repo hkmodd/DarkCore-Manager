@@ -1,0 +1,74 @@
+
+    /// Recursively fetches game hierarchy (Root -> DLCs -> Depots)
+    pub async fn fetch_full_hierarchy(&self, appid: String) -> Result<GameHierarchy, Box<dyn Error + Send + Sync>> {
+        // Use a Mutex to collect results across recursion threads if needed, 
+        // but for now, simple recursion is fine as depth is usually shallow (1 level).
+        // Actually, Steam hierarchies can be nested, but `listofdlc` usually covers mostly everything relative to the app.
+        
+        let root_info = self.get_app_info_no_auth(&appid).await?;
+        let root_name = root_info.get_name().unwrap_or(format!("App {}", appid));
+        
+        // Base Depots
+        let base_depots = root_info.extract_depots("english"); // Defaulting english for now
+        
+        // DLCs
+        let dlc_ids = root_info.extract_dlc_ids();
+        let mut dlc_nodes = Vec::new();
+        
+        if !dlc_ids.is_empty() {
+             // For each DLC, we need its name and depots
+             // We can do this concurrently
+             let mut handles = Vec::new();
+             
+             // LIMIT: Fetch max 200 DLCs to prevent ban/overload, though Manifestor UI limits to 130 selection.
+             // We fetch all to let user choose.
+             for d_id in dlc_ids.into_iter().take(400) {
+                 let client = self.clone();
+                 handles.push(tokio::spawn(async move {
+                     match client.get_app_info_no_auth(&d_id).await {
+                         Ok(info) => {
+                             let name = info.get_name().unwrap_or(format!("DLC {}", d_id));
+                             let depots = info.extract_depots("english");
+                             Some(DlcNode {
+                                 app_id: d_id,
+                                 name,
+                                 depots,
+                                 selected: false, 
+                             })
+                         },
+                         Err(_) => None,
+                     }
+                 }));
+             }
+             
+             // Await all
+             for h in handles {
+                 if let Ok(res) = h.await {
+                     if let Some(node) = res {
+                         dlc_nodes.push(node);
+                     }
+                 }
+             }
+        }
+        
+        // Apply Smart Defaults to selection
+        for node in &mut dlc_nodes {
+            let n = node.name.to_lowercase();
+            // Default: Select everything EXCEPT...
+            if n.contains("soundtrack") || n.contains(" ost") || n.contains("artbook") || n.contains("beta") || n.contains("demo") || n.contains("server") {
+                node.selected = false;
+            } else {
+                node.selected = true;
+            }
+        }
+        
+        // Sort by AppID
+        dlc_nodes.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        
+        Ok(GameHierarchy {
+            root_id: appid,
+            root_name,
+            base_depots,
+            dlcs: dlc_nodes,
+        })
+    }
