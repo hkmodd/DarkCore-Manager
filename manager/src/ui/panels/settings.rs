@@ -268,56 +268,9 @@ pub fn render(app: &mut crate::ui::state::DarkCoreApp, ui: &mut egui::Ui) {
     ui.add_space(5.0);
     
     // API Check / Refresh Logic
-    // Timer is a FUTURE time - when it passes, we refresh.
-    if !app.config.api_key.is_empty() {
-        if let Some(timer) = app.api_refresh_timer {
-            if Instant::now() > timer {
-                app.api_refresh_timer = None; // Reset timer
-                
-                let stats_arc = app.user_stats.clone();
-                let status_queue = app.status_update_queue.clone();
-                let error_arc = app.api_last_error.clone();
-                let validating_arc = app.is_validating_api.clone();
-                let cfg_key = app.config.api_key.clone();
-                
-                // Set VALIDATING flag immediately
-                if let Ok(mut v) = app.is_validating_api.lock() { *v = true; }
+    // Logic moved to app.rs update() loop for global coverage.
+    // settings.rs only sets the timer (via text edit or button), app.rs executes it.
 
-                std::thread::spawn(move || {
-                    let client = crate::api::ApiClient::new(cfg_key);
-                    let result = crate::ui::state::ASYNC_RUNTIME.block_on(client.get_user_stats());
-                    
-                    // *** CRITICAL: Clear Validating Flag ***
-                    if let Ok(mut v) = validating_arc.lock() { *v = false; }
-                    
-                    match result {
-                        Ok(stats) => {
-                            if let Ok(mut e) = error_arc.lock() { *e = None; }
-                            if let Ok(mut s) = stats_arc.lock() { *s = Some(stats); }
-                            if let Ok(mut q) = status_queue.lock() {
-                                *q = Some("API Connection Established.".to_string());
-                            }
-                        },
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if let Ok(mut er) = error_arc.lock() { *er = Some(err_str.clone()); }
-                            if let Ok(mut q) = status_queue.lock() {
-                                if err_str.contains("401") || err_str.contains("403") {
-                                    *q = Some("⛔ API KEY INVALID OR EXPIRED.".to_string());
-                                } else {
-                                    *q = Some(format!("API Error: {}", err_str));
-                                }
-                            }
-                        }
-                    }
-                });
-                app.log("Auto-Refreshing API Stats...".to_string());
-            } else {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(200)); // Timer countdown
-            }
-        }
-        // NOTE: If timer is None, it stays None until user modifies the API key
-    }
 
     // API UI Header
     ui.horizontal(|ui| {

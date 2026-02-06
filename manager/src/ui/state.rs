@@ -191,6 +191,7 @@ pub struct DarkCoreApp {
     pub(crate) user_stats: Arc<Mutex<Option<UserStats>>>,
     pub(crate) api_last_error: Arc<Mutex<Option<String>>>,
     pub(crate) is_validating_api: Arc<Mutex<bool>>,
+    pub(crate) request_api_refresh: Arc<Mutex<bool>>, // Signal from threads to main loop
 
     // DLC Picker
     pub(crate) dlc_picker_open: bool,

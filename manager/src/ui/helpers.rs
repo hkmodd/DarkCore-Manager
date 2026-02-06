@@ -298,27 +298,39 @@ pub fn remove_games_by_id(
         let vault = crate::vault::VaultManager::new(".");
 
         for id in &ids {
+            // [FIX] Avoid Ghost Folders: Only backup Parent AppIDs
+            // Skip children (Depots/DLCs) because the Parent backup handles the main ACF and all mounted manifests.
+            let is_child = if let Ok(map) = app.relationships.lock() {
+                map.contains_key(id)
+            } else {
+                false
+            };
+
             let mut backed_up = false;
-            for lib in &libraries {
-                if let Ok(c) = vault.backup_manifests(&lib.to_string_lossy(), id) {
-                    if c > 0 {
-                        if let Ok(mut logs) = app.system_log.lock() {
-                            crate::ui::state::push_log(
-                                &mut logs,
-                                format!(
-                                    "Vault: Secured {} manifests for {} from {:?}.",
-                                    c, id, lib
-                                ),
-                            );
+
+            // Only backup if NOT a child (Base Game)
+            if !is_child {
+                for lib in &libraries {
+                    if let Ok(c) = vault.backup_manifests(&lib.to_string_lossy(), id) {
+                        if c > 0 {
+                            if let Ok(mut logs) = app.system_log.lock() {
+                                crate::ui::state::push_log(
+                                    &mut logs,
+                                    format!(
+                                        "Vault: Secured {} manifests for {} from {:?}.",
+                                        c, id, lib
+                                    ),
+                                );
+                            }
+                            backed_up = true;
+                            break;
                         }
-                        backed_up = true;
-                        break;
                     }
                 }
-            }
-            if !backed_up {
-                let _ = vault.backup_manifests(&steam_path, id);
-            }
+                if !backed_up {
+                    let _ = vault.backup_manifests(&steam_path, id);
+                }
+            } // End if !is_child
 
             let mut locations = libraries.clone();
             locations.push(std::path::Path::new(&steam_path).to_path_buf());

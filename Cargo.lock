@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "darkcore-manager"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "adler32",
  "aes",

@@ -129,6 +129,7 @@ pub fn create_app(cc: &eframe::CreationContext<'_>) -> DarkCoreApp {
         user_stats: Arc::new(Mutex::new(None)),
         api_last_error: Arc::new(Mutex::new(None)),
         is_validating_api: Arc::new(Mutex::new(false)),
+        request_api_refresh: Arc::new(Mutex::new(false)),
         matrix_trails: Vec::new(),
         api_key_glitch_cache: String::new(),
         api_key_glitch_update: Instant::now(),
@@ -454,6 +455,7 @@ impl DarkCoreApp {
             let cover_cache = self.cover_cache.clone();
             let log_arc = self.system_log.clone();
             let user_stats_arc = self.user_stats.clone(); 
+            let refresh_arc = self.request_api_refresh.clone();
 
             // Use self.log helper? We just added it to state.rs, but is it visible?
             // Yes, if we import DarkCoreApp.
@@ -472,6 +474,9 @@ impl DarkCoreApp {
                 let client = ApiClient::new(client_key.clone());
 
                 let search_res = rt.block_on(client.search(&query));
+
+                // Always request a fresh stats update after search, just in case
+                if let Ok(mut req) = refresh_arc.lock() { *req = true; }
 
                 match search_res {
                     Ok(mut res) => {
@@ -681,6 +686,72 @@ impl DarkCoreApp {
 
 impl eframe::App for DarkCoreApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // --- GLOBAL API REFRESH LOGIC ---
+        // Check for signals from background threads
+        let mut trigger_refresh = false;
+        if let Ok(mut req) = self.request_api_refresh.lock() {
+            if *req {
+                *req = false;
+                trigger_refresh = true;
+            }
+        }
+
+        // If signal received, set timer for immediate refresh (debounce 500ms? No, immediate)
+        if trigger_refresh {
+            self.api_refresh_timer = Some(Instant::now());
+        }
+
+        // Check if timer expired
+        if let Some(timer) = self.api_refresh_timer {
+            if Instant::now() > timer {
+                self.api_refresh_timer = None; // Reset
+                self.helper_refresh_api_stats();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+        
         crate::ui::render::render(self, ctx, frame);
+    }
+}
+
+impl DarkCoreApp {
+    /// Spawns background thread to refresh user stats
+    pub fn helper_refresh_api_stats(&mut self) {
+        if self.config.api_key.is_empty() { return; }
+
+        let stats_arc = self.user_stats.clone();
+        let status_queue = self.status_update_queue.clone();
+        let error_arc = self.api_last_error.clone();
+        let validating_arc = self.is_validating_api.clone();
+        let cfg_key = self.config.api_key.clone();
+        
+        // Set VALIDATING flag immediately
+        if let Ok(mut v) = self.is_validating_api.lock() { *v = true; }
+
+        std::thread::spawn(move || {
+            let client = crate::api::ApiClient::new(cfg_key);
+            let result = crate::ui::state::ASYNC_RUNTIME.block_on(client.get_user_stats());
+            
+            // Clear Validating Flag
+            if let Ok(mut v) = validating_arc.lock() { *v = false; }
+            
+            match result {
+                Ok(stats) => {
+                    if let Ok(mut e) = error_arc.lock() { *e = None; }
+                    if let Ok(mut s) = stats_arc.lock() { *s = Some(stats); }
+                    if let Ok(mut q) = status_queue.lock() {
+                        *q = Some("API Stats Refreshed.".to_string());
+                    }
+                },
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if let Ok(mut er) = error_arc.lock() { *er = Some(err_str.clone()); }
+                    // Only log error if it's strictly an API failure, not just network blip
+                    // But we want to know if it fails.
+                }
+            }
+        });
+        self.log("Refreshing API Stats...".to_string());
     }
 }

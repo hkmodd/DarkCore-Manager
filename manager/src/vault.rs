@@ -16,18 +16,24 @@ impl VaultManager {
     }
 
     fn get_path(&self, appid: &str) -> PathBuf {
-        self.base_path.join(format!("{}.lua", appid))
+        // Fix: Store Lua INSIDE the AppID folder to avoid loose ghost files
+        // Vault/{AppID}/{AppID}.lua
+        self.base_path.join(appid).join(format!("{}.lua", appid))
     }
 
     pub fn exists(&self, appid: &str) -> bool {
         self.get_path(appid).exists()
     }
 
-    pub fn save(&self, appid: &str, data: &[u8]) -> std::io::Result<()> {
+    pub fn save_lua(&self, appid: &str, data: &[u8]) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            fs::create_dir_all(&storage_dir)?;
+        }
         fs::write(self.get_path(appid), data)
     }
 
-    pub fn get(&self, appid: &str) -> std::io::Result<Vec<u8>> {
+    pub fn get_lua(&self, appid: &str) -> std::io::Result<Vec<u8>> {
         fs::read(self.get_path(appid))
     }
 

@@ -6,6 +6,15 @@ use std::fs::File;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum DepotCategory {
+    Unknown,
+    MainApp,
+    MainDepot,
+    SharedDepot,
+    DlcDepot,
+}
+
 /// Represents a downloadable Depot
 #[derive(Debug, Clone)]
 pub struct DepotInfo {
@@ -13,6 +22,13 @@ pub struct DepotInfo {
     pub depot_key: String,
     pub manifest_id: Option<u64>,
     pub name: Option<String>,
+    pub category: DepotCategory,
+}
+
+#[derive(Debug, Clone)]
+pub struct DlcInfo {
+    pub app_id: u32,
+    pub name: String,
 }
 
 /// Data extracted from Morrenus .lua/.st files
@@ -21,7 +37,7 @@ pub struct ScriptData {
     pub app_id: Option<u32>,
     pub app_name: Option<String>,
     pub depots: Vec<DepotInfo>,
-    pub dlc_ids: Vec<u32>,
+    pub dlcs: Vec<DlcInfo>,
 
     // Legacy mapping (kept for internal use/merging)
     pub depot_keys: HashMap<u32, String>,
@@ -58,9 +74,9 @@ impl ScriptData {
             }
         }
 
-        for dlc in other.dlc_ids {
-            if !self.dlc_ids.contains(&dlc) {
-                self.dlc_ids.push(dlc);
+        for dlc in other.dlcs {
+            if !self.dlcs.iter().any(|d| d.app_id == dlc.app_id) {
+                self.dlcs.push(dlc);
             }
         }
 
@@ -157,15 +173,14 @@ pub fn parse_content(content: &str) -> Result<ScriptData, Box<dyn Error>> {
     }
 
     // Step 2: Parse Lines
-    #[derive(PartialEq, Clone, Copy)]
-    enum Section {
-        Unknown,
-        MainApp,
-        MainDepots,
-        DlcDepots,
-    }
+    // Section mapping now uses the public enum
+    let mut current_section = DepotCategory::Unknown;
 
-    let mut current_section = Section::Unknown;
+    // Helper to map section (because we can't store DepotCategory with associated data in hashmap easily
+    // without more complex logic, we'll store section in a parallel map or just use current loop state)
+    // Actually we need to store the category per depot ID.
+    let mut temp_depot_cats: HashMap<u32, DepotCategory> = HashMap::new();
+
     let mut temp_keys: HashMap<u32, (String, Option<String>)> = HashMap::new();
     let mut manifest_ids: HashMap<u32, u64> = HashMap::new();
     let mut main_app_id: Option<u32> = None;
@@ -174,13 +189,16 @@ pub fn parse_content(content: &str) -> Result<ScriptData, Box<dyn Error>> {
         let trimmed = line.trim();
 
         if trimmed.contains("MAIN APPLICATION") {
-            current_section = Section::MainApp;
+            current_section = DepotCategory::MainApp;
             continue;
         } else if trimmed.contains("MAIN APP DEPOTS") || trimmed.contains("APP DEPOTS") {
-            current_section = Section::MainDepots;
+            current_section = DepotCategory::MainDepot;
             continue;
         } else if trimmed.contains("DLCS") && trimmed.starts_with("--") {
-            current_section = Section::DlcDepots;
+            current_section = DepotCategory::DlcDepot;
+            continue;
+        } else if trimmed.contains("SHARED DEPOTS") {
+            current_section = DepotCategory::SharedDepot; // CRITICAL FIX: Detect shared depots
             continue;
         }
 
@@ -204,18 +222,26 @@ pub fn parse_content(content: &str) -> Result<ScriptData, Box<dyn Error>> {
                 let id = id_match.as_str().parse::<u32>()?;
                 let key = key_match.as_str().to_string();
 
-                if current_section == Section::MainApp && main_app_id.is_none() {
+                if current_section == DepotCategory::MainApp && main_app_id.is_none() {
                     main_app_id = Some(id);
                 }
 
                 temp_keys.insert(id, (key.clone(), comment_name.clone()));
+                temp_depot_cats.insert(id, current_section.clone());
                 data.depot_keys.insert(id, key);
             }
         } else if let Some(cap) = re_addappid_only.captures(trimmed) {
             if let Some(id_match) = cap.get(1) {
                 let id = id_match.as_str().parse::<u32>()?;
-                if !data.dlc_ids.contains(&id) && Some(id) != main_app_id {
-                    data.dlc_ids.push(id);
+                // Check if already present in dlcs or main app
+                if !data.dlcs.iter().any(|d| d.app_id == id) && Some(id) != main_app_id {
+                    let dlc_name = comment_name
+                        .clone()
+                        .unwrap_or_else(|| format!("DLC {}", id));
+                    data.dlcs.push(DlcInfo {
+                        app_id: id,
+                        name: dlc_name,
+                    });
                 }
             }
         }
@@ -233,11 +259,17 @@ pub fn parse_content(content: &str) -> Result<ScriptData, Box<dyn Error>> {
     // Step 3: Build Depots
     for (depot_id, manifest_id) in &manifest_ids {
         if let Some((key, name)) = temp_keys.get(depot_id) {
+            let cat = temp_depot_cats
+                .get(depot_id)
+                .cloned()
+                .unwrap_or(DepotCategory::Unknown);
+
             data.depots.push(DepotInfo {
                 depot_id: *depot_id,
                 depot_key: key.clone(),
                 manifest_id: Some(*manifest_id),
                 name: name.clone(),
+                category: cat,
             });
         }
     }

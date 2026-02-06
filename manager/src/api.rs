@@ -679,7 +679,26 @@ impl ApiClient {
                                 selected,
                             })
                         },
-                        Err(_) => None, // Skip failed DLCs
+                        Err(_) => {
+                        // Fallback: Try fetching name from Steam Store API (GET_DETAILS)
+                        // This handles cases where SteamCMD has no public info (e.g. License-only DLCs)
+                        if let Ok(details) = client.get_game_details(&dlc_id).await {
+                             Some(DlcNode {
+                                app_id: dlc_id,
+                                name: details.name,
+                                depots: Vec::new(),
+                                selected: true,
+                            })
+                        } else {
+                            // Ultimate Fallback: Add as Generic Node so it appears in the list
+                            Some(DlcNode {
+                                app_id: dlc_id.clone(),
+                                name: format!("DLC {} (Info Unavailable)", dlc_id),
+                                depots: Vec::new(),
+                                selected: true,
+                            })
+                        }
+                    },
                     }
                 }));
             }
@@ -733,7 +752,9 @@ impl RawSteamInfo {
     
     fn extract_dlc_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
-         if let Some(extended) = self.data.get("data")
+
+        // 1. Standard Method: extended -> listofdlc
+        if let Some(extended) = self.data.get("data")
             .and_then(|d| d.get(&self.appid))
             .and_then(|a| a.get("extended")) 
         {
@@ -741,6 +762,26 @@ impl RawSteamInfo {
                 ids = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
             }
         }
+
+        // 2. "Solus" Method: Reverse Lookup via Depots (dlcappid)
+        // Scan all depots to see if they claim to belong to a DLC
+        if let Some(depots) = self.data.get("data")
+            .and_then(|d| d.get(&self.appid))
+            .and_then(|a| a.get("depots"))
+            .and_then(|d| d.as_object()) 
+        {
+            for val in depots.values() {
+                if let Some(dlc_id) = val.get("dlcappid").and_then(|v| v.as_str()) {
+                    let dlc_str = dlc_id.to_string();
+                    if !ids.contains(&dlc_str) {
+                         ids.push(dlc_str);
+                    }
+                }
+            }
+        }
+        
+        // Sort for consistency
+        ids.sort();
         ids
     }
     

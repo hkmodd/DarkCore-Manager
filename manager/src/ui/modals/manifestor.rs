@@ -163,20 +163,182 @@ pub fn open_manifestor(app: &mut DarkCoreApp, appid: String, name: String) {
     app.install_dir_input.clear();
     app.install_modal_auto_scanned = false;
     
-    // Check API Client
-    if let Some(client) = &app.api_client {
-        let client = client.clone();
-        let data_target = app.manifestor_data.clone();
-        let appid_target = appid.clone();
+    // 1. Check for OFFLINE data (Priority)
+    let mut loaded_from_zip = false;
+    if let Some(zip_data) = &app.import_zip_data {
+        let zip_app_id = zip_data.script_data.app_id.unwrap_or(0).to_string();
         
-        // Spawn Fetch Task
-        tokio::spawn(async move {
-            // Fetch English hierarchy by default
-            if let Ok(hierarchy) = client.fetch_full_hierarchy(&appid_target, "english").await {
-                if let Ok(mut target) = data_target.lock() {
-                    *target = Some(hierarchy);
+                if zip_app_id == appid {
+            if let Ok(mut data) = app.manifestor_data.lock() {
+                // Convert ScriptData -> GameHierarchy
+                let mut dlcs = Vec::new();
+                for dlc_info in &zip_data.script_data.dlcs {
+                    dlcs.push(crate::api::DlcNode {
+                        app_id: dlc_info.app_id.to_string(),
+                        name: dlc_info.name.clone(),
+                        depots: Vec::new(),
+                        selected: true,
+                    });
                 }
+                
+                let mut base_depots = Vec::new();
+                for d_info in &zip_data.script_data.depots {
+                     base_depots.push(crate::api::DepotNode {
+                         depot_id: d_info.depot_id.to_string(),
+                         gid: None, // No GID context from simple ScriptData
+                         size: None,
+                         language: None,
+                         is_common: true,
+                     });
+                }
+
+                *data = Some(crate::api::GameHierarchy {
+                    root_id: appid.clone(),
+                    root_name: zip_data.script_data.app_name.clone().unwrap_or(name.clone()),
+                    base_depots,
+                    dlcs,
+                });
+                loaded_from_zip = true;
             }
-        });
+        }
+    }
+
+    // 2. Fallback to API (if not loaded from zip)
+    if !loaded_from_zip {
+        if let Some(client) = &app.api_client {
+            let client = client.clone();
+            let data_target = app.manifestor_data.clone();
+            let appid_target = appid.clone();
+            let stats_arc = app.user_stats.clone();
+            let refresh_arc = app.request_api_refresh.clone();
+            
+            tokio::spawn(async move {
+                // 1. Try Standard API Fetch (Reverse Lookup included)
+                match client.fetch_full_hierarchy(&appid_target, "english").await {
+                    Ok(mut hierarchy) => {
+                        // [MORRENUS FAILOVER PROTOCOL]
+                        // If API finds 0 DLCs, it might be a hidden game (like Risk of Rain 2).
+                        // We FORCE check Morrenus to see if there's a script with better info.
+                        if hierarchy.dlcs.is_empty() {
+                            let vault = crate::vault::VaultManager::new(".");
+                            // 1. CHECK VAULT (Token Saver) - 06/02/2026
+                            // If we already have the Lua script, USE IT. Do NOT download again.
+                            let mut loaded_from_vault = false;
+                            
+                            if let Ok(lua_bytes) = vault.get_lua(&appid_target) {
+                                println!("[Failover] Found cached Lua in Vault. Using local data (0 Tokens).");
+                                let lua_content = String::from_utf8_lossy(&lua_bytes).to_string();
+                                
+                                if let Ok(script_data) = crate::direct_download::lua_parser::parse_content(&lua_content) {
+                                    if !script_data.dlcs.is_empty() {
+                                        // FOUND HIDDEN DLCs (From Vault)!
+                                        for dlc in script_data.dlcs {
+                                            if !hierarchy.dlcs.iter().any(|d| d.app_id == dlc.app_id.to_string()) {
+                                                hierarchy.dlcs.push(crate::api::DlcNode {
+                                                    app_id: dlc.app_id.to_string(),
+                                                    name: dlc.name,
+                                                    depots: Vec::new(),
+                                                    selected: true,
+                                                });
+                                            }
+                                        }
+                                        hierarchy.dlcs.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+                                        loaded_from_vault = true;
+                                    }
+                                }
+                            }
+
+                            // 2. DOWNLOAD (Only if Vault failed/empty)
+                            if !loaded_from_vault {
+                                // Don't log to UI here, just do it in background
+                                if let Ok(zip_bytes) = client.download_manifest(&appid_target).await {
+                                    // [STATS TRIGGER] - Real-time Update
+                                    if let Ok(mut stats) = stats_arc.lock() {
+                                        if let Some(s) = stats.as_mut() {
+                                            s.api_key_usage_count += 1;
+                                            s.daily_usage += 1;
+                                        }
+                                    }
+                                    if let Ok(mut req) = refresh_arc.lock() { *req = true; }
+
+                                    // [IMMEDIATE VAULT SAVE] - 06/02/2026
+                                    // Strategy: "Extracted Only" (Armored Layout)
+                                    // Vault/{AppID}/{AppID}.lua
+                                    // Vault/{AppID}/{Depot}_{Gid}.manifest
+                                    
+                                    let mut real_lua_content = String::new();
+                                    if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes)) {
+                                         // 1. EXTRACT AND SAVE MANIFESTS + FIND LUA
+                                         for i in 0..archive.len() {
+                                             if let Ok(mut f) = archive.by_index(i) {
+                                                 if f.name().ends_with(".lua") {
+                                                     use std::io::Read;
+                                                     let _ = f.read_to_string(&mut real_lua_content);
+                                                     // Save Lua immediately to Vault
+                                                     if let Err(e) = vault.save_lua(&appid_target, real_lua_content.as_bytes()) {
+                                                         println!("[Fallback] Warning: Could not save Lua to Vault: {}", e);
+                                                     }
+                                                 } else if f.name().ends_with(".manifest") {
+                                                      // Backup manifests individually
+                                                      if let Ok(gids) = crate::api::ApiClient::extract_gids_from_zip(&zip_bytes) {
+                                                           let fname = f.name().to_string();
+                                                           for (depot_id, gid) in &gids {
+                                                               if fname.contains(&format!("{}_{}", depot_id, gid)) {
+                                                                   let mut buf = Vec::new();
+                                                                   use std::io::Read;
+                                                                   if f.read_to_end(&mut buf).is_ok() {
+                                                                       let _ = vault.store_manifest_bytes(&appid_target, depot_id.parse().unwrap_or(0), gid.parse().unwrap_or(0), &buf);
+                                                                   }
+                                                                   break;
+                                                               }
+                                                           }
+                                                      }
+                                                 }
+                                             }
+                                         }
+                                    }
+                                    
+                                    // Fallback if unzip failed but bytes are valid (weird text case)
+                                    if real_lua_content.is_empty() {
+                                        real_lua_content = String::from_utf8_lossy(&zip_bytes).to_string();
+                                        // Try to save this as Lua too, just in case
+                                        let _ = vault.save_lua(&appid_target, &zip_bytes); 
+                                    }
+                                    
+                                    println!("[Fallback] Data secured in Vault (Extracted Format). Token preserved.");
+
+                                    if let Ok(script_data) = crate::direct_download::lua_parser::parse_content(&real_lua_content) {
+                                        if !script_data.dlcs.is_empty() {
+                                            // FOUND HIDDEN DLCs! Merge them in.
+                                            for dlc in script_data.dlcs {
+                                                // Check duplicates
+                                                if !hierarchy.dlcs.iter().any(|d| d.app_id == dlc.app_id.to_string()) {
+                                                    hierarchy.dlcs.push(crate::api::DlcNode {
+                                                        app_id: dlc.app_id.to_string(),
+                                                        name: dlc.name, // Use name from Lua comment!
+                                                        depots: Vec::new(),
+                                                        selected: true,
+                                                    });
+                                                }
+                                            }
+                                            // Sort
+                                            hierarchy.dlcs.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Ok(mut target) = data_target.lock() {
+                            *target = Some(hierarchy);
+                        }
+                    },
+                    Err(_) => {
+                         // API Failed completely? Try Morrenus as last resort?
+                         // For now, leave as None (Spinner spins forever or we could handle error)
+                    }
+                }
+            });
+        }
     }
 }

@@ -43,13 +43,40 @@ pub fn finalize_installation(
     hierarchy: Option<crate::api::GameHierarchy>,
 ) {
     // PHASE 2 INTERCEPTOR: Save state and ask user
+    // [FIX] Auto-load ZIP from Import Data if available (Offline Fix)
+    let final_zip = if cached_zip.is_some() {
+        cached_zip
+    } else {
+        if let Some(zip_data) = &app.import_zip_data {
+            let zip_appid = zip_data.script_data.app_id.unwrap_or(0).to_string();
+            if zip_appid == appid {
+                // Determine if we should read the file
+                if zip_data.source_path.exists() {
+                     match std::fs::read(&zip_data.source_path) {
+                         Ok(bytes) => {
+                             if let Ok(mut l) = app.system_log.lock() { l.push(format!("Loaded imported ZIP from: {:?}", zip_data.source_path)); }
+                             Some(bytes)
+                         },
+                         Err(_) => None
+                     }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     app.pending_install = Some(PendingInstall {
         appid,
         name,
         target_library,
         install_dir_name,
         selected_dlcs,
-        cached_zip,
+        cached_zip: final_zip,
         hierarchy,
     });
     app.download_method_modal_open = true;
@@ -64,6 +91,8 @@ pub fn legacy_install_game(
 ) {
     let client_opt = app.api_client.clone();
     let _log_arc = app.system_log.clone();
+    let stats_arc = app.user_stats.clone();
+    let refresh_arc = app.request_api_refresh.clone();
     
     // CAPTURE CONTEXT FOR ASYNC
     let appid_c = appid.clone();
@@ -101,8 +130,33 @@ pub fn legacy_install_game(
                   let steam_dlcs_res = rt.block_on(client.get_dlc_list(&appid_c));
                   
                   // 2. Fetch Available Content from Morrenus
-                  match rt.block_on(client.download_manifest(&appid_c)) {
+                  // 2. Fetch Available Content (Vault First -> Morrenus)
+                  let vault = crate::vault::VaultManager::new(".");
+                  let vault_data = vault.get_lua(&appid_c).ok();
+                  let mut from_vault = false;
+                  
+                  let data_res = if let Some(b) = vault_data {
+                      if let Ok(mut l) = log_arc.lock() { l.push("Using cached Lua from Vault (0 Tokens).".to_string()); }
+                      from_vault = true;
+                      Ok(b)
+                  } else {
+                      rt.block_on(client.download_manifest(&appid_c))
+                          .map(|b| b.to_vec())
+                  };
+
+                  match data_res {
                       Ok(lua_bytes) => {
+                          // [STATS TRIGGER] - Only if NOT from Vault
+                          if !from_vault {
+                              if let Ok(mut stats) = stats_arc.lock() {
+                                  if let Some(s) = stats.as_mut() {
+                                      s.api_key_usage_count += 1;
+                                      s.daily_usage += 1;
+                                  }
+                              }
+                              if let Ok(mut req) = refresh_arc.lock() { *req = true; }
+                          }
+
                           // Cache bytes
                           if let Ok(mut z) = scan_zip_res.lock() { *z = Some(lua_bytes.to_vec()); }
 
@@ -177,6 +231,9 @@ pub fn spawn_direct_install(
     let download_state = app.download_state.clone();
     let steam_path = app.config.steam_path.clone();
     let gl_path = app.config.gl_path.clone(); // Needed for AppList
+    let stats_arc = app.user_stats.clone();
+    let refresh_arc = app.request_api_refresh.clone();
+    let relationships_arc = app.relationships.clone();
 
     
     // Reset State
@@ -211,7 +268,17 @@ pub fn spawn_direct_install(
              } else {
                  log("Downloading Morrenus ZIP...".to_string());
                  match client.download_manifest(&appid).await {
-                     Ok(b) => b.to_vec(),
+                     Ok(b) => {
+                         // [STATS TRIGGER]
+                         if let Ok(mut stats) = stats_arc.lock() {
+                             if let Some(s) = stats.as_mut() {
+                                 s.api_key_usage_count += 1;
+                                 s.daily_usage += 1;
+                             }
+                         }
+                         if let Ok(mut req) = refresh_arc.lock() { *req = true; }
+                         b.to_vec()
+                     },
                      Err(e) => {
                          log(format!("Failed to download ZIP: {}", e));
                          if let Ok(mut s) = download_state.lock() { s.status = crate::direct_download::state::DownloadStatus::Error(e.to_string()); }
@@ -300,14 +367,14 @@ pub fn spawn_direct_install(
                       }
                   }
                   
-                  for depot in script_data.depots {
+                  for depot in &script_data.depots {
                       if allowed_depots.contains(&depot.depot_id.to_string()) {
-                          depots_to_process.push(depot);
+                          depots_to_process.push(depot.clone());
                       }
                   }
              } else {
                   log("Warning: No Hierarchy. Downloading ALL depots found in script.".to_string());
-                  depots_to_process = script_data.depots;
+                  depots_to_process = script_data.depots.clone();
              }
              
                 for depot in depots_to_process {
@@ -378,37 +445,57 @@ pub fn spawn_direct_install(
                  }
              }
              
-             // v1.7.2: SAVE TO VAULT FOR FUTURE REINSTALLATIONS
-             log("Saving to Vault for future use...".to_string());
+             // v1.7.2: SAVE TO VAULT FOR FUTURE REINSTALLATIONS (EXTRACTED FORMAT)
+             log("Saving to Vault for future use (Extracted Rules)...".to_string());
              let vault = crate::vault::VaultManager::new(".");
              
-             // Save ZIP for complete backup
-             if let Err(e) = vault.store_zip(&appid, &zip_bytes) {
-                 log(format!("⚠️ Could not save ZIP to Vault: {}", e));
-             } else {
-                 log(format!("✅ Saved ZIP to Vault ({} bytes)", zip_bytes.len()));
-             }
+             // 1. Save Lua (Explicitly) - No ZIP
+             if let Err(e) = vault.save_lua(&appid, lua_content.as_bytes()) {
+                  log(format!("Warning: Could not save Lua to Vault: {}", e));
+            } else {
+                 log("✅ Lua script backed up to Vault.".to_string());
+            }
              
-             // Save individual manifests for Steam Install compatibility
-             // Note: We use GIDs from the manifest filenames in the ZIP instead of script_data.depots
-             //       because depots was already consumed in the download loop
+             // 2. Save Manifests
+             // We use the already-loaded `manifest_bytes_map` which contains [u8] for each manifest
              let mut saved_manifests = 0;
+             
+             // We need to map ManifestID back to DepotID for the filename: {DepotID}_{Gid}.manifest
+             // We can use the previously downloaded `depots_to_process` or `script_data` to map MID -> DepotID
+             // Or simpler: Extract from ZIP again if we want to be 100% sure of filename structure
+             // But we have `manifest_bytes_map` which is keyed by MID.
+             // Best approach: Use `script_data.depots` to find which DepotID owns this MID.
+             
              for (mid, bytes) in &manifest_bytes_map {
-                 // Extract depot_id from ZIP filename pattern via stored data
-                 // The ZIP has format: {depot_id}_{manifest_id}.manifest
-                 // We can infer depot_id from manifest bytes or just save with mid as identifier
-                 // For compatibility, we'll extract from the original zip
-                 if let Ok(gids) = crate::api::ApiClient::extract_gids_from_zip(&zip_bytes) {
-                     for (depot_id, gid) in &gids {
-                         if gid.parse::<u64>().ok() == Some(*mid) {
-                             if vault.store_manifest_bytes(&appid, depot_id.parse().unwrap_or(0), *mid, bytes).is_ok() {
-                                 saved_manifests += 1;
+                 // Find depot_id for this mid
+                 let mut found_depot = None;
+                 for d in &script_data.depots {
+                     if d.manifest_id == Some(*mid) { 
+                         found_depot = Some(d.depot_id);
+                         break;
+                     } 
+                 }
+
+                 if let Some(depot_id) = found_depot {
+                     if vault.store_manifest_bytes(&appid, depot_id, *mid, bytes).is_ok() {
+                         saved_manifests += 1;
+                     }
+                 } else {
+                     // Fallback check: Extract from ZIP name if available (as in original code)
+                     if let Ok(gids) = crate::api::ApiClient::extract_gids_from_zip(&zip_bytes) {
+                         for (did_str, gid_str) in &gids {
+                             if gid_str.parse::<u64>().ok() == Some(*mid) {
+                                 if let Ok(did) = did_str.parse::<u32>() {
+                                      let _ = vault.store_manifest_bytes(&appid, did, *mid, bytes);
+                                      saved_manifests += 1;
+                                 }
+                                 break;
                              }
-                             break;
                          }
                      }
                  }
              }
+
              if saved_manifests > 0 {
                  log(format!("✅ Saved {} manifest files to Vault", saved_manifests));
              }
@@ -453,9 +540,20 @@ pub fn spawn_direct_install(
 
              log(format!("Patching AppList with {} IDs (Filtered from {})...", final_applist_ids.len(), keys.len()));
              
-             match crate::app_list::add_games_to_list(&gl_path, final_applist_ids) {
+             match crate::app_list::add_games_to_list(&gl_path, final_applist_ids.clone()) {
                  Ok(_) => log("✅ AppList patched successfully.".to_string()),
                  Err(e) => log(format!("❌ Error patching AppList: {}", e)),
+             }
+
+             // [FIX] Record Relationships for Ghost Folder Prevention (Direct Install)
+             if let Ok(mut map) = relationships_arc.lock() {
+                 let parent = appid.clone();
+                 for id in &final_applist_ids {
+                     if *id != parent {
+                         map.insert(id.clone(), parent.clone());
+                     }
+                 }
+                 crate::app_list::save_relationships(".", &map);
              }
              
              // 4. Inject Keys (Optional but good practice)
@@ -490,6 +588,7 @@ pub fn spawn_steam_install(
     let status_queue = app.status_update_queue.clone();
     
     let status_queue_closure = status_queue.clone();
+    let relationships_arc = app.relationships.clone();
     let update_status = move |msg: String| {
         if let Ok(mut lock) = status_queue_closure.lock() {
             *lock = Some(msg);
@@ -638,9 +737,22 @@ pub fn spawn_steam_install(
         let depot_cache = std::path::Path::new(&steam_root).join("depotcache");
         if !depot_cache.exists() { let _ = std::fs::create_dir_all(&depot_cache); }
         
+        // Declare lua_content outside the conditional block so it's available for Step 3
+        let mut lua_content = String::new();
+        
         if skip_morrenus {
-            log("STEP 2: SKIPPED - Using Vault manifests. ðŸ›¡ï¸ ".to_string());
+            log("STEP 2: SKIPPED - Using Vault manifests. 🛡️".to_string());
             applist_ids.push(appid.clone());
+
+            // [FIX] Load keys from Vault Lua
+             if let Ok(lua_bytes) = vault.get_lua(&appid) {
+                lua_content = String::from_utf8_lossy(&lua_bytes).to_string(); // Capture for Step 3
+                let (_ids, parsed_keys) = crate::vdf_injector::parse_lua_for_keys(&lua_content);
+                keys = parsed_keys;
+                log(format!("Vault: Restored {} decryption keys from backup Lua.", keys.len()));
+            } else {
+                log("Warning: Vault has manifests but NO Lua script. Keys might be missing!".to_string());
+            }
         } else {
             log("STEP 2: Fetching game data from Morrenus...".to_string());
             update_status(format!("Downloading manifests for {}", name));
@@ -660,23 +772,27 @@ pub fn spawn_steam_install(
                  }
             };
             
-            let mut lua_content = String::new();
+            // let mut lua_content = String::new(); // REMOVED (Declared above)
             if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes)) {
                 for i in 0..archive.len() {
                     if let Ok(mut f) = archive.by_index(i) {
                          if f.name().ends_with(".lua") {
                              use std::io::Read;
                              let _ = f.read_to_string(&mut lua_content);
-                         } else if f.name().contains("depotcache") {
-                              // Extract depot manifest
-                              let out_path = depot_cache.join(f.name());
-                              if let Some(parent) = out_path.parent() { let _ = std::fs::create_dir_all(parent); }
-                              
-                              let mut buf = Vec::new();
-                              use std::io::Read; 
-                              let _ = f.read_to_end(&mut buf);
-                              let _ = std::fs::write(&out_path, &buf);
-                              log(format!("Extracted: {}", f.name()));
+                         } else if f.name().ends_with(".manifest") {
+                              // Extract depot manifest (FLATTEN to depotcache root)
+                              // We use file_name() to strip any internal folders in ZIP (e.g. "depotcache/")
+                              // This ensures it lands directly in Steam/depotcache/
+                              let fname_owned = std::path::Path::new(f.name()).file_name().map(|n| n.to_owned());
+                              if let Some(fname) = fname_owned {
+                                  let out_path = depot_cache.join(&fname);
+                                  
+                                  let mut buf = Vec::new();
+                                  use std::io::Read; 
+                                  let _ = f.read_to_end(&mut buf);
+                                  let _ = std::fs::write(&out_path, &buf);
+                                  log(format!("Extracted Manifest: {:?}", fname));
+                              }
                          }
                     }
                 }
@@ -690,6 +806,33 @@ pub fn spawn_steam_install(
             applist_ids = ids;
             keys = parsed_keys;
             log(format!("Parsed {} AppIDs and {} Keys from LUA.", applist_ids.len(), keys.len()));
+
+            // [VAULT FIX]: Save downloaded data to Vault for future Offline use (EXTRACTED FORMAT)
+            log("Backing up Morrenus data to Vault (Extracted Rules)...".to_string());
+            
+            // 1. Save Lua (Explicitly)
+            if let Err(e) = vault.save_lua(&appid, lua_content.as_bytes()) {
+                 log(format!("Warning: Could not save Lua to Vault: {}", e));
+            } else {
+                 log("✅ Lua script backed up to Vault.".to_string());
+            }
+
+            // 2. Save Manifests
+            if let Ok(gids) = crate::api::ApiClient::extract_gids_from_zip(&zip_bytes) {
+                 for (depot_id, gid) in gids {
+                     if let Ok(mut archive_verify) = zip::ZipArchive::new(std::io::Cursor::new(&zip_bytes)) {
+                         let target_name = format!("{}_{}.manifest", depot_id, gid);
+                         if let Ok(mut f) = archive_verify.by_name(&target_name) {
+                             let mut buf = Vec::new();
+                             use std::io::Read;
+                             if f.read_to_end(&mut buf).is_ok() {
+                                 let _ = vault.store_manifest_bytes(&appid, depot_id.parse().unwrap_or(0), gid.parse().unwrap_or(0), &buf);
+                             }
+                         }
+                     }
+                 }
+                 log("✅ Depot manifests backed up to Vault.".to_string());
+            }
         }
 
         // STEP 3: UPDATE APPLIST.JSON
@@ -697,34 +840,69 @@ pub fn spawn_steam_install(
         update_status("Patching AppList...".to_string());
         
         let mut final_ids = Vec::new();
+
+        // Parse Lua for Structured Data (to distinguishing DLCs from Depots)
+        let script_data = match crate::direct_download::lua_parser::parse_content(&lua_content) {
+            Ok(d) => d,
+            Err(e) => {
+                log(format!("Warning: Failed to parse Lua structure: {}. Using legacy fallback.", e));
+                crate::direct_download::lua_parser::ScriptData::default()
+            }
+        };
         
         if let Some(h) = &hierarchy {
              log("Using GameHierarchy for Mandatory Depot Resolution...".to_string());
              final_ids = resolve_mandatory_depots(h, &selected_dlcs);
              log(format!("Resolved {} mandatory IDs (Base + DLCs + Depots).", final_ids.len()));
+
+             // [FIX] Record Relationships for Ghost Folder Prevention
+             if let Ok(mut map) = relationships_arc.lock() {
+                 let parent = h.root_id.clone();
+                 for id in &final_ids {
+                     if *id != parent {
+                         map.insert(id.clone(), parent.clone());
+                     }
+                 }
+                 // Save map
+                 crate::app_list::save_relationships(".", &map);
+             }
         } else {
-             // Fallback: Use simple AppID + Selected DLCs logic (Legacy)
+             // Fallback: Smart Merge Strategy (Lua + User Selection)
+             
+             // 1. Always add Main AppID
              final_ids.push(appid.clone());
              
-             if !selected_dlcs.is_empty() {
-                  log(format!("Using {} user-selected DLCs (Fallback Mode).", selected_dlcs.len()));
-                  for id in &selected_dlcs {
-                      if !final_ids.contains(id) {
-                          final_ids.push(id.clone());
-                      }
-                  }
-             } else {
-                 // Try to use applist_ids from LUA if no selection (e.g. First Install default)
-                 // But strictly speaking, if selected_dlcs is passed, it should be respected.
-                 // If selected_dlcs is empty, it might mean "Just Base Game" OR "No Selection made".
-                 // In UI, selected_dlcs is usually populated?
-                 // We will trust selected_dlcs if present.
-                 if !applist_ids.is_empty() && selected_dlcs.is_empty() {
-                      // Maybe Auto-Select All from Lua if nothing selected?
-                      // No, adhere to safety: Base Game Only.
-                      log("No DLCs selected (Base Game Only).".to_string());
+             // 2. Add Selected DLCs
+             for dlc in &selected_dlcs {
+                 if !final_ids.contains(dlc) {
+                     final_ids.push(dlc.clone());
                  }
              }
+
+             // 3. Add Depots from Lua (System/Shared Depots)
+             // Rule: strict category check to avoid polluting AppList with internal depots
+             for depot in script_data.depots {
+                 match depot.category {
+                     crate::direct_download::lua_parser::DepotCategory::SharedDepot => {
+                         let did = depot.depot_id.to_string();
+                         if !final_ids.contains(&did) {
+                             log(format!("Included Shared Depot (Redist): {}", did));
+                             final_ids.push(did);
+                         }
+                     },
+                     // Explicitly IGNORE MainDepots (covered by Main AppID)
+                     // This fixes the Geometry Dash regression where internal depots were added as Apps
+                     crate::direct_download::lua_parser::DepotCategory::MainDepot => {
+                         // log(format!("Skipping Internal Depot: {}", depot.depot_id));
+                     },
+                     _ => {
+                         // For Unknown or DlcDepot, we generally ignore them as AppList
+                         // handles Apps, not file depots. DLC AppIDs are handled above.
+                     }
+                 }
+             }
+             
+             log(format!("Smart Patching: Final AppList has {} IDs (Base + {} DLCs + Shared).", final_ids.len(), selected_dlcs.len()));
         }
 
         match crate::app_list::add_games_to_list(&gl_path, final_ids.clone()) {
@@ -741,19 +919,36 @@ pub fn spawn_steam_install(
             }
         }
 
-        // STEP 5: RELAUNCH STEAM
-        log("STEP 5: Relaunching Steam...".to_string());
-        update_status("Relaunching Steam...".to_string());
+        // STEP 5: RELAUNCH STEAM via GREENLUMA (GLStealth Match)
+        log("STEP 5: Relaunching Steam (GreenLuma Injection)...".to_string());
+        update_status("Launching GreenLuma...".to_string());
         
         let steam_exe = std::path::Path::new(&steam_path).join("steam.exe");
+        let dll_name = "GreenLuma_2025_x64.dll";
+        let dll_path = std::path::Path::new(&gl_path).join(dll_name);
+
         if steam_exe.exists() {
-            if let Err(e) = open::that(steam_exe) {
-                log(format!("Failed to launch Steam: {}", e));
+            if dll_path.exists() {
+                // Ensure Steam is dead (Double Tap)
+                let _ = std::process::Command::new("taskkill").args(["/F", "/IM", "steam.exe"]).output();
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                
+                // Re-apply config just in case
+                let _ = crate::ui::helpers::setup_greenluma_config(&gl_path, enable_stealth);
+
+                match crate::injector::launch_injected(
+                    steam_exe.to_str().unwrap_or(""),
+                    dll_path.to_str().unwrap_or(""),
+                    Some("-inhibitbootstrap"),
+                ) {
+                    Ok(_) => log("✅ Steam Launched with GreenLuma.".to_string()),
+                    Err(e) => log(format!("❌ Launch Failed: {}", e)),
+                }
             } else {
-                 log("Steam relaunched. Download should begin shortly.".to_string());
+                 log(format!("❌ Error: Missing {}", dll_name));
             }
         } else {
-            log("Steame.exe not found.".to_string());
+            log("❌ steam.exe not found.".to_string());
         }
         
         update_status("Ready".to_string());
@@ -932,7 +1127,10 @@ fn resolve_mandatory_depots(
     
     // 2. Base Depots
     for depot in &hierarchy.base_depots {
-        ids.push(depot.depot_id.clone());
+        // [FIX] User Request: Include Depots (Critical for Download), EXCLUDE Steamworks (228980/228989)
+        if depot.depot_id != "228980" && depot.depot_id != "228989" {
+            ids.push(depot.depot_id.clone());
+        }
     }
     
     // 3. Selected DLCs and THEIR Depots
@@ -940,7 +1138,9 @@ fn resolve_mandatory_depots(
         if selected_dlcs.contains(&dlc.app_id) {
             ids.push(dlc.app_id.clone());
             for depot in &dlc.depots {
-                ids.push(depot.depot_id.clone());
+                 if depot.depot_id != "228980" && depot.depot_id != "228989" {
+                    ids.push(depot.depot_id.clone());
+                 }
             }
         }
     }
