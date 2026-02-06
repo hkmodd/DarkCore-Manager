@@ -25,15 +25,15 @@ jobs:
     - name: Build Release
       run: cargo build --release --workspace --verbose
 
-    - name: Rename Binary for Release
+    - name: Package for Release
       run: |
         cd target/release
-        mv darkcore-manager.exe darkcore-manager-x86_64-pc-windows-msvc.exe
+        powershell Compress-Archive -Path darkcore-manager.exe -DestinationPath darkcore-manager-x86_64-pc-windows-msvc.zip
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: target/release/darkcore-manager-x86_64-pc-windows-msvc.exe
+        files: target/release/darkcore-manager-x86_64-pc-windows-msvc.zip
         name: Release ${{ github.ref_name }}
         draft: false
         prerelease: false
