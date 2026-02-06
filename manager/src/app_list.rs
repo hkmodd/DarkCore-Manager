@@ -222,8 +222,12 @@ pub fn add_games_to_list(gl_path: &str, new_ids: Vec<String>) -> Result<(), std:
 
     // 3. Sort and Write
     let mut final_list: Vec<_> = current_ids.into_iter().collect();
-    // Sort logic to match others if needed, but simple sort is fine for now
-    final_list.sort();
+    // Sort numerically for stability
+    final_list.sort_by(|a, b| {
+        let na = a.parse::<u64>().unwrap_or(u64::MAX);
+        let nb = b.parse::<u64>().unwrap_or(u64::MAX);
+        na.cmp(&nb)
+    });
 
     for (i, aid) in final_list.iter().enumerate() {
         let text_path = al_path.join(format!("{}.txt", i));
@@ -282,9 +286,13 @@ pub fn remove_games_from_list(
         }
     }
 
-    // 2. Write Back Remaining
     let mut final_list: Vec<_> = current_ids.into_iter().collect();
-    final_list.sort();
+    // Sort numerically
+    final_list.sort_by(|a, b| {
+        let na = a.parse::<u64>().unwrap_or(u64::MAX);
+        let nb = b.parse::<u64>().unwrap_or(u64::MAX);
+        na.cmp(&nb)
+    });
 
     for (i, aid) in final_list.iter().enumerate() {
         let text_path = al_path.join(format!("{}.txt", i));

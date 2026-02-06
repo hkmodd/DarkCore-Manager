@@ -11,7 +11,13 @@ authors = ["Team DarkCore"]
 
 [profile.release]
 strip = true      # Automatically strip symbols from the binary.
-opt-level = 3     # Optimize for SPEED (was "z" for size).
+opt-level = "z"     # Optimize for SIZE (was 3 for speed).
 lto = "fat"       # Enable Link Time Optimization (Maximum).
 codegen-units = 1 # Maximum optimization (slower build).
 panic = "abort"   # Remove unwind tables for smaller/faster binary.
+
+# For profiling (preserves debug info)
+[profile.release-debug]
+inherits = "release"
+debug = true
+strip = false

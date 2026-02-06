@@ -9,17 +9,18 @@ mod steamless;
 mod game_path;
 mod injector;
 mod ui;
+// mod ui_old; // Removed
 mod goldberg;
 mod manifest_downloader;
 mod vdf_injector;
 mod vault;
 mod watcher;
 mod updater; // NEW: OTA Update System
+pub mod direct_download;
 
-// REMOVED: mod downloader (switched to SMD approach)
-// REMOVED: mod manifest_parser (unused native parser)
-
-use ui::DarkCoreApp;
+mod steam; // New module for Steam logic
+mod registry;
+use ui::state::DarkCoreApp;
 
 #[tokio::main]
 async fn main() -> Result<(), eframe::Error> {

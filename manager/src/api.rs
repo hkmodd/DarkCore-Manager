@@ -13,6 +13,11 @@ pub struct SearchResult {
     pub name: Option<String>,
     #[serde(default)]
     pub is_free: bool,
+    // FIX v1.7.3: Cover URL from search used as fallback
+    #[serde(default)]
+    pub tiny_image: Option<String>, 
+    #[serde(default)]
+    pub logo: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -44,6 +49,21 @@ pub struct CoveredGame {
     pub id: String,
     pub name: String,
     pub cover_url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GameDetails {
+    pub app_id: String,
+    pub name: String,
+    pub short_description: String,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    pub genres: Vec<String>,
+    pub release_date: String,
+    pub metacritic_score: Option<u32>,
+    pub recommendations: Option<u64>,
+    pub platforms: (bool, bool, bool), // (windows, mac, linux)
+    pub required_age: u8,
 }
 
 pub fn val_to_string(v: &Option<Value>) -> String {
@@ -117,12 +137,16 @@ impl ApiClient {
                             }
                         }
 
+                        let tiny_image = item.get("tiny_image").and_then(|v| v.as_str()).map(|s| s.to_string());
+
                         results.push(SearchResult {
                             game_id: id_val.clone(), 
                             game_name: name_str.clone(), 
                             app_id: id_val,
                             name: name_str,
                             is_free, 
+                            tiny_image,
+                            logo: None,
                         });
                     }
                 }
@@ -157,7 +181,7 @@ impl ApiClient {
         Ok(results) // Return empty if both failed
     }
 
-    pub async fn download_manifest(&self, appid: &str) -> Result<Bytes, Box<dyn Error>> {
+    pub async fn download_manifest(&self, appid: &str) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
         let url = format!("https://manifest.morrenus.xyz/api/v1/manifest/{}", appid);
         let resp = self.client.get(&url).send().await?;
         if !resp.status().is_success() {
@@ -168,7 +192,7 @@ impl ApiClient {
     }
 
     /// Generic download helper
-    pub async fn download_file(&self, url: &str) -> Result<Bytes, Box<dyn Error>> {
+    pub async fn download_file(&self, url: &str) -> Result<Bytes, Box<dyn Error + Send + Sync>> {
         let resp = self.client.get(url).send().await?;
         if !resp.status().is_success() {
              return Err(format!("Download Error: {}", resp.status()).into());
@@ -177,7 +201,7 @@ impl ApiClient {
         Ok(bytes)
     }
 
-    pub async fn get_dlc_list(&self, appid: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    pub async fn get_dlc_list(&self, appid: &str) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
         let url = format!(
             "https://store.steampowered.com/api/appdetails?appids={}&filters=dlc",
             appid
@@ -207,7 +231,7 @@ impl ApiClient {
         Ok(dlc_ids)
     }
 
-    pub async fn get_details_parent(&self, appid: &str) -> Result<Option<String>, Box<dyn Error>> {
+    pub async fn get_details_parent(&self, appid: &str) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
         let url = format!(
             "https://store.steampowered.com/api/appdetails?appids={}&filters=basic,fullgame",
             appid
@@ -235,7 +259,7 @@ impl ApiClient {
         Ok(None)
     }
 
-    pub async fn get_status(&self, appid: &str) -> Result<GameStatus, Box<dyn Error>> {
+    pub async fn get_status(&self, appid: &str) -> Result<GameStatus, Box<dyn Error + Send + Sync>> {
         if self.api_key.is_empty() {
              return Err("No API Key".into());
         }
@@ -248,7 +272,7 @@ impl ApiClient {
         Ok(status)
     }
 
-    pub async fn get_user_stats(&self) -> Result<UserStats, Box<dyn Error>> {
+    pub async fn get_user_stats(&self) -> Result<UserStats, Box<dyn Error + Send + Sync>> {
         if self.api_key.is_empty() { return Err("No API Key Provided".into()); }
         
         let url = "https://manifest.morrenus.xyz/api/v1/user/stats";
@@ -269,6 +293,137 @@ impl ApiClient {
         
         let stats: UserStats = resp.json().await?;
         Ok(stats)
+    }
+
+    /// Fetch detailed game info from Steam Store API (FREE - no Morrenus token used)
+    pub async fn get_game_details(&self, appid: &str) -> Result<GameDetails, Box<dyn Error + Send + Sync>> {
+        let url = format!(
+            "https://store.steampowered.com/api/appdetails?appids={}&l=english",
+            appid
+        );
+        
+        let resp = self.client.get(&url).send().await?;
+        let json: serde_json::Value = resp.json().await?;
+        
+        let data = json
+            .get(appid)
+            .and_then(|v| v.get("data"))
+            .ok_or("No data found")?;
+        
+        Ok(GameDetails {
+            app_id: appid.to_string(),
+            name: data.get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            short_description: data.get("short_description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            developers: data.get("developers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            publishers: data.get("publishers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            genres: data.get("genres")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter()
+                    .filter_map(|v| v.get("description").and_then(|d| d.as_str()).map(String::from))
+                    .collect())
+                .unwrap_or_default(),
+            release_date: data.get("release_date")
+                .and_then(|v| v.get("date"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            metacritic_score: data.get("metacritic")
+                .and_then(|v| v.get("score"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+            recommendations: data.get("recommendations")
+                .and_then(|v| v.get("total"))
+                .and_then(|v| v.as_u64()),
+            platforms: (
+                data.get("platforms").and_then(|v| v.get("windows")).and_then(|v| v.as_bool()).unwrap_or(false),
+                data.get("platforms").and_then(|v| v.get("mac")).and_then(|v| v.as_bool()).unwrap_or(false),
+                data.get("platforms").and_then(|v| v.get("linux")).and_then(|v| v.as_bool()).unwrap_or(false),
+            ),
+            required_age: data.get("required_age")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u8)
+                .unwrap_or(0),
+        })
+    }
+
+    // =========================================================================
+    // VAULT AUDIT v1.7.2 - MANIFEST GID EXTRACTION
+    // =========================================================================
+
+    /// Fetches current manifest GIDs from Morrenus for an appid.
+    /// Returns HashMap<depot_id, manifest_gid> for version verification.
+    /// 
+    /// NOTE: This downloads the full ZIP which costs 1 API token.
+    /// Use sparingly and cache the result for reinstallations.
+    pub async fn get_manifest_gids(
+        &self,
+        appid: &str,
+    ) -> Result<std::collections::HashMap<String, String>, Box<dyn Error + Send + Sync>> {
+        // Download ZIP (unfortunately full download is required)
+        let bytes = self.download_manifest(appid).await
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        Self::extract_gids_from_zip(&bytes)
+    }
+
+    /// Extracts manifest GIDs from already-downloaded ZIP bytes.
+    /// Used when ZIP is already available (e.g., from cache or direct download).
+    pub fn extract_gids_from_zip(
+        bytes: &[u8],
+    ) -> Result<std::collections::HashMap<String, String>, Box<dyn Error + Send + Sync>> {
+        let mut gids = std::collections::HashMap::new();
+
+        if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+            for i in 0..archive.len() {
+                if let Ok(f) = archive.by_index(i) {
+                    let name = f.name();
+                    if name.ends_with(".manifest") {
+                        // Filename format: depotcache/{depot_id}_{gid}.manifest
+                        // or: {depot_id}_{gid}.manifest
+                        if let Some(stem) = std::path::Path::new(name).file_stem() {
+                            let stem_str = stem.to_string_lossy();
+                            if let Some(idx) = stem_str.rfind('_') {
+                                let depot_id = &stem_str[..idx];
+                                let gid = &stem_str[idx + 1..];
+                                gids.insert(depot_id.to_string(), gid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(gids)
+    }
+
+    /// Lightweight GID check using SteamCMD API (FREE, no token cost).
+    /// Returns HashMap<depot_id, manifest_gid> from public Steam API.
+    /// 
+    /// Prefer this over get_manifest_gids() when possible.
+    pub async fn get_public_gids(
+        &self,
+        appid: &str,
+    ) -> Result<std::collections::HashMap<String, String>, Box<dyn Error + Send + Sync>> {
+        let info = self.get_app_info(appid).await
+            .map_err(|e| -> Box<dyn Error + Send + Sync> { e.to_string().into() })?;
+        let mut gids = std::collections::HashMap::new();
+        for (depot_id, depot_info) in info.depots {
+            if let Some(gid) = depot_info.gid {
+                gids.insert(depot_id, gid);
+            }
+        }
+        Ok(gids)
     }
 }
 
@@ -307,7 +462,7 @@ pub struct DepotInfo {
 
 impl ApiClient {
     /// Fetch public info from api.steamcmd.net
-    pub async fn get_app_info(&self, appid: &str) -> Result<SteamCmdInfo, Box<dyn Error>> {
+    pub async fn get_app_info(&self, appid: &str) -> Result<SteamCmdInfo, Box<dyn Error + Send + Sync>> {
         let url = format!("https://api.steamcmd.net/v1/info/{}", appid);
         let resp = self.client.get(&url).send().await?;
         
@@ -411,7 +566,7 @@ pub struct SchemaAchievement {
 
 impl ApiClient {
     /// Fetch Achievement Schema from Steam Web API
-    pub async fn get_schema_for_game(&self, appid: &str) -> Result<SchemaResponse, Box<dyn Error>> {
+    pub async fn get_schema_for_game(&self, appid: &str) -> Result<SchemaResponse, Box<dyn Error + Send + Sync>> {
         if self.api_key.is_empty() {
              return Err("No Web API Key provided".into());
         }

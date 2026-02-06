@@ -159,4 +159,124 @@ impl VaultManager {
 
         Ok((restored_acf, restored_count))
     }
+
+    // =========================================================================
+    // VAULT AUDIT v1.7.2 - VERSION VERIFICATION & INVALIDATION
+    // =========================================================================
+
+    /// Get the vault storage directory for an appid
+    pub fn get_storage_dir(&self, appid: &str) -> PathBuf {
+        self.base_path.join(appid)
+    }
+
+    /// Check if vault has data for an appid (manifest folder exists)
+    pub fn has_manifests(&self, appid: &str) -> bool {
+        let storage_dir = self.base_path.join(appid);
+        storage_dir.exists() && storage_dir.is_dir()
+    }
+
+    /// Verifies if the manifests in Vault are up-to-date compared to expected GIDs.
+    /// Returns (is_valid, outdated_depot_ids)
+    ///
+    /// expected_gids: HashMap<depot_id, expected_manifest_gid>
+    pub fn verify_manifests(
+        &self,
+        appid: &str,
+        expected_gids: &std::collections::HashMap<String, String>,
+    ) -> (bool, Vec<String>) {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            // No vault data = all outdated
+            return (false, expected_gids.keys().cloned().collect());
+        }
+
+        let mut outdated = Vec::new();
+
+        for (depot_id, expected_gid) in expected_gids {
+            let expected_filename = format!("{}_{}.manifest", depot_id, expected_gid);
+            let expected_path = storage_dir.join(&expected_filename);
+
+            if !expected_path.exists() {
+                // Manifest doesn't exist or has different GID
+                outdated.push(depot_id.clone());
+            }
+        }
+
+        let is_valid = outdated.is_empty();
+        (is_valid, outdated)
+    }
+
+    /// Deletes ALL vault data for an appid (full invalidation)
+    pub fn invalidate_app(&self, appid: &str) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if storage_dir.exists() {
+            fs::remove_dir_all(&storage_dir)?;
+        }
+        // Also remove the .lua file if exists
+        let lua_path = self.get_path(appid);
+        if lua_path.exists() {
+            fs::remove_file(&lua_path)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes only manifests for specific depot IDs (partial invalidation)
+    pub fn invalidate_depots(&self, appid: &str, depot_ids: &[String]) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            return Ok(());
+        }
+
+        let pattern = storage_dir.join("*.manifest");
+        if let Ok(paths) = glob::glob(&pattern.to_string_lossy()) {
+            for path in paths.flatten() {
+                if let Some(fname) = path.file_name() {
+                    let fname_str = fname.to_string_lossy();
+                    // Filename format: {depot_id}_{gid}.manifest
+                    for depot_id in depot_ids {
+                        if fname_str.starts_with(&format!("{}_", depot_id)) {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stores raw manifest bytes directly to vault (for Direct Download integration)
+    pub fn store_manifest_bytes(
+        &self,
+        appid: &str,
+        depot_id: u32,
+        manifest_gid: u64,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            fs::create_dir_all(&storage_dir)?;
+        }
+        let filename = format!("{}_{}.manifest", depot_id, manifest_gid);
+        fs::write(storage_dir.join(filename), bytes)
+    }
+
+    /// Stores a ZIP file in the vault for future use
+    pub fn store_zip(&self, appid: &str, bytes: &[u8]) -> std::io::Result<()> {
+        let storage_dir = self.base_path.join(appid);
+        if !storage_dir.exists() {
+            fs::create_dir_all(&storage_dir)?;
+        }
+        let zip_path = storage_dir.join(format!("{}.zip", appid));
+        fs::write(zip_path, bytes)
+    }
+
+    /// Gets stored ZIP bytes if available
+    pub fn get_zip(&self, appid: &str) -> Option<Vec<u8>> {
+        let zip_path = self.base_path.join(appid).join(format!("{}.zip", appid));
+        if zip_path.exists() {
+            fs::read(&zip_path).ok()
+        } else {
+            None
+        }
+    }
 }

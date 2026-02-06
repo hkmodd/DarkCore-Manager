@@ -200,7 +200,7 @@ impl GoldbergGenerator {
         appid: &str, 
         client: &ApiClient, 
         game_path: &Path
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let schema = client.get_schema_for_game(appid).await?;
         
         let settings_dir = game_path.join("steam_settings");
@@ -271,7 +271,7 @@ impl GoldbergGenerator {
         appid: &str, 
         client: &ApiClient, 
         game_path: &Path
-    ) -> Result<String, Box<dyn std::error::Error>> {
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // Fetch info from SteamCMD
         let info = client.get_app_info(appid).await?;
         

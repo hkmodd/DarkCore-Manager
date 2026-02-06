@@ -64,6 +64,7 @@ impl VdfValue {
 pub struct GamePathFinder;
 
 impl GamePathFinder {
+    #[allow(dead_code)] // Utility function kept for future use
     pub fn find_manifest_path(steam_path: &str, app_id: &str) -> Option<PathBuf> {
         let library_folders = Self::get_library_folders(steam_path);
         for lib in library_folders {
@@ -131,7 +132,13 @@ impl GamePathFinder {
                             for (key, val) in props {
                                 if key.eq_ignore_ascii_case("path") {
                                     if let VdfValue::Str(s) = val {
-                                        let p = PathBuf::from(s.replace("\\\\", "\\"));
+                                        // Clean the path string
+                                        let mut cleaned = s.replace("\\\\", "\\");
+                                        // FIX 3: REMOVE \\?\ prefix if present (don't skip!)
+                                        if cleaned.starts_with(r"\\?\") {
+                                            cleaned = cleaned[4..].to_string(); // Remove first 4 chars: \\?\
+                                        }
+                                        let p = PathBuf::from(&cleaned);
                                         if p != main_steam {
                                             folders.push(p);
                                         }
