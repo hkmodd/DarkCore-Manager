@@ -18,7 +18,6 @@ pub fn download_manifests_wudrm(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     use crate::api::ApiClient;
 
-    // Check if module exists - assuming we imported it or use crate path
     let runtime = tokio::runtime::Runtime::new()?;
     // Anonymous client for public SteamCMD API
     let client = ApiClient::new("".to_string());

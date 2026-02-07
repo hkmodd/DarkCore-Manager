@@ -218,11 +218,8 @@ impl VaultManager {
         if storage_dir.exists() {
             fs::remove_dir_all(&storage_dir)?;
         }
-        // Also remove the .lua file if exists
-        let lua_path = self.get_path(appid);
-        if lua_path.exists() {
-            fs::remove_file(&lua_path)?;
-        }
+        // NOTE: .lua lives INSIDE storage_dir (Vault/{appid}/{appid}.lua)
+        // so remove_dir_all already handles it. No separate delete needed.
         Ok(())
     }
 

@@ -247,7 +247,16 @@ async fn check_games_for_updates_internal(
     results
 }
 
-/// Trigger manifest download for a specific update
+/// Trigger manifest download for a specific update.
+/// 
+/// INTELLIGENT UPDATE FLOW:
+/// 1. Fetch current depot GIDs from SteamCMD (free API)
+/// 2. Filter depots by target language
+/// 3. For each depot: check if depotcache already has the CORRECT GID
+/// 4. If outdated GID exists → delete old manifest, download new one
+/// 5. If correct GID exists → skip (already up to date)
+/// 6. If missing → download fresh
+/// 7. Save all new manifests to Vault for future offline use
 pub async fn trigger_update_download(
     api_key: &str,
     downloader: &ManifestDownloader,
@@ -267,14 +276,83 @@ pub async fn trigger_update_download(
     let filtered_depots = filter_depots_by_language(&info.depots, target_language);
 
     let depot_cache = steam_path.join("depotcache");
-    let mut downloaded = 0;
+    if !depot_cache.exists() {
+        std::fs::create_dir_all(&depot_cache)
+            .map_err(|e| format!("Failed to create depotcache: {}", e))?;
+    }
 
-    for (depot_id, depot_info) in filtered_depots {
-        if let Some(gid) = depot_info.gid {
-            match downloader.download_manifest(&depot_id, &gid, &depot_cache).await {
-                Ok(_) => downloaded += 1,
-                Err(_) => {} // Continue with other depots
+    let vault = crate::vault::VaultManager::new(".");
+    let mut downloaded = 0;
+    let mut skipped = 0;
+    let mut cleaned = 0;
+
+    for (depot_id, depot_info) in &filtered_depots {
+        if let Some(gid) = &depot_info.gid {
+            let expected_name = format!("{}_{}.manifest", depot_id, gid);
+            let expected_path = depot_cache.join(&expected_name);
+
+            // ── CHECK: Already have the correct manifest? ──
+            if expected_path.exists() {
+                if let Ok(meta) = std::fs::metadata(&expected_path) {
+                    if meta.len() > 100 {
+                        skipped += 1;
+                        continue; // Already up to date
+                    }
+                }
             }
+
+            // ── CLEANUP: Remove OLD manifests for this depot (different GID) ──
+            let pattern = format!("{}_*.manifest", depot_id);
+            if let Ok(paths) = glob::glob(&depot_cache.join(&pattern).to_string_lossy()) {
+                for old_path in paths.flatten() {
+                    if let Some(fname) = old_path.file_name() {
+                        let fname_str = fname.to_string_lossy();
+                        if fname_str != expected_name {
+                            let _ = std::fs::remove_file(&old_path);
+                            cleaned += 1;
+                        }
+                    }
+                }
+            }
+
+            // ── VAULT CHECK: Try restoring from Vault before downloading ──
+            let vault_manifest = vault.get_storage_dir(app_id).join(&expected_name);
+            if vault_manifest.exists() {
+                if let Ok(meta) = std::fs::metadata(&vault_manifest) {
+                    if meta.len() > 100 {
+                        if std::fs::copy(&vault_manifest, &expected_path).is_ok() {
+                            downloaded += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // ── DOWNLOAD: Fetch from CDN via WUDRM ──
+            match downloader.download_manifest(depot_id, gid, &depot_cache).await {
+                Ok(path) => {
+                    downloaded += 1;
+                    // Save to Vault for future use
+                    let _ = vault.store_manifest(app_id, &path);
+                }
+                Err(_) => {
+                    // Continue with other depots — partial success is better than abort
+                }
+            }
+        }
+    }
+
+    // Also invalidate old Vault manifests for this app
+    if cleaned > 0 {
+        let mut expected_gids = std::collections::HashMap::new();
+        for (depot_id, depot_info) in &filtered_depots {
+            if let Some(gid) = &depot_info.gid {
+                expected_gids.insert(depot_id.clone(), gid.clone());
+            }
+        }
+        let (_, outdated) = vault.verify_manifests(app_id, &expected_gids);
+        if !outdated.is_empty() {
+            let _ = vault.invalidate_depots(app_id, &outdated);
         }
     }
 

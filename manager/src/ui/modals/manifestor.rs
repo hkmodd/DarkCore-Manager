@@ -154,9 +154,15 @@ pub fn open_manifestor(app: &mut DarkCoreApp, appid: String, name: String) {
     // Default target library
     app.manifestor_target_library = app.detected_libraries.get(0).cloned();
     
-    // Reset data
+    // Reset data ONLY if this is a DIFFERENT game than what's cached
     if let Ok(mut data) = app.manifestor_data.lock() {
-        *data = None;
+        let should_reset = match data.as_ref() {
+            Some(h) => h.root_id != appid, // Different game → reset
+            None => true,                    // No data → reset (will fetch fresh)
+        };
+        if should_reset {
+            *data = None;
+        }
     }
     
     // FIX: Reset install dir for auto-fill
@@ -230,21 +236,24 @@ pub fn open_manifestor(app: &mut DarkCoreApp, appid: String, name: String) {
                                 let lua_content = String::from_utf8_lossy(&lua_bytes).to_string();
                                 
                                 if let Ok(script_data) = crate::direct_download::lua_parser::parse_content(&lua_content) {
-                                    if !script_data.dlcs.is_empty() {
-                                        // FOUND HIDDEN DLCs (From Vault)!
-                                        for dlc in script_data.dlcs {
-                                            if !hierarchy.dlcs.iter().any(|d| d.app_id == dlc.app_id.to_string()) {
-                                                hierarchy.dlcs.push(crate::api::DlcNode {
-                                                    app_id: dlc.app_id.to_string(),
-                                                    name: dlc.name,
-                                                    depots: Vec::new(),
-                                                    selected: true,
-                                                });
-                                            }
+                                    // VAULT HIT: Lua exists and parses successfully.
+                                    // This IS a valid cache hit regardless of DLC count.
+                                    // If DLCs exist, merge them. If not, we still skip Morrenus.
+                                    for dlc in script_data.dlcs {
+                                        if !hierarchy.dlcs.iter().any(|d| d.app_id == dlc.app_id.to_string()) {
+                                            hierarchy.dlcs.push(crate::api::DlcNode {
+                                                app_id: dlc.app_id.to_string(),
+                                                name: dlc.name,
+                                                depots: Vec::new(),
+                                                selected: true,
+                                            });
                                         }
-                                        hierarchy.dlcs.sort_by(|a, b| a.app_id.cmp(&b.app_id));
-                                        loaded_from_vault = true;
                                     }
+                                    if !hierarchy.dlcs.is_empty() {
+                                        hierarchy.dlcs.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+                                    }
+                                    // ALWAYS mark as loaded — 0 DLC is a valid result
+                                    loaded_from_vault = true;
                                 }
                             }
 
