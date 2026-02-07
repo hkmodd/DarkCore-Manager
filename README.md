@@ -951,8 +951,6 @@ DarkCore Manager
 
 <div align="center">
 
-Built by the **Antigravity** development team.
-
 Powered by the Rust ecosystem and the open-source community.
 
 <br>
