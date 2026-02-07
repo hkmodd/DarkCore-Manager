@@ -15,12 +15,10 @@
     <b>High-Performance. Memory-Safe. Aesthetics.</b>
   </p>
 
-# 🌌 DarkCore Manager v1.7.0
-
 > **The Rust-Native Orchestrator for External Compatibility Layers.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
-![Version](https://img.shields.io/badge/version-v1.7.0-00f3ff?style=for-the-badge&logo=rust)
+![Version](https://img.shields.io/badge/version-v1.7.1-00f3ff?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
   
@@ -95,7 +93,7 @@ DarkCore adapts to your environment in real-time.
 | **Standard**      | **LOCAL ONLY**  | **Fallback to Public Store API**. Instant Search & DLC listings. Ideal for local Family Sharing management. |
 
 > [!NOTE]
-> **BYOL (Bring Your Own License)**: GreenLuma, Steamless, and API Keys are third-party resources. You must acquire and configure them independently.
+> **BYOL (Bring Your Own License)**: GreenLuma 1.7.0 (not 1.7.1), Steamless, and Morrenus API Keys are third-party resources. You must acquire and configure them independently.
 
 ### 🛡️ Integrity Validation
 When a valid API connection is established, DarkCore enforces **Strict Validation**, preventing the configuration of invalid AppIDs. If the metadata doesn't exist, the configuration is rejected to maintain system stability.
@@ -109,12 +107,7 @@ When a valid API connection is established, DarkCore enforces **Strict Validatio
 * **Zero-Compromise Engineering**: The codebase compiles with **0 Warnings**, adhering to strict Rust 2024 standards.
 * **Native Process Injection**: Utilizes advanced `QueueUserAPC` calls for stable, thread-safe module loading. This ensures seamless integration without the instability of legacy injection methods.
 * **Profile Swapping**: Proprietary system allows for unlimited library configurations by hot-swapping `AppList` files.
-
-### 🆕 v1.7.0 Additions
-* **⬇️ OTA Self-Update**: Automatic update checks on startup. One-click download & restart via GitHub Releases.
-* **🎯 The Manifestor**: Surgical DLC selection modal with hierarchical view, search, and AppList slot protection.
-* **🔄 WUDRM Auto-Recovery**: Detects "Update Required" flags and auto-downloads missing manifests.
-* **🧠 F2P Intelligence**: Auto-detects Free-to-Play titles, displays "FREE" badges, and skips AppList injection.
+* **Native Downloader**: Download using Steam or using our external Rust DepotDownloader! you choose! 
 
 ---
 
@@ -130,15 +123,10 @@ We believe in transparency. Build it yourself.
 
 1.  **Clone Repository**
     ```powershell
-    git clone [https://github.com/hkmodd/DarkCore-Manager.git](https://github.com/hkmodd/DarkCore-Manager.git)
+    git clone https://github.com/hkmodd/DarkCore-Manager.git
     cd DarkCore-Manager
     ```
-
-2.  **Asset Injection (Optional)**
-    * **Logo**: Automatically embedded (`baked-in`) at compile time.
-    * **Icon**: Place your `icon.ico` in the `manager/` directory.
-
-3.  **Compile System**
+2.  **Compile System**
     ```powershell
     cargo build --release
     ```
