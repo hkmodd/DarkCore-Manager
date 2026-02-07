@@ -15,12 +15,12 @@
     <b>High-Performance. Memory-Safe. Aesthetics.</b>
   </p>
 
-# 🌌 DarkCore Manager v1.7.0
+# 🌌 DarkCore Manager v1.7.1
 
 > **The Rust-Native Orchestrator for External Compatibility Layers.**
 > *Zero Dependency. Zero Bloat. Pure Power.*
 
-![Version](https://img.shields.io/badge/version-v1.7.0-00f3ff?style=for-the-badge&logo=rust)
+![Version](https://img.shields.io/badge/version-v1.7.1-00f3ff?style=for-the-badge&logo=rust)
 ![Status](https://img.shields.io/badge/status-STABLE-success?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey?style=for-the-badge)
   
@@ -80,6 +80,8 @@ To achieve seamless interoperability, four components must work in unison. DarkC
 * **Role**: **Manifest & Config Synchronization**.
 * **Function**: Facilitates the retrieval of public **Manifests** and configuration scripts necessary for client validation.
 * **DarkCore Integration**: Automates the alignment of Lua scripts and Manifests to ensure `config.vdf` and `depotcache` consistency.
+
+### 4. NATIVE RUST DOWNLOADER
 
 
 ---
