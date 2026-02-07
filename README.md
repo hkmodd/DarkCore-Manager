@@ -958,9 +958,8 @@ Powered by the Rust ecosystem and the open-source community.
 <br>
 
 <sub>
-
-**Third-Party Acknowledgments** — GreenLuma by [Steam006](https://cs.rin.ru/forum/viewtopic.php?f=29&t=103709) · Steamless by [atom0s](https://github.com/atom0s/Steamless) · Goldberg Emulator by [Mr. Goldberg](https://gitlab.com/Mr_Goldberg/goldberg_emulator) · Morrenus API by [manifest.morrenus.xyz](https://manifest.morrenus.xyz/) · egui by [emilk](https://github.com/emilk/egui)
-
+**Third-Party Acknowledgments** — GreenLuma by [Steam006](https://cs.rin.ru/forum/viewtopic.php?f=29&t=103709) · Steamless by [atom0s](https://github.com/atom0s/Steamless) · Goldberg Emulator by [Mr. Goldberg](https://gitlab.com/Mr_Goldberg/goldberg_emulator)
+Morrenus API by [manifest.morrenus.xyz](https://manifest.morrenus.xyz/) · egui by [emilk](https://github.com/emilk/egui)
 </sub>
 
 <br>
