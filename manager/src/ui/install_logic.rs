@@ -704,10 +704,18 @@ pub fn spawn_steam_install(
 
         // Only restore from vault if verified
         if vault_is_valid {
+            // Check if we have the Lua/Keys (CRITICAL for Decryption)
+            let has_keys = vault.exists(&appid);
+
             if let Ok((restored_acf, count)) = vault.restore_manifests(&library_path, &appid) {
                 if count > 0 { 
-                    log(format!("Vault: Restored {} verified depot manifests. SKIPPING MORRENUS (Token Saved). 🛡️", count)); 
-                    skip_morrenus = true;
+                    if has_keys {
+                        log(format!("Vault: Restored {} verified depot manifests. SKIPPING MORRENUS (Token Saved). 🛡️", count)); 
+                        skip_morrenus = true;
+                    } else {
+                        log(format!("Vault: Restored {} manifests, but LUA/KEYS ARE MISSING. Forcing Morrenus Download to recover keys.", count));
+                        // skip_morrenus remains false to trigger download
+                    }
                 }
                 if restored_acf {
                     log("Vault: Restored AppManifest.acf. Skipping Ghost Generation. 🛡️".to_string());

@@ -13,68 +13,207 @@ pub fn clean_tokenize(text: &str) -> Vec<String> {
 
 pub fn download_manifests_wudrm(
     appid: &str,
-    steam_root: &str,
+    steam_path: &str,
     log: &dyn Fn(String),
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::api::ApiClient;
+    use crate::manifest_downloader::ManifestDownloader;
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    // Anonymous client for public SteamCMD API
-    let client = ApiClient::new("".to_string());
-    let downloader = crate::manifest_downloader::ManifestDownloader::new();
-    let depot_cache_dir = std::path::Path::new(steam_root).join("depotcache");
+    // Standard Steam Protobuf Magic: 0x71F617D0 (Little Endian)
+    const STEAM_MANIFEST_MAGIC: u32 = 0x71F617D0;
 
+    let client = crate::api::ApiClient::new("".to_string());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let info = runtime.block_on(client.get_app_info(appid))?;
+    let vault = crate::vault::VaultManager::new(".");
+
+    let mut valid_manifests: usize = 0;
+    let mut skipped: usize = 0;
+
+    let remote_gids: Vec<(u32, u64)> = info
+        .depots
+        .iter()
+        .filter_map(|(depot_id, depot_curr)| {
+            let did = depot_id.parse::<u32>().ok()?;
+            let gid = depot_curr.gid.as_ref()?.parse::<u64>().ok()?;
+            Some((did, gid))
+        })
+        .collect();
+
+    let total_depots = remote_gids.len();
+
+    log(format!(
+        "Wudrm: Checking {} manifests for AppID {}...",
+        total_depots, appid
+    ));
+
+    let downloader = ManifestDownloader::new();
+    let depot_cache_dir = std::path::Path::new(steam_path).join("depotcache");
     if !depot_cache_dir.exists() {
         std::fs::create_dir_all(&depot_cache_dir)?;
     }
 
-    log(format!(
-        "Wudrm: Connecting to SteamCMD for AppID {}...",
-        appid
-    ));
+    for (depot_id, gid) in remote_gids {
+        let filename = format!("{}_{}.manifest", depot_id, gid);
+        let expected_path = depot_cache_dir.join(&filename);
 
-    // We need 'get_app_info' to return public info with GIDs
-    let info = runtime.block_on(client.get_app_info(appid))?;
+        // SMART SKIP: Check if already exists AND is valid (Magic + Size)
+        if expected_path.exists() {
+            let mut is_valid = false;
+            let mut reason = "Unknown";
 
-    let vault = crate::vault::VaultManager::new(".");
-
-    let mut valid_manifests = 0;
-    // Download manifest for EACH depot that has a GID
-    for (depot_id, depot_curr) in info.depots {
-        if let Some(gid) = depot_curr.gid {
-            let expected_name = format!("{}_{}.manifest", depot_id, gid);
-            let expected_path = depot_cache_dir.join(&expected_name);
-
-            // 1. Check if exists (Restored from Vault or previous run)
-            if expected_path.exists() {
-                log(format!(
-                    "   - Skipping Wudrm (Found local): {}",
-                    expected_name
-                ));
-                valid_manifests += 1;
-                // Ensure it is in Vault too (Sync)
-                let _ = vault.store_manifest(appid, &expected_path);
-                continue;
+            if let Ok(meta) = std::fs::metadata(&expected_path) {
+                if meta.len() > 50 {
+                    // Check Magic Bytes
+                    if let Ok(mut file) = std::fs::File::open(&expected_path) {
+                        let mut buf = [0u8; 4];
+                        use std::io::Read;
+                        if file.read_exact(&mut buf).is_ok() {
+                            let magic = u32::from_le_bytes(buf);
+                            if magic == STEAM_MANIFEST_MAGIC {
+                                is_valid = true;
+                            } else {
+                                reason = "Invalid Magic Bytes";
+                            }
+                        } else {
+                            reason = "Read Error";
+                        }
+                    } else {
+                        reason = "Open Error";
+                    }
+                } else {
+                    reason = "Too Small";
+                }
             }
 
-            log(format!(
-                "   - Downloading Manifest: Depot {} | GID: {}",
-                depot_id, gid
-            ));
-            match runtime.block_on(downloader.download_manifest(&depot_id, &gid, &depot_cache_dir))
-            {
-                Ok(path) => {
-                    log(format!("      ✅ Success! Saved to {:?}", path));
-                    valid_manifests += 1;
-                    // 2. Save to Vault immediately
-                    let _ = vault.store_manifest(appid, &path);
-                }
-                Err(e) => {
-                    log(format!("      ❌ Failed to download {}: {}", depot_id, e));
+            if is_valid {
+                log(format!(
+                    "   ✓ Already exists: {} ({} bytes)",
+                    filename,
+                    std::fs::metadata(&expected_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                ));
+                valid_manifests += 1;
+                skipped += 1;
+                let _ = vault.store_manifest(appid, &expected_path);
+                continue;
+            } else {
+                log(format!(
+                    "   ⚠ Corrupt ({}): {}. Re-downloading...",
+                    reason, filename
+                ));
+                let _ = std::fs::remove_file(&expected_path);
+            }
+        }
+
+        // CLEANUP: Remove OLD manifests for this depot
+        if let Ok(entries) = std::fs::read_dir(&depot_cache_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+                    if fname.starts_with(&format!("{}_", depot_id)) && fname.ends_with(".manifest")
+                    {
+                        if fname != filename {
+                            log(format!("   🗑 Removing outdated: {}", fname));
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
                 }
             }
         }
+
+        // VAULT RESTORE: Try before network
+        let vault_dir = vault.get_storage_dir(appid);
+        let vault_manifest = vault_dir.join(&filename);
+        if vault_manifest.exists() {
+            let mut is_vault_valid = false;
+            if let Ok(meta) = std::fs::metadata(&vault_manifest) {
+                if meta.len() > 50 {
+                    if let Ok(mut file) = std::fs::File::open(&vault_manifest) {
+                        let mut buf = [0u8; 4];
+                        use std::io::Read;
+                        if file.read_exact(&mut buf).is_ok() {
+                            if u32::from_le_bytes(buf) == STEAM_MANIFEST_MAGIC {
+                                is_vault_valid = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_vault_valid {
+                if std::fs::copy(&vault_manifest, &expected_path).is_ok() {
+                    log(format!("   🛡️ Restored from Vault: {}", filename));
+                    valid_manifests += 1;
+                    continue;
+                }
+            }
+        }
+
+        // DOWNLOAD from CDN
+        log(format!(
+            "   ⬇ Downloading Depot {} (GID: {})",
+            depot_id, gid
+        ));
+        log(format!("     Target: {:?}", expected_path));
+
+        match runtime.block_on(downloader.download_manifest_detailed(
+            &depot_id.to_string(),
+            &gid.to_string(),
+            &depot_cache_dir,
+        )) {
+            Ok(result) => {
+                log(format!(
+                    "      ✅ Downloaded! (Format: {}, Orig: {}b, Final: {}b)",
+                    result.format_detected, result.original_size, result.final_size
+                ));
+
+                // VERIFY NEW FILE IMMEDIATELY
+                let mut verification_passed = false;
+                if let Ok(mut f) = std::fs::File::open(&result.path) {
+                    let mut buf = [0u8; 4];
+                    use std::io::Read; // Import Trait
+                    if f.read_exact(&mut buf).is_ok() {
+                        let magic = u32::from_le_bytes(buf);
+                        if magic == STEAM_MANIFEST_MAGIC {
+                            verification_passed = true;
+                            log(format!(
+                                "      🛡️ Verification PASSED (Magic: {:08X})",
+                                magic
+                            ));
+                        } else {
+                            log(format!(
+                                "      ❌ Verification FAILED (Magic: {:08X} != {:08X})",
+                                magic, STEAM_MANIFEST_MAGIC
+                            ));
+                        }
+                    }
+                }
+
+                if verification_passed {
+                    valid_manifests += 1;
+                    let _ = vault.store_manifest(appid, &result.path);
+                } else {
+                    log("      🔥 DELETING CORRUPT DOWNLOAD.".to_string());
+                    let _ = std::fs::remove_file(&result.path);
+                }
+            }
+            Err(e) => {
+                log(format!("      ❌ Failed {}: {}", depot_id, e));
+            }
+        }
     }
+
+    log(format!(
+        "Wudrm: Complete! {}/{} valid ({} cached, {} downloaded/restored)",
+        valid_manifests,
+        total_depots,
+        skipped,
+        valid_manifests.saturating_sub(skipped)
+    ));
 
     Ok(valid_manifests)
 }

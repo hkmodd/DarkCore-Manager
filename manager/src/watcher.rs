@@ -258,103 +258,20 @@ async fn check_games_for_updates_internal(
 /// 6. If missing → download fresh
 /// 7. Save all new manifests to Vault for future offline use
 pub async fn trigger_update_download(
-    api_key: &str,
-    downloader: &ManifestDownloader,
+    _api_key: &str,
+    _downloader: &ManifestDownloader,
     app_id: &str,
     steam_path: &std::path::Path,
-    target_language: &str,
+    _target_language: &str,
 ) -> Result<usize, String> {
-    use crate::api::filter_depots_by_language;
-
-    let client = crate::api::ApiClient::new(api_key.to_string());
-
-    // Get app info with depot details
-    let info = client.get_app_info(app_id).await
-        .map_err(|e| format!("Failed to get app info: {}", e))?;
-
-    // Filter depots by language
-    let filtered_depots = filter_depots_by_language(&info.depots, target_language);
-
-    let depot_cache = steam_path.join("depotcache");
-    if !depot_cache.exists() {
-        std::fs::create_dir_all(&depot_cache)
-            .map_err(|e| format!("Failed to create depotcache: {}", e))?;
+    let app_id_owned = app_id.to_string();
+    let steam_path_owned = steam_path.to_string_lossy().to_string();
+    
+    // UNIFIED LOGIC: Delegate to the robust helper (v1.7.3+)
+    let log_fn = |s: String| println!("[ManualUpdate] {}", s);
+    
+    match crate::ui::helpers::download_manifests_wudrm(&app_id_owned, &steam_path_owned, &log_fn) {
+        Ok(count) => Ok(count),
+        Err(e) => Err(e.to_string()),
     }
-
-    let vault = crate::vault::VaultManager::new(".");
-    let mut downloaded = 0;
-    let mut skipped = 0;
-    let mut cleaned = 0;
-
-    for (depot_id, depot_info) in &filtered_depots {
-        if let Some(gid) = &depot_info.gid {
-            let expected_name = format!("{}_{}.manifest", depot_id, gid);
-            let expected_path = depot_cache.join(&expected_name);
-
-            // ── CHECK: Already have the correct manifest? ──
-            if expected_path.exists() {
-                if let Ok(meta) = std::fs::metadata(&expected_path) {
-                    if meta.len() > 100 {
-                        skipped += 1;
-                        continue; // Already up to date
-                    }
-                }
-            }
-
-            // ── CLEANUP: Remove OLD manifests for this depot (different GID) ──
-            let pattern = format!("{}_*.manifest", depot_id);
-            if let Ok(paths) = glob::glob(&depot_cache.join(&pattern).to_string_lossy()) {
-                for old_path in paths.flatten() {
-                    if let Some(fname) = old_path.file_name() {
-                        let fname_str = fname.to_string_lossy();
-                        if fname_str != expected_name {
-                            let _ = std::fs::remove_file(&old_path);
-                            cleaned += 1;
-                        }
-                    }
-                }
-            }
-
-            // ── VAULT CHECK: Try restoring from Vault before downloading ──
-            let vault_manifest = vault.get_storage_dir(app_id).join(&expected_name);
-            if vault_manifest.exists() {
-                if let Ok(meta) = std::fs::metadata(&vault_manifest) {
-                    if meta.len() > 100 {
-                        if std::fs::copy(&vault_manifest, &expected_path).is_ok() {
-                            downloaded += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // ── DOWNLOAD: Fetch from CDN via WUDRM ──
-            match downloader.download_manifest(depot_id, gid, &depot_cache).await {
-                Ok(path) => {
-                    downloaded += 1;
-                    // Save to Vault for future use
-                    let _ = vault.store_manifest(app_id, &path);
-                }
-                Err(_) => {
-                    // Continue with other depots — partial success is better than abort
-                }
-            }
-        }
-    }
-
-    // Also invalidate old Vault manifests for this app
-    if cleaned > 0 {
-        let mut expected_gids = std::collections::HashMap::new();
-        for (depot_id, depot_info) in &filtered_depots {
-            if let Some(gid) = &depot_info.gid {
-                expected_gids.insert(depot_id.clone(), gid.clone());
-            }
-        }
-        let (_, outdated) = vault.verify_manifests(app_id, &expected_gids);
-        if !outdated.is_empty() {
-            let _ = vault.invalidate_depots(app_id, &outdated);
-        }
-    }
-
-    Ok(downloaded)
 }

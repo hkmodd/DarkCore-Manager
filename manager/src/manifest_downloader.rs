@@ -326,6 +326,7 @@ impl ManifestDownloader {
     ///
     /// This method detects the format automatically and extracts the clean
     /// .manifest file ready for placement in Steam/depotcache/.
+    #[allow(dead_code)]
     pub async fn download_manifest(
         &self, 
         depot_id: &str, 

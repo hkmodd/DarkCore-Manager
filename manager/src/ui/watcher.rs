@@ -2,10 +2,10 @@ use crate::ui::state::DarkCoreApp;
 use crate::api::ApiClient;
 use crate::cache::save_game_cache;
 use crate::ui::state::push_log;
-use crate::vault::VaultManager;
-use crate::manifest_downloader::ManifestDownloader;
-use std::collections::HashMap;
-use zip::ZipArchive;
+// use crate::vault::VaultManager;
+// use crate::manifest_downloader::ManifestDownloader;
+// use std::collections::HashMap;
+// use zip::ZipArchive;
 use std::path::Path;
 
 pub fn resolve_unknown_games(app: &mut DarkCoreApp) {
@@ -212,101 +212,29 @@ pub fn resolve_unknown_games(app: &mut DarkCoreApp) {
 async fn smart_update_manifests(
     appid: &str,
     steam_path: &str,
-    api_client: &ApiClient,
+    _api_client: &ApiClient,
     log: impl Fn(String) + Send + Sync + 'static,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let vault = VaultManager::new(".");
-    
-    // 1. Ottieni GID remoti (sempre gratuito via Steam API)
-    let remote_info = api_client.get_app_info(appid).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-    let mut remote_gids: HashMap<String, String> = HashMap::new();
-    for (depot_id, depot) in &remote_info.depots {
-        if let Some(gid) = &depot.gid {
-            remote_gids.insert(depot_id.clone(), gid.clone());
-        }
-    }
-    
-    // 2. Check Vault (Verify GIDs)
-    let (vault_is_valid, outdated) = vault.verify_manifests(appid, &remote_gids);
-    
-    if vault_is_valid {
-        log("✅ Vault represents current version! No download needed.".to_string());
-        // Restore from Vault
-        if let Err(e) = vault.restore_manifests(steam_path, appid) {
-             log(format!("Error restoring from Vault: {}", e));
-        } else {
-             log("Restored manifests from Vault.".to_string());
-        }
-        return Ok(());
-    }
-    
-    log(format!("⚠️ Vault outdated. {} depots need update. Downloading...", outdated.len()));
-    
-    // 3. Invalida Vault (Clean old data)
-    if let Err(e) = vault.invalidate_app(appid) {
-        log(format!("Warning: Could not invalidate vault: {}", e));
-    }
-    
-    // 4. PRIMA prova wudrm.com (gratuito)
-    let depot_cache = Path::new(steam_path).join("depotcache");
-    let downloader = ManifestDownloader::new();
-    let mut wudrm_success = true;
-    
-    for (depot_id, gid) in &remote_gids {
-        match downloader.download_manifest(depot_id, gid, &depot_cache).await {
-            Ok(path) => {
-                log(format!("  ✅ Downloaded via wudrm: {}", depot_id));
-                // Salva nel Vault
-                if let Err(e) = vault.store_manifest(appid, &path) {
-                    log(format!("Warning: Could not save to vault: {}", e));
-                }
-            },
-            Err(e) => {
-                log(format!("  ⚠️ wudrm failed for {}: {}", depot_id, e));
-                wudrm_success = false;
-                break;
+    // Unified Logic: Use the shared helper which includes:
+    // 1. Magic Byte Validation
+    // 2. Vault Restoration
+    // 3. Smart Skipping
+    // 4. Robust Download
+    match crate::ui::helpers::download_manifests_wudrm(appid, steam_path, &log) {
+        Ok(count) => {
+            if count > 0 {
+                log(format!("✅ Successfully processed {} manifests.", count));
+                Ok(())
+            } else {
+                log("⚠️ No valid manifests processed (Count 0).".to_string());
+                Ok(())
             }
         }
-    }
-    
-    // 5. SE wudrm fallisce → Fallback a Morrenus
-    if !wudrm_success {
-        log("🔄 wudrm failed. Falling back to Morrenus...".to_string());
-        
-        match api_client.download_manifest(appid).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() }) {
-            Ok(zip_bytes) => {
-                // Salva ZIP nel Vault
-                let _ = vault.store_zip(appid, &zip_bytes);
-                
-                // Estrai manifest e salva
-                let cursor = std::io::Cursor::new(&zip_bytes);
-                if let Ok(mut archive) = ZipArchive::new(cursor) {
-                    for i in 0..archive.len() {
-                        if let Ok(mut f) = archive.by_index(i) {
-                            if f.name().ends_with(".manifest") {
-                                let manifest_name = f.name().to_string(); 
-                                let out_path = depot_cache.join(&manifest_name);
-                                let mut buf = Vec::new();
-                                use std::io::Read;
-                                if f.read_to_end(&mut buf).is_ok() {
-                                    if std::fs::write(&out_path, &buf).is_ok() {
-                                        let _ = vault.store_manifest(appid, &out_path);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                log("✅ Morrenus fallback successful!".to_string());
-            }
-            Err(e) => {
-                log(format!("❌ Morrenus fallback failed: {}", e));
-                return Err(e);
-            }
+        Err(e) => {
+             log(format!("❌ Update failed: {}", e));
+             Err(e)
         }
     }
-    
-    Ok(())
 }
 
 pub fn check_updates_for_ids(app: &DarkCoreApp, ids: Vec<String>) {
@@ -491,6 +419,7 @@ impl DarkCoreApp {
             let mut found_updates = 0;
             
             // Check each game
+            // Check each game
             rt.block_on(async {
                 for game in &games {
                     // Skip depots
@@ -500,16 +429,23 @@ impl DarkCoreApp {
                     
                     // Get remote build info
                     if let Ok(info) = client.get_app_info(&game.app_id).await {
-                        if let Some(remote_build) = info.buildid {
-                            // For now, we don't have local build stored, so check ACF
-                            let acf_path = std::path::Path::new(&steam_path)
+                        let remote_build = info.buildid.unwrap_or(0);
+                        
+                        // Strategy 1: Compare BuildID from ACF (traditional games)
+                        let mut local_build: u64 = 0;
+                        
+                        // Try ALL library folders, not just the main steam path
+                        let all_libraries = crate::game_path::GamePathFinder::get_library_folders(&steam_path);
+                        let mut acf_found = false;
+                        
+                        for lib in &all_libraries {
+                            let acf_path = lib
                                 .join("steamapps")
                                 .join(format!("appmanifest_{}.acf", game.app_id));
                             
-                            let mut local_build: u64 = 0;
                             if acf_path.exists() {
+                                acf_found = true;
                                 if let Ok(content) = std::fs::read_to_string(&acf_path) {
-                                    // Parse buildid from ACF
                                     for line in content.lines() {
                                         if line.contains("\"buildid\"") {
                                             if let Some(start) = line.rfind('"') {
@@ -522,17 +458,60 @@ impl DarkCoreApp {
                                         }
                                     }
                                 }
+                                break; // Found ACF, stop searching
                             }
-                            
-                            // Compare: if remote > local, update available
-                            if remote_build > local_build && local_build > 0 {
-                                found_updates += 1;
-                                if let Ok(mut p) = pending_arc.lock() {
-                                    p.insert(
-                                        game.app_id.clone(),
-                                        (game.name.clone(), local_build, remote_build)
-                                    );
+                        }
+                        
+                        // Strategy 2: If no ACF or local_build=0, check depotcache manifests
+                        // GreenLuma games often don't have ACF files.
+                        // Compare: do we have manifests matching the CURRENT GIDs?
+                        let mut manifests_outdated = false;
+                        
+                        if !acf_found || local_build == 0 {
+                            let depot_cache = std::path::Path::new(&steam_path).join("depotcache");
+                            if depot_cache.exists() {
+                                for (depot_id, depot_info) in &info.depots {
+                                    if let Some(gid) = &depot_info.gid {
+                                        let expected = format!("{}_{}.manifest", depot_id, gid);
+                                        let expected_path = depot_cache.join(&expected);
+                                        
+                                        if !expected_path.exists() {
+                                            // We DON'T have the current manifest → needs update
+                                            // But only flag if we have ANY manifest for this depot
+                                            // (i.e., we had a previous version)
+                                            let pattern = format!("{}_", depot_id);
+                                            if let Ok(entries) = std::fs::read_dir(&depot_cache) {
+                                                for entry in entries.flatten() {
+                                                    let name = entry.file_name().to_string_lossy().to_string();
+                                                    if name.starts_with(&pattern) && name.ends_with(".manifest") {
+                                                        // Has OLD manifest but not current → outdated
+                                                        manifests_outdated = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
+                            }
+                        }
+                        
+                        // Determine if update needed
+                        let needs_update = if local_build > 0 && remote_build > 0 {
+                            // Traditional: BuildID comparison
+                            remote_build > local_build
+                        } else {
+                            // GreenLuma fallback: manifest GID comparison
+                            manifests_outdated
+                        };
+                        
+                        if needs_update {
+                            found_updates += 1;
+                            if let Ok(mut p) = pending_arc.lock() {
+                                p.insert(
+                                    game.app_id.clone(),
+                                    (game.name.clone(), local_build, remote_build)
+                                );
                             }
                         }
                     }
