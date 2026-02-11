@@ -876,62 +876,6 @@ The **Direct Download** engine is DarkCore's experimental CDN-direct acquisition
 
 <br>
 
----
-
-<br>
-
-<div align="center">
-
-```
-╔══════════════════════════════════════════════════════════════════╗
-║                                                                  ║
-║        ██╗░░░░░██╗███╗░░██╗███████╗░█████╗░░██████╗░███████╗    ║
-║        ██║░░░░░██║████╗░██║██╔════╝██╔══██╗██╔════╝░██╔════╝    ║
-║        ██║░░░░░██║██╔██╗██║█████╗░░███████║██║░░██╗░█████╗░░    ║
-║        ██║░░░░░██║██║╚████║██╔══╝░░██╔══██║██║░░╚██╗██╔══╝░░    ║
-║        ███████╗██║██║░╚███║███████╗██║░░██║╚██████╔╝███████╗    ║
-║        ╚══════╝╚═╝╚═╝░░╚══╝╚══════╝╚═╝░░╚═╝░╚═════╝░╚══════╝    ║
-║                                                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-```
-
-</div>
-
-<br>
-
-```
-DarkCore Manager
-│
-├── v1.0.0  ──  Initial Release. Search + AppList + Basic Inject.
-├── v1.1.0  ──  Profile System. Multi-config hot-swapping.
-├── v1.2.0  ──  Steamless Integration. Automated DRM preprocessing.
-├── v1.3.0  ──  Goldberg Emulator. Offline play configuration.
-├── v1.4.0  ──  Direct Download Engine. CDN-direct acquisition.
-├── v1.5.0  ──  Project Neon UI. Complete visual overhaul.
-├── v1.6.0  ──  Vault System. Intelligent manifest caching.
-│
-└── v1.7.0  ──  ⭐ CURRENT
-    │
-    ├── ⬇️  OTA Self-Update via GitHub Releases
-    ├── 🎯  The Manifestor — Surgical DLC selection
-    ├── 🔄  WUDRM Auto-Recovery — Manifest repair engine
-    ├── 🧠  F2P Intelligence — Free content detection
-    ├── 👨‍👩‍👧  Family Shared Mode — AppList-only install (0 downloads)
-    ├── 📂  ZIP Import — Offline manifest import
-    ├── 🧊  Vault Verification — GID-based version checking
-    ├── 🎴  Premium Hover Cards — Steam Store detail popups
-    ├── 📡  Background Watcher — BuildID update monitoring
-    └── 🎵  Audio System — Embedded ambient soundtrack
-```
-
-<br>
-
----
-
-<br>
-
-<div align="center">
-
 ```
 ╔═════════════════════════════════════════════════════╗
 ║                                                     ║
@@ -967,13 +911,6 @@ Morrenus API by [manifest.morrenus.xyz](https://manifest.morrenus.xyz/) · egui 
 <br>
 
 <pre>
-                        ██████╗  █████╗ ██████╗ ██╗  ██╗
-                        ██╔══██╗██╔══██╗██╔══██╗██║ ██╔╝
-                        ██║  ██║███████║██████╔╝█████╔╝ 
-                        ██║  ██║██╔══██║██╔══██╗██╔═██╗ 
-                        ██████╔╝██║  ██║██║  ██║██║  ██╗
-                        ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
-                        
             "Wake up, Samurai. We have a compiled language to burn."
 </pre>
 
