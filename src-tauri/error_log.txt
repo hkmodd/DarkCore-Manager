@@ -1,0 +1,165 @@
+    Checking tauri-app v0.1.0 (E:\Programmi VARI\STEAM h4cks\GREEN LUMA\DARKCORE-GREENLUMA\DarkCore-Manager-20\src-tauri)
+warning: unused imports: `ManifestFormat` and `ManifestSource`
+  --> src\commands\direct_download.rs:12:52
+   |
+12 | use crate::services::downloader::manifest_source::{ManifestSource, ManifestFormat};
+   |                                                    ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ChunkData`
+  --> src\commands\direct_download.rs:13:101
+   |
+13 | use crate::services::downloader::download_engine::{DirectDownloader, DownloadState, DownloadStatus, ChunkData};
+   |                                                                                                     ^^^^^^^^^
+
+warning: unused imports: `ApiClient` and `GameHierarchy`
+   --> src\commands\library.rs:367:18
+    |
+367 | use crate::api::{ApiClient, GameHierarchy}; // Added imports
+    |                  ^^^^^^^^^  ^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Mutex`
+ --> src\profiles.rs:4:5
+  |
+4 | use std::sync::Mutex;
+  |     ^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::config::AppConfig`
+ --> src\state.rs:3:5
+  |
+3 | use crate::config::AppConfig;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ManifestParser`
+  --> src\services\downloader\download_engine.rs:16:50
+   |
+16 | use super::manifest_parser::{ProtoDepotManifest, ManifestParser};
+   |                                                  ^^^^^^^^^^^^^^
+
+warning: unused imports: `ManifestParser` and `ProtoDepotManifest`
+ --> src\services\downloader\manifest_source.rs:6:30
+  |
+6 | use super::manifest_parser::{ManifestParser, ProtoDepotManifest};
+  |                              ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `serde::Deserialize`
+ --> src\services\steam_api.rs:2:5
+  |
+2 | use serde::Deserialize;
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `regex::Regex`
+ --> src\utils\vdf.rs:1:5
+  |
+1 | use regex::Regex;
+  |     ^^^^^^^^^^^^
+
+warning: unused import: `VdfValue`
+ --> src\vault.rs:1:36
+  |
+1 | use crate::utils::vdf::{VdfParser, VdfValue};
+  |                                    ^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+ --> src\vault.rs:2:5
+  |
+2 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: future cannot be sent between threads safely
+   --> src\commands\library.rs:369:1
+    |
+369 |   #[tauri::command]
+    |   ^^^^^^^^^^^^^^^^^ future returned by `repair_library_relationships` is not `Send`
+    |
+   ::: src\lib.rs:82:25
+    |
+ 82 |           .invoke_handler(tauri::generate_handler![
+    |  _________________________-
+ 83 | |             // Inherited/Inlined Commands (Keep these or move them?)
+ 84 | |             injector::launch_injected,
+ 85 | |             injector::is_greenluma_injected,
+...   |
+151 | |             commands::direct_download::get_download_status,
+152 | |         ])
+    | |_________- in this macro invocation
+    |
+    = help: within `impl Future<Output = Result<std::string::String, std::string::String>>`, the trait `Send` is not implemented for `std::sync::MutexGuard<'_, AppListManager>`
+note: future is not `Send` as this value is used across an await
+   --> src\commands\library.rs:411:79
+    |
+371 |     let app_list = state.app_list.lock().unwrap();
+    |         -------- has type `std::sync::MutexGuard<'_, AppListManager>` which is not `Send`
+...
+411 |         if let Ok(hierarchy) = client.fetch_full_hierarchy(&appid, "english").await {
+    |                                                                               ^^^^^ await occurs here, with `app_list` maybe used later
+note: required by a bound in `ResultFutureTag::future`
+   --> C:\Users\sebas\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tauri-2.10.2\src\ipc\command.rs:314:42
+    |
+310 |     pub async fn future<T, E, F>(self, value: F) -> Result<InvokeResponseBody, InvokeError>
+    |                  ------ required by a bound in this associated function
+...
+314 |       F: Future<Output = Result<T, E>> + Send,
+    |                                          ^^^^ required by this bound in `ResultFutureTag::future`
+    = note: this error originates in the macro `commands::library::__cmd__repair_library_relationships` which comes from the expansion of the macro `tauri::generate_handler` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: future cannot be sent between threads safely
+   --> src\commands\library.rs:369:1
+    |
+369 |   #[tauri::command]
+    |   ^^^^^^^^^^^^^^^^^ future returned by `repair_library_relationships` is not `Send`
+    |
+   ::: src\lib.rs:82:25
+    |
+ 82 |           .invoke_handler(tauri::generate_handler![
+    |  _________________________-
+ 83 | |             // Inherited/Inlined Commands (Keep these or move them?)
+ 84 | |             injector::launch_injected,
+ 85 | |             injector::is_greenluma_injected,
+...   |
+151 | |             commands::direct_download::get_download_status,
+152 | |         ])
+    | |_________- in this macro invocation
+    |
+    = help: within `impl Future<Output = Result<std::string::String, std::string::String>>`, the trait `Send` is not implemented for `std::sync::MutexGuard<'_, HashMap<std::string::String, std::string::String>>`
+note: future is not `Send` as this value is used across an await
+   --> src\commands\library.rs:411:79
+    |
+372 |     let cache = state.name_cache.lock().unwrap();
+    |         ----- has type `std::sync::MutexGuard<'_, HashMap<std::string::String, std::string::String>>` which is not `Send`
+...
+411 |         if let Ok(hierarchy) = client.fetch_full_hierarchy(&appid, "english").await {
+    |                                                                               ^^^^^ await occurs here, with `cache` maybe used later
+note: required by a bound in `ResultFutureTag::future`
+   --> C:\Users\sebas\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tauri-2.10.2\src\ipc\command.rs:314:42
+    |
+310 |     pub async fn future<T, E, F>(self, value: F) -> Result<InvokeResponseBody, InvokeError>
+    |                  ------ required by a bound in this associated function
+...
+314 |       F: Future<Output = Result<T, E>> + Send,
+    |                                          ^^^^ required by this bound in `ResultFutureTag::future`
+    = note: this error originates in the macro `commands::library::__cmd__repair_library_relationships` which comes from the expansion of the macro `tauri::generate_handler` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `expected_name`
+   --> src\services\downloader\manifest_source.rs:162:21
+    |
+162 |                 let expected_name = format!("{}_{}.manifest", depot_id, manifest_gid);
+    |                     ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_expected_name`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `depots_insert_pos`
+  --> src\vdf_injector.rs:74:13
+   |
+74 |         let depots_insert_pos = depots_match.end();
+   |             ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_depots_insert_pos`
+
+warning: unused variable: `existing_match`
+  --> src\vdf_injector.rs:83:25
+   |
+83 |             if let Some(existing_match) = existing_re.find(&modified) {
+   |                         ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_existing_match`
+
+warning: `tauri-app` (lib) generated 14 warnings
+error: could not compile `tauri-app` (lib) due to 4 previous errors; 14 warnings emitted
